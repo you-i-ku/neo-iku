@@ -641,8 +641,29 @@ body {
     background: #1a1a0d;
 }
 
-.dev-tools h3 {
-    color: #d29922 !important;
+.dev-tools-summary {
+    color: #d29922;
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    cursor: pointer;
+    user-select: none;
+    list-style: none;
+    margin-bottom: 0;
+}
+
+.dev-tools-summary::before {
+    content: "▶ ";
+    font-size: 10px;
+}
+
+.dev-tools[open] .dev-tools-summary::before {
+    content: "▼ ";
+}
+
+.dev-tools[open] .dev-tools-grid {
+    margin-top: 12px;
 }
 
 .dev-tools-grid {

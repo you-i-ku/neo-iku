@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>イク — neo-iku</title>
-    <link rel="stylesheet" href="/static/style.css?v=8">
+    <link rel="stylesheet" href="/static/style.css?v=10">
 </head>
 <body>
     <div class="container">
@@ -55,19 +55,9 @@
                     </div>
                 </div>
 
-                <!-- 記憶検索 -->
-                <div class="section">
-                    <h3>記憶</h3>
-                    <div class="search-area">
-                        <input id="memory-search" type="text" placeholder="記憶を検索...">
-                        <button id="search-btn">検索</button>
-                    </div>
-                    <div id="memory-list" class="memory-list"></div>
-                </div>
-
                 <!-- 開発用ツール -->
-                <div class="section dev-tools">
-                    <h3>開発用ツール</h3>
+                <details class="section dev-tools">
+                    <summary class="dev-tools-summary">開発用ツール</summary>
                     <div class="dev-tools-grid">
                         <div class="dev-item">
                             <label>自律行動間隔（秒）</label>
@@ -86,6 +76,16 @@
                         <button id="dev-trigger-btn" class="dev-btn trigger">今すぐ自律行動</button>
                         <button id="dev-reset-btn" class="dev-btn danger">DBリセット（過去ログ以外）</button>
                     </div>
+                </details>
+
+                <!-- 記憶検索 -->
+                <div class="section">
+                    <h3>記憶</h3>
+                    <div class="search-area">
+                        <input id="memory-search" type="text" placeholder="記憶を検索...">
+                        <button id="search-btn">検索</button>
+                    </div>
+                    <div id="memory-list" class="memory-list"></div>
                 </div>
             </div>
         </div>
@@ -100,6 +100,6 @@
             <div id="log-content" class="log-content"></div>
         </div>
     </div>
-    <script src="/static/app.js?v=8"></script>
+    <script src="/static/app.js?v=10"></script>
 </body>
 </html>

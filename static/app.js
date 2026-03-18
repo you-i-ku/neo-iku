@@ -256,6 +256,8 @@ function sendMessage() {
     chatInput.style.height = "auto";
     userScrolledUp = false;
     scrollToBottom(true);
+    // 送信したメッセージに関連する記憶を即表示
+    loadMemories(text);
 }
 
 // --- イベント ---
