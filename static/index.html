@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>イク — neo-iku</title>
+    <link rel="stylesheet" href="/static/style.css?v=5">
+</head>
+<body>
+    <div class="container">
+        <!-- 左パネル: チャット -->
+        <div class="panel chat-panel">
+            <div class="panel-header">
+                <h2 id="chat-title">チャット</h2>
+                <span id="connection-status" class="status-dot offline"></span>
+                <div class="mode-toggle">
+                    <button id="mode-btn" class="mode-btn normal" title="クリックでモード切替">ノーマル</button>
+                </div>
+            </div>
+            <div id="chat-messages" class="messages"></div>
+            <div class="input-area">
+                <textarea id="chat-input" placeholder="メッセージを入力..." rows="2"></textarea>
+                <button id="send-btn">送信</button>
+            </div>
+        </div>
+
+        <!-- 右パネル: ダッシュボード -->
+        <div class="panel dashboard-panel">
+            <div class="panel-header">
+                <h2>ダッシュボード</h2>
+            </div>
+            <div class="dashboard-content">
+                <!-- 状態 -->
+                <div class="section">
+                    <h3>状態</h3>
+                    <div class="status-grid">
+                        <div class="status-item">
+                            <span class="label">LLM</span>
+                            <span id="llm-status" class="value">—</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="label">メッセージ数</span>
+                            <span id="message-count" class="value">—</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="label">モデル</span>
+                            <select id="model-select" class="model-select">
+                                <option value="">読み込み中...</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 記憶検索 -->
+                <div class="section">
+                    <h3>記憶</h3>
+                    <div class="search-area">
+                        <input id="memory-search" type="text" placeholder="記憶を検索...">
+                        <button id="search-btn">検索</button>
+                    </div>
+                    <div id="memory-list" class="memory-list"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <!-- ログパネル -->
+    <div id="log-panel" class="log-panel">
+        <div class="log-header" id="log-toggle">
+            <span>ログ</span>
+            <span id="log-arrow">▲</span>
+        </div>
+        <div id="log-body" class="log-body" style="display:none">
+            <div id="log-content" class="log-content"></div>
+        </div>
+    </div>
+    <script src="/static/app.js?v=5"></script>
+</body>
+</html>
