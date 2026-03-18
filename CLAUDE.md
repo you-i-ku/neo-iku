@@ -71,7 +71,7 @@ neo-iku/
 - web_search: DuckDuckGoでWeb検索（APIキー不要、`duckduckgo-search`ライブラリ使用）
 - 承認/拒否のどちらにもコメント欄あり（任意）。コメントがあればLLMにフィードバックされる
 - `app/tools/code_analysis.py`: 構文チェック（ast.parse）+ リスク静的解析（AST walk）。exec_code・create_toolの承認UIにリスクレベル（🔴HIGH/🟡MEDIUM/🟢LOW）を表示
-- 応答中断: ストリーミング中に停止ボタンで即中断可能。入力欄のテキストがフィードバックとしてLLMに伝わる
+- 応答中断: 専用停止ボタン（⏹）で即中断可能（送信ボタンとは独立）。入力欄にテキストがあればfeedbackとしてLLMに伝わる。ストリーミング中でも送信ボタンで割り込みメッセージを送れる
 - `register_tool()` の `required_args` で必須引数を指定可能。引数なし→スキップ（会話中の言及）、パース失敗→エラーをLLMに返す
 - 引数パーサーはクォート内の `\n`→改行、`\t`→タブのエスケープシーケンス変換に対応
 - ツールループ中のユーザー割り込み: WebSocketをasyncio.Queueで管理し、次のLLM呼び出し前にユーザーメッセージをhistoryに挿入

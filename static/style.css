@@ -607,11 +607,21 @@ body {
     cursor: not-allowed;
 }
 
-.input-area button.stop-btn {
-    background: #da3633;
+#stop-btn {
+    padding: 10px 12px;
+    background: #21262d;
+    color: #6e7681;
+    cursor: not-allowed;
+    font-size: 14px;
 }
 
-.input-area button.stop-btn:hover {
+#stop-btn:not(:disabled) {
+    background: #da3633;
+    color: #fff;
+    cursor: pointer;
+}
+
+#stop-btn:not(:disabled):hover {
     background: #f85149;
 }
 

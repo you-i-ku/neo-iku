@@ -264,15 +264,11 @@ function scrollToBottom(force = false) {
     }
 }
 
+const stopBtn = document.getElementById("stop-btn");
+
 function setStreaming(active) {
     isStreaming = active;
-    if (active) {
-        sendBtn.textContent = "停止";
-        sendBtn.classList.add("stop-btn");
-    } else {
-        sendBtn.textContent = "送信";
-        sendBtn.classList.remove("stop-btn");
-    }
+    stopBtn.disabled = !active;
 }
 
 function stopStreaming() {
@@ -286,10 +282,6 @@ function stopStreaming() {
 }
 
 function sendMessage() {
-    if (isStreaming) {
-        stopStreaming();
-        return;
-    }
     const text = chatInput.value.trim();
     if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
 
@@ -306,6 +298,7 @@ function sendMessage() {
 // --- イベント ---
 
 sendBtn.addEventListener("click", sendMessage);
+stopBtn.addEventListener("click", stopStreaming);
 
 chatInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
