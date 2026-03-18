@@ -89,6 +89,22 @@ function connect() {
                 showWriteApproval(data);
                 break;
 
+            case "exec_approval":
+                showExecApproval(data);
+                break;
+
+            case "exec_start":
+                showExecTerminal(data);
+                break;
+
+            case "exec_output":
+                appendExecOutput(data);
+                break;
+
+            case "exec_end":
+                finalizeExecTerminal(data);
+                break;
+
             case "autonomous_countdown":
                 startCountdown(data.seconds);
                 break;
@@ -503,6 +519,115 @@ function showWriteApproval(data) {
         disableAll();
         ws.send(JSON.stringify({ type: "write_response", action: "review", message: msg }));
     };
+}
+
+// --- コード実行承認UI ---
+
+function showExecApproval(data) {
+    const el = document.createElement("div");
+    el.className = "message exec-approval";
+    el.innerHTML = `
+        <div class="exec-approval-header">⚠ コード実行承認</div>
+        <details open><summary>実行するコード</summary><pre class="write-preview">${escapeHtml(data.code)}</pre></details>
+        <div class="write-approval-buttons">
+            <button class="write-btn approve">実行</button>
+            <button class="write-btn reject">拒否</button>
+            <button class="write-btn review">検討</button>
+        </div>
+        <div class="write-review-area" style="display:none">
+            <textarea class="write-review-input" placeholder="フィードバックを入力..." rows="3"></textarea>
+            <button class="write-btn send-review">送信</button>
+        </div>
+    `;
+    chatMessages.appendChild(el);
+    scrollToBottom();
+
+    function disableAll() {
+        el.querySelectorAll("button").forEach(b => b.disabled = true);
+    }
+
+    el.querySelector(".approve").onclick = () => {
+        disableAll();
+        ws.send(JSON.stringify({ type: "exec_response", action: "approve" }));
+    };
+    el.querySelector(".reject").onclick = () => {
+        disableAll();
+        ws.send(JSON.stringify({ type: "exec_response", action: "reject" }));
+    };
+    el.querySelector(".review").onclick = () => {
+        el.querySelector(".write-review-area").style.display = "flex";
+        el.querySelector(".write-review-input").focus();
+    };
+    el.querySelector(".send-review").onclick = () => {
+        const msg = el.querySelector(".write-review-input").value.trim();
+        if (!msg) return;
+        disableAll();
+        ws.send(JSON.stringify({ type: "exec_response", action: "review", message: msg }));
+    };
+}
+
+// --- ミニターミナル ---
+
+let currentTerminalEl = null;
+
+function showExecTerminal(data) {
+    const el = document.createElement("div");
+    el.className = "message exec-terminal";
+    el.innerHTML = `
+        <div class="exec-terminal-header">
+            <span class="exec-terminal-title">▶ コード実行中...</span>
+            <span class="exec-terminal-time"></span>
+        </div>
+        <div class="exec-terminal-code"><span class="exec-prompt">$</span> python -c</div>
+        <pre class="exec-terminal-input">${escapeHtml(data.code)}</pre>
+        <div class="exec-terminal-divider"></div>
+        <div class="exec-terminal-output"></div>
+        <div class="exec-terminal-status"></div>
+    `;
+    if (data.backup) {
+        const backupLine = document.createElement("div");
+        backupLine.className = "exec-line system";
+        backupLine.textContent = data.backup;
+        el.querySelector(".exec-terminal-output").appendChild(backupLine);
+    }
+    chatMessages.appendChild(el);
+    currentTerminalEl = el;
+    scrollToBottom();
+}
+
+function appendExecOutput(data) {
+    if (!currentTerminalEl) return;
+    const output = currentTerminalEl.querySelector(".exec-terminal-output");
+    const line = document.createElement("div");
+    line.className = `exec-line ${data.stream}`;
+    line.textContent = data.content;
+    output.appendChild(line);
+    // 出力が多い時のスクロール
+    if (output.children.length > 200) {
+        output.removeChild(output.firstChild);
+    }
+    scrollToBottom();
+}
+
+function finalizeExecTerminal(data) {
+    if (!currentTerminalEl) return;
+    const header = currentTerminalEl.querySelector(".exec-terminal-title");
+    const status = currentTerminalEl.querySelector(".exec-terminal-status");
+    const timeEl = currentTerminalEl.querySelector(".exec-terminal-time");
+
+    if (data.return_code === 0) {
+        header.textContent = "✓ 実行完了";
+        header.className = "exec-terminal-title success";
+        status.textContent = `正常終了`;
+        status.className = "exec-terminal-status success";
+    } else {
+        header.textContent = "✗ 実行失敗";
+        header.className = "exec-terminal-title error";
+        status.textContent = `終了コード: ${data.return_code}`;
+        status.className = "exec-terminal-status error";
+    }
+    timeEl.textContent = `${data.elapsed}秒`;
+    currentTerminalEl = null;
 }
 
 // --- カウントダウン ---

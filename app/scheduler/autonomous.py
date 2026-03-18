@@ -21,6 +21,7 @@ class AutonomousScheduler:
         self._trigger_event = asyncio.Event()
         self._interval = AUTONOMOUS_INTERVAL_MIN
         self._jitter = AUTONOMOUS_INTERVAL_JITTER
+        self._skip_speak = False  # interval変更時: ループ再開するがspeakはスキップ
 
     def set_callbacks(self, llm_func, memory_func):
         """LLM呼び出しと記憶取得のコールバックを設定"""
@@ -62,10 +63,13 @@ class AutonomousScheduler:
             logger.info("自発的発言スケジューラ停止")
 
     def set_interval(self, seconds: int, jitter: int = 0):
-        """自律行動の間隔を変更"""
+        """自律行動の間隔を変更し、新しい間隔でカウントダウンを再開"""
         self._interval = max(10, seconds)
         self._jitter = max(0, jitter)
         logger.info(f"自律行動間隔変更: {self._interval}秒 (±{self._jitter}秒)")
+        # 現在の待機を中断して新しい間隔でループ再開（speakはスキップ）
+        self._skip_speak = True
+        self._trigger_event.set()
 
     def trigger_now(self):
         """次の自律行動を即時実行"""
@@ -92,6 +96,11 @@ class AutonomousScheduler:
                 logger.info("即時実行トリガーを受信")
             except asyncio.TimeoutError:
                 pass  # 通常のタイムアウト = 予定通りの実行
+
+            # interval変更によるループ再開の場合はspeakスキップ
+            if self._skip_speak:
+                self._skip_speak = False
+                continue
 
             if not self._websockets:
                 continue
@@ -158,22 +167,39 @@ class AutonomousScheduler:
             from app.tools.registry import parse_tool_calls, execute_tool
             from config import TOOL_MAX_ROUNDS
             import time as _time
-            for _ in range(TOOL_MAX_ROUNDS + 1):
+            tool_round = 0
+            for _ in range(TOOL_MAX_ROUNDS + 2):  # +2: 上限フィードバック後の最終応答用
                 response = await self._llm_func(messages)
                 if not response:
                     break
 
                 clean = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
-                tool_calls = parse_tool_calls(clean) or parse_tool_calls(response)
+
+                tool_calls = []
+                if tool_round < TOOL_MAX_ROUNDS:
+                    tool_calls = parse_tool_calls(clean) or parse_tool_calls(response)
+                elif parse_tool_calls(clean) or parse_tool_calls(response):
+                    # 上限到達フィードバック
+                    limit_msg = f"[ツール実行上限（{TOOL_MAX_ROUNDS}回）に達しました。ツールなしで応答を完了してください。]"
+                    messages.append({"role": "assistant", "content": clean})
+                    messages.append({"role": "user", "content": limit_msg})
+                    async with async_session() as db_session:
+                        await add_message(db_session, conv_id, "assistant", response)
+                        await add_message(db_session, conv_id, "tool", limit_msg)
+                        await db_session.commit()
+                    logger.info(f"自律行動ツール上限到達: {TOOL_MAX_ROUNDS}回")
+                    tool_round += 1
+                    continue
 
                 if tool_calls:
+                    tool_round += 1
                     all_results = []
                     for tool_name, tool_args in tool_calls:
                         logger.info(f"自律行動ツール: {tool_name} {tool_args}")
                         args_str = " ".join(f"{k}={v}" for k, v in tool_args.items()) if tool_args else ""
                         await self._broadcast(_json.dumps({"type": "autonomous_tool", "name": tool_name, "args": args_str}))
-                        if tool_name == "overwrite_file":
-                            result = "エラー: 既存ファイルの上書きは自律行動中にはできません。チャットで提案してください。"
+                        if tool_name in ("overwrite_file", "exec_code"):
+                            result = "エラー: この操作は自律行動中にはできません。チャットで提案してください。"
                             exec_ms = 0
                         else:
                             t0 = _time.perf_counter()

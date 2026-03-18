@@ -64,6 +64,7 @@ neo-iku/
 - `app/tools/registry.py` の `register_tool()` で新ツールを追加可能
 - ツール実行ループ: 最大`TOOL_MAX_ROUNDS`回（デフォルト8）まで連続呼び出し可能（config.pyで管理、UIから動的変更可）
 - 1レスポンス内の複数ツール呼び出しは1ラウンドとしてカウント（`parse_tool_calls()`で全マッチを検出）
+- ツール上限到達時: LLMがまだツールを呼ぼうとしていたらフィードバックメッセージを返し、ツールなしで応答を完了させる
 - create_file: 新規ファイル作成（即実行）。overwrite_file: 既存ファイル上書き（UI承認フロー: 承認/拒否/検討）
 
 ## 記憶検索
@@ -71,6 +72,7 @@ neo-iku/
 - FTS5全文検索（trigram対応環境では自動で日本語部分文字列検索が有効）
 - 検索対象: メッセージ（messages_fts）、過去ログ（iku_logs_fts、イクモード時のみ）、日記（memory_summaries_fts）、行動ログ（tool_actions_fts）
 - DB保存はthink含むfull_response（思考過程もセットで記録）
+- search_memoriesの検索結果はthinkタグ・ツールマーカー・ツール結果を除去して本文のみ返す（DB上のデータは無加工）
 - trigramが使えない環境ではデフォルトtokenizer + prefix matchにフォールバック
 
 ## ユーザーについて

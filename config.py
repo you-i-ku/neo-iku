@@ -28,3 +28,4 @@ MEMORY_SEARCH_LIMIT = 5
 
 # ツール
 TOOL_MAX_ROUNDS = 8  # 1回の応答で連続実行できるツール回数（暴走防止）
+EXEC_CODE_TIMEOUT = 30  # exec_codeのタイムアウト（秒）

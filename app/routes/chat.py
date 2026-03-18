@@ -1,6 +1,8 @@
 """WebSocketチャットルート"""
+import asyncio
 import json
 import re
+import sys
 import time
 import logging
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -17,10 +19,107 @@ from app.tools.registry import parse_tool_calls, execute_tool
 from app.tools.builtin import (
     PENDING_MARKER, get_pending_overwrite,
     execute_pending_overwrite, cancel_pending_overwrite,
+    PENDING_EXEC_MARKER, get_pending_exec,
+    pop_pending_exec, cancel_pending_exec,
+    _git_auto_backup,
 )
+from config import BASE_DIR, EXEC_CODE_TIMEOUT
 
 logger = logging.getLogger("iku.chat")
 router = APIRouter()
+
+
+async def _stream_exec_code(ws: WebSocket, code: str) -> str:
+    """コードをストリーミング実行し、UIにリアルタイム出力を送る"""
+    # git自動バックアップ
+    backup_msg = _git_auto_backup()
+
+    # ターミナル開始を通知
+    await ws.send_text(json.dumps({
+        "type": "exec_start",
+        "code": code,
+        "backup": backup_msg,
+    }))
+
+    output_lines = []
+    return_code = -1
+    t0 = time.perf_counter()
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", code,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(BASE_DIR),
+        )
+
+        async def read_stream(stream, stream_type):
+            while True:
+                line = await stream.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip("\n")
+                output_lines.append(f"[{stream_type}] {text}")
+                await ws.send_text(json.dumps({
+                    "type": "exec_output",
+                    "stream": stream_type,
+                    "content": text,
+                }))
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    read_stream(proc.stdout, "stdout"),
+                    read_stream(proc.stderr, "stderr"),
+                ),
+                timeout=EXEC_CODE_TIMEOUT,
+            )
+            return_code = await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await ws.send_text(json.dumps({
+                "type": "exec_output",
+                "stream": "stderr",
+                "content": f"⏰ タイムアウト（{EXEC_CODE_TIMEOUT}秒）",
+            }))
+            output_lines.append(f"タイムアウト（{EXEC_CODE_TIMEOUT}秒）")
+            return_code = -1
+
+    except Exception as e:
+        await ws.send_text(json.dumps({
+            "type": "exec_output",
+            "stream": "stderr",
+            "content": f"実行エラー: {e}",
+        }))
+        output_lines.append(f"実行エラー: {e}")
+
+    elapsed = time.perf_counter() - t0
+
+    # 終了通知
+    await ws.send_text(json.dumps({
+        "type": "exec_end",
+        "return_code": return_code,
+        "elapsed": round(elapsed, 2),
+    }))
+
+    # LLMに返す結果テキスト
+    result_parts = [backup_msg]
+    if output_lines:
+        result_parts.append("\n".join(output_lines))
+    if return_code == 0:
+        result_parts.append(f"正常終了 ({round(elapsed, 2)}秒)")
+    elif return_code == -1:
+        result_parts.append("異常終了")
+    else:
+        result_parts.append(f"終了コード: {return_code} ({round(elapsed, 2)}秒)")
+
+    if not output_lines and return_code == 0:
+        result_parts.append("コード実行完了（出力なし）")
+
+    result = "\n".join(result_parts)
+    if len(result) > 5000:
+        result = result[:5000] + "\n...（出力が長すぎるため省略）"
+    return result
 
 
 @router.websocket("/ws/chat")
@@ -59,7 +158,7 @@ async def chat_ws(ws: WebSocket):
                 from config import TOOL_MAX_ROUNDS
                 max_tool_rounds = TOOL_MAX_ROUNDS
 
-                for tool_round in range(max_tool_rounds + 1):
+                for tool_round in range(max_tool_rounds + 2):  # +2: 上限到達フィードバック後の最終応答用
                     # LLMからストリーミング応答（think/回答を分離）
                     llm = llm_manager.get()
                     full_response = ""
@@ -152,6 +251,16 @@ async def chat_ws(ws: WebSocket):
                     tool_calls = []
                     if tool_round < max_tool_rounds:
                         tool_calls = parse_tool_calls(clean_response) or parse_tool_calls(full_response)
+                    elif parse_tool_calls(clean_response) or parse_tool_calls(full_response):
+                        # 上限到達だがLLMがまだツールを呼ぼうとしている → フィードバック
+                        limit_msg = f"[ツール実行上限（{max_tool_rounds}回）に達しました。ツールなしで応答を完了してください。]"
+                        all_messages.append({"role": "assistant", "content": clean_response})
+                        await add_message(session, conversation_id, "assistant", full_response)
+                        all_messages.append({"role": "user", "content": limit_msg})
+                        await add_message(session, conversation_id, "tool", limit_msg)
+                        await session.commit()
+                        logger.info(f"ツール上限到達: {max_tool_rounds}回")
+                        continue
 
                     if tool_calls:
                         # 複数ツールを1ラウンドで順次実行
@@ -200,6 +309,29 @@ async def chat_ws(ws: WebSocket):
                                                 result = cancel_pending_overwrite()
                                             elif action == "review":
                                                 result = cancel_pending_overwrite()
+                                                result += f"\nユーザーからのフィードバック: {resp_data.get('message', '')}"
+                                            break
+
+                            # コード実行承認フロー（ストリーミング）
+                            if result == PENDING_EXEC_MARKER:
+                                pending = get_pending_exec()
+                                if pending:
+                                    await ws.send_text(json.dumps({
+                                        "type": "exec_approval",
+                                        "code": pending["code"][:2000],
+                                    }))
+                                    while True:
+                                        raw_resp = await ws.receive_text()
+                                        resp_data = json.loads(raw_resp)
+                                        if resp_data.get("type") == "exec_response":
+                                            action = resp_data.get("action")
+                                            if action == "approve":
+                                                code = pop_pending_exec()
+                                                result = await _stream_exec_code(ws, code)
+                                            elif action == "reject":
+                                                result = cancel_pending_exec()
+                                            elif action == "review":
+                                                result = cancel_pending_exec()
                                                 result += f"\nユーザーからのフィードバック: {resp_data.get('message', '')}"
                                             break
 

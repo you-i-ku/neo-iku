@@ -1,15 +1,21 @@
 """組み込みツール — 自己参照・内省のための基本ツール"""
 import json
 import os
+import sys
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from config import BASE_DIR, DATA_DIR
+from config import BASE_DIR, DATA_DIR, EXEC_CODE_TIMEOUT
 from app.tools.registry import register_tool
 
 # 承認待ちの上書きデータ（メモリ上に保持、1件のみ）
 _pending_overwrite: dict | None = None
 PENDING_MARKER = "__PENDING_OVERWRITE__"
+
+# 承認待ちのコード実行データ
+_pending_exec: dict | None = None
+PENDING_EXEC_MARKER = "__PENDING_EXEC_CODE__"
 
 
 async def read_file(path: str = "", offset: str = "0") -> str:
@@ -129,6 +135,23 @@ async def search_files(query: str = "", path: str = ".") -> str:
     return "\n".join(lines)
 
 
+def _clean_memory_content(text: str) -> str:
+    """検索結果表示用: thinkタグとツールマーカーを除去して会話の本文だけにする"""
+    import re
+    # thinkブロック除去
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    if "</think>" in text:
+        text = text.split("</think>")[-1]
+    if "<think>" in text:
+        text = text.split("<think>")[0]
+    # ツールマーカー除去（単一行・ブロック形式両方）
+    text = re.sub(r"\[TOOL:\w+[^\]]*\]", "", text)
+    text = re.sub(r"\[/TOOL\]", "", text)
+    # ツール結果ブロック除去
+    text = re.sub(r"\[ツール結果: \w+\]\n?", "", text)
+    return text.strip()
+
+
 async def search_memories(query: str = "") -> str:
     """記憶を検索する"""
     if not query:
@@ -148,22 +171,25 @@ async def search_memories(query: str = "") -> str:
         lines.append("【会話の記憶】")
         for m in chat_results:
             role = "ユーザー" if m["role"] == "user" else "イク"
-            content = m["content"][:200]
-            lines.append(f"- {role}: {content}")
+            content = _clean_memory_content(m["content"])[:200]
+            if content:
+                lines.append(f"- {role}: {content}")
 
     if log_results:
         lines.append("【過去ログの記憶】")
         for m in log_results:
             role = "ユーザー" if m["role"] == "user" else "イク"
-            content = m["content"][:200]
-            lines.append(f"- {role}: {content}")
+            content = _clean_memory_content(m["content"])[:200]
+            if content:
+                lines.append(f"- {role}: {content}")
 
     if diary_results:
         lines.append("【日記・内省メモ】")
         for m in diary_results:
-            content = m["content"][:200]
+            content = _clean_memory_content(m["content"])[:200]
             date = str(m.get("created_at", ""))[:10]
-            lines.append(f"- [{date}] {content}")
+            if content:
+                lines.append(f"- [{date}] {content}")
 
     if not lines:
         return f"「{query}」に関する記憶は見つかりませんでした。"
@@ -258,6 +284,104 @@ def cancel_pending_overwrite() -> str:
     path = _pending_overwrite["path"]
     _pending_overwrite = None
     return f"ユーザーにより上書きを拒否されました: {path}"
+
+
+def _git_auto_backup() -> str:
+    """exec_code実行前にgit自動バックアップ"""
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg = f"[イク] exec_code実行前の自動バックアップ ({ts})"
+        subprocess.run(
+            ["git", "add", "-A"], cwd=str(BASE_DIR),
+            timeout=10, capture_output=True,
+        )
+        result = subprocess.run(
+            ["git", "commit", "-m", msg], cwd=str(BASE_DIR),
+            timeout=10, capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            return f"自動バックアップ完了: {msg}"
+        return "バックアップ: 変更なし（コミット不要）"
+    except Exception as e:
+        return f"バックアップ警告: {e}"
+
+
+async def exec_code(code: str = "") -> str:
+    """Pythonコードを実行する（ユーザー承認が必要）"""
+    global _pending_exec
+
+    if not code:
+        return "エラー: codeを指定してください。"
+
+    _pending_exec = {"code": code}
+    return PENDING_EXEC_MARKER
+
+
+def get_pending_exec() -> dict | None:
+    """承認待ちのコード実行データを取得"""
+    return _pending_exec
+
+
+def pop_pending_exec() -> str | None:
+    """承認待ちのコードを取得し、状態をクリア（ストリーミング実行用）"""
+    global _pending_exec
+    if _pending_exec is None:
+        return None
+    code = _pending_exec["code"]
+    _pending_exec = None
+    return code
+
+
+def execute_pending_exec() -> str:
+    """承認済みのコード実行を実行"""
+    global _pending_exec
+    if _pending_exec is None:
+        return "エラー: 承認待ちのコード実行はありません。"
+
+    code = _pending_exec["code"]
+    _pending_exec = None
+
+    # git自動バックアップ
+    backup_msg = _git_auto_backup()
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(BASE_DIR),
+            timeout=EXEC_CODE_TIMEOUT,
+            capture_output=True,
+            text=True,
+        )
+        output_parts = []
+        if backup_msg:
+            output_parts.append(backup_msg)
+        if result.stdout:
+            output_parts.append(f"[stdout]\n{result.stdout}")
+        if result.stderr:
+            output_parts.append(f"[stderr]\n{result.stderr}")
+        if result.returncode != 0:
+            output_parts.append(f"[終了コード: {result.returncode}]")
+        if not result.stdout and not result.stderr and result.returncode == 0:
+            output_parts.append("コード実行完了（出力なし）")
+
+        output = "\n".join(output_parts)
+        if len(output) > 5000:
+            output = output[:5000] + "\n...（出力が長すぎるため省略）"
+        return output
+
+    except subprocess.TimeoutExpired:
+        return f"{backup_msg}\nエラー: 実行タイムアウト（{EXEC_CODE_TIMEOUT}秒）"
+    except Exception as e:
+        return f"{backup_msg}\nエラー: コード実行失敗: {e}"
+
+
+def cancel_pending_exec() -> str:
+    """承認待ちのコード実行をキャンセル"""
+    global _pending_exec
+    if _pending_exec is None:
+        return "承認待ちのコード実行はありません。"
+    _pending_exec = None
+    return "ユーザーによりコード実行を拒否されました。"
 
 
 async def write_diary(content: str = "", keywords: str = "") -> str:
@@ -365,4 +489,10 @@ def register_all():
         "自分の過去の行動履歴を検索する（どのツールをいつ使ったか振り返れる）",
         "query=検索キーワード（省略可） tool_name=ツール名でフィルタ（省略可）",
         search_action_log,
+    )
+    register_tool(
+        "exec_code",
+        "Pythonコードを実行する。ユーザーの承認が必要（承認UIが自動で表示される）",
+        'code=実行するPythonコード（例: code="print(1+1)"）',
+        exec_code,
     )
