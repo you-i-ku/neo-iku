@@ -297,7 +297,7 @@ def _git_auto_backup() -> str:
         )
         result = subprocess.run(
             ["git", "commit", "-m", msg], cwd=str(BASE_DIR),
-            timeout=10, capture_output=True, text=True,
+            timeout=10, capture_output=True, encoding="utf-8", errors="replace",
         )
         if result.returncode == 0:
             return f"自動バックアップ完了: {msg}"
@@ -350,7 +350,8 @@ def execute_pending_exec() -> str:
             cwd=str(BASE_DIR),
             timeout=EXEC_CODE_TIMEOUT,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         output_parts = []
         if backup_msg:

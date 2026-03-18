@@ -46,11 +46,14 @@ async def _stream_exec_code(ws: WebSocket, code: str) -> str:
     t0 = time.perf_counter()
 
     try:
+        import os as _os
+        env = {**_os.environ, "PYTHONIOENCODING": "utf-8"}
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-c", code,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(BASE_DIR),
+            env=env,
         )
 
         async def read_stream(stream, stream_type):

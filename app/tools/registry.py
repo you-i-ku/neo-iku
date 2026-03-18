@@ -76,7 +76,9 @@ def _parse_args(args_str: str) -> dict:
     quoted = list(re.finditer(r'(\w+)="((?:[^"\\]|\\.)*)"', args_str, re.DOTALL))
     if quoted:
         for part in quoted:
-            args[part.group(1)] = part.group(2).replace('\\"', '"')
+            val = part.group(2).replace('\\"', '"')
+            val = val.replace('\\n', '\n').replace('\\t', '\t')
+            args[part.group(1)] = val
 
         # クォートされてない引数も拾う（path=xxx content="yyy" の path 部分）
         remaining = args_str

@@ -568,68 +568,111 @@ function showExecApproval(data) {
     };
 }
 
-// --- ミニターミナル ---
+// --- ターミナルポップアップ ---
 
 let currentTerminalEl = null;
 
 function showExecTerminal(data) {
-    const el = document.createElement("div");
-    el.className = "message exec-terminal";
-    el.innerHTML = `
-        <div class="exec-terminal-header">
-            <span class="exec-terminal-title">▶ コード実行中...</span>
+    // オーバーレイ
+    const overlay = document.createElement("div");
+    overlay.className = "exec-terminal-overlay";
+
+    const win = document.createElement("div");
+    win.className = "exec-terminal-window";
+    win.innerHTML = `
+        <div class="exec-terminal-titlebar">
+            <div class="exec-terminal-dots">
+                <span class="exec-dot-close"></span>
+                <span class="exec-dot-min"></span>
+                <span class="exec-dot-max"></span>
+            </div>
+            <span class="exec-terminal-titletext running">実行中...</span>
             <span class="exec-terminal-time"></span>
         </div>
-        <div class="exec-terminal-code"><span class="exec-prompt">$</span> python -c</div>
-        <pre class="exec-terminal-input">${escapeHtml(data.code)}</pre>
-        <div class="exec-terminal-divider"></div>
-        <div class="exec-terminal-output"></div>
-        <div class="exec-terminal-status"></div>
+        <div class="exec-terminal-body">
+            <div class="exec-prompt">$ python -c</div>
+            <pre class="exec-terminal-input">${escapeHtml(data.code)}</pre>
+            <div class="exec-terminal-output"></div>
+        </div>
+        <div class="exec-terminal-statusbar">
+            <span class="exec-status-text">実行中...</span>
+            <span class="exec-status-time"></span>
+        </div>
     `;
+
     if (data.backup) {
         const backupLine = document.createElement("div");
         backupLine.className = "exec-line system";
         backupLine.textContent = data.backup;
-        el.querySelector(".exec-terminal-output").appendChild(backupLine);
+        win.querySelector(".exec-terminal-output").appendChild(backupLine);
     }
-    chatMessages.appendChild(el);
-    currentTerminalEl = el;
-    scrollToBottom();
+
+    overlay.appendChild(win);
+    document.body.appendChild(overlay);
+    currentTerminalEl = overlay;
+
+    // 閉じるボタン（赤丸）
+    win.querySelector(".exec-dot-close").onclick = () => {
+        overlay.remove();
+        currentTerminalEl = null;
+    };
+
+    // 最小化ボタン（黄丸）— ポップアップを閉じてチャット内にサマリーを残す
+    win.querySelector(".exec-dot-min").onclick = () => {
+        overlay.remove();
+        currentTerminalEl = null;
+    };
+
+    // タイトルバーダブルクリックで最小化/復元
+    win.querySelector(".exec-terminal-titlebar").ondblclick = () => {
+        win.classList.toggle("minimized");
+    };
 }
 
 function appendExecOutput(data) {
     if (!currentTerminalEl) return;
     const output = currentTerminalEl.querySelector(".exec-terminal-output");
+    if (!output) return;
     const line = document.createElement("div");
     line.className = `exec-line ${data.stream}`;
     line.textContent = data.content;
     output.appendChild(line);
-    // 出力が多い時のスクロール
-    if (output.children.length > 200) {
+    if (output.children.length > 500) {
         output.removeChild(output.firstChild);
     }
-    scrollToBottom();
+    // 出力エリアを自動スクロール
+    const body = currentTerminalEl.querySelector(".exec-terminal-body");
+    if (body) body.scrollTop = body.scrollHeight;
 }
 
 function finalizeExecTerminal(data) {
     if (!currentTerminalEl) return;
-    const header = currentTerminalEl.querySelector(".exec-terminal-title");
-    const status = currentTerminalEl.querySelector(".exec-terminal-status");
-    const timeEl = currentTerminalEl.querySelector(".exec-terminal-time");
+    const win = currentTerminalEl.querySelector(".exec-terminal-window");
+    const titleText = currentTerminalEl.querySelector(".exec-terminal-titletext");
+    const statusBar = currentTerminalEl.querySelector(".exec-terminal-statusbar");
+    const statusText = currentTerminalEl.querySelector(".exec-status-text");
+    const statusTime = currentTerminalEl.querySelector(".exec-status-time");
+    const titleTime = currentTerminalEl.querySelector(".exec-terminal-time");
 
     if (data.return_code === 0) {
-        header.textContent = "✓ 実行完了";
-        header.className = "exec-terminal-title success";
-        status.textContent = `正常終了`;
-        status.className = "exec-terminal-status success";
+        titleText.textContent = "✓ 実行完了";
+        titleText.className = "exec-terminal-titletext success";
+        statusBar.className = "exec-terminal-statusbar success";
+        statusText.textContent = "正常終了";
+        win.style.borderColor = "#3fb950";
     } else {
-        header.textContent = "✗ 実行失敗";
-        header.className = "exec-terminal-title error";
-        status.textContent = `終了コード: ${data.return_code}`;
-        status.className = "exec-terminal-status error";
+        titleText.textContent = "✗ 実行失敗";
+        titleText.className = "exec-terminal-titletext error";
+        statusBar.className = "exec-terminal-statusbar error";
+        statusText.textContent = `終了コード: ${data.return_code}`;
+        win.classList.add("error");
     }
-    timeEl.textContent = `${data.elapsed}秒`;
-    currentTerminalEl = null;
+    statusTime.textContent = `${data.elapsed}秒`;
+    titleTime.textContent = `${data.elapsed}秒`;
+
+    // チャット内にもサマリーを残す
+    const icon = data.return_code === 0 ? "✓" : "✗";
+    addMessage("tool_result", `${icon} exec_code 完了 (${data.elapsed}秒)`);
 }
 
 // --- カウントダウン ---
