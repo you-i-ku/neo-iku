@@ -448,6 +448,7 @@ def register_all():
         "プロジェクト内のファイルを読む（自分のコードを確認できる）",
         "path=ファイルパス（例: app/main.py） offset=開始位置（省略時は先頭から。続きを読む時に使う）",
         read_file,
+        required_args=["path"],
     )
     register_tool(
         "list_files",
@@ -460,30 +461,35 @@ def register_all():
         "ファイル名で検索する（部分一致）。ファイルの場所がわからない時に使う",
         "query=検索キーワード（例: 内省） path=検索開始ディレクトリ（省略時はプロジェクト全体）",
         search_files,
+        required_args=["query"],
     )
     register_tool(
         "create_file",
         "新規ファイルを作成する。既にファイルが存在する場合はエラーになる",
         'path=ファイルパス（例: data/memo.txt） content=書き込む内容',
         create_file,
+        required_args=["path", "content"],
     )
     register_tool(
         "overwrite_file",
         "既存ファイルを上書きする。ユーザーの承認が必要（承認UIが自動で表示される）",
         'path=ファイルパス（例: app/main.py） content=上書き後の内容',
         overwrite_file,
+        required_args=["path", "content"],
     )
     register_tool(
         "search_memories",
         "過去の会話や過去ログから記憶を検索する",
         "query=検索キーワード",
         search_memories,
+        required_args=["query"],
     )
     register_tool(
         "write_diary",
         "日記や内省メモを書いて記憶に保存する",
         'content=日記の内容（例: content="今日は自分のコードを読んで新しい発見があった"）',
         write_diary,
+        required_args=["content"],
     )
     register_tool(
         "search_action_log",
@@ -496,4 +502,5 @@ def register_all():
         "Pythonコードを実行する。ユーザーの承認が必要（承認UIが自動で表示される）",
         'code=実行するPythonコード（例: code="print(1+1)"）',
         exec_code,
+        required_args=["code"],
     )

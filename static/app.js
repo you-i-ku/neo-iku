@@ -124,6 +124,7 @@ function connect() {
 
             case "autonomous":
                 addAutonomousMessage(data.content);
+                loadMemories(memorySearch.value.trim());
                 break;
         }
     };

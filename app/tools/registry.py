@@ -8,12 +8,13 @@ logger = logging.getLogger("iku.tools")
 _tools: dict = {}
 
 
-def register_tool(name: str, description: str, args_desc: str, func):
-    """ツールを登録する"""
+def register_tool(name: str, description: str, args_desc: str, func, required_args: list[str] | None = None):
+    """ツールを登録する。required_argsがあると、それらが欠けた呼び出しは無視される"""
     _tools[name] = {
         "description": description,
         "args_desc": args_desc,
         "func": func,
+        "required_args": required_args or [],
     }
     logger.debug(f"ツール登録: {name}")
 
@@ -99,7 +100,10 @@ def _parse_args(args_str: str) -> dict:
             single = re.match(r'(\w+)=(.*)', args_str, re.DOTALL)
             if single:
                 args[single.group(1)] = single.group(2).strip()
-        # else: パースできない → 空のargsを返す
+        else:
+            # パターンにマッチしないが引数文字列は存在する → パース失敗マーカー
+            if args_str.strip():
+                args["__parse_failed__"] = args_str.strip()
 
     return args
 
@@ -202,13 +206,44 @@ def parse_tool_calls(text: str) -> list[tuple[str, dict]]:
         results.append((m.start(), name, args))
         matched_spans.append((m.start(), m.end()))
 
-    # 出現順にソートしてpositionを除去
+    # 出現順にソート
     results.sort(key=lambda x: x[0])
-    return [(name, args) for _, name, args in results]
+
+    # 必須引数チェック: 欠けている場合はエラー情報を付与
+    filtered = []
+    for _, name, args in results:
+        tool = _tools.get(name)
+
+        # パース失敗マーカーがある場合 → エラーとして返す
+        if "__parse_failed__" in args:
+            raw = args["__parse_failed__"]
+            args["__error__"] = f"引数のパースに失敗しました。元の引数: {raw}"
+            logger.debug(f"ツール呼び出しエラー（パース失敗）: {name} raw={raw}")
+            filtered.append((name, args))
+            continue
+
+        if tool and tool.get("required_args"):
+            missing = [r for r in tool["required_args"] if not args.get(r)]
+            if missing:
+                # argsが完全に空 → 会話文中の言及と見なしてスキップ
+                if not args:
+                    logger.debug(f"ツール呼び出しスキップ（引数なし、会話中の言及）: {name}")
+                    continue
+                # 一部の引数はあるが必須が欠けている → パース失敗、エラーとして返す
+                args["__error__"] = f"必須引数が不足しています: {', '.join(missing)}"
+                logger.debug(f"ツール呼び出しエラー（必須引数不足）: {name} missing={missing}")
+        filtered.append((name, args))
+
+    return filtered
 
 
 async def execute_tool(name: str, args: dict) -> str:
     """ツールを実行し結果文字列を返す。エラーも文字列として返す"""
+    # 引数パースエラーがある場合はそのまま返す
+    if "__error__" in args:
+        error_msg = args["__error__"]
+        return f"エラー: {error_msg}（引数の書き方を確認してください。例: [TOOL:{name} key=value]）"
+
     tool = _tools.get(name)
     if not tool:
         return f"エラー: ツール '{name}' は存在しません。"
