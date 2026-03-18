@@ -80,3 +80,56 @@ async def select_model(req: ModelRequest):
     if hasattr(llm, "set_model"):
         llm.set_model(req.model)
     return {"model": req.model}
+
+
+# --- 開発用ツール ---
+
+class IntervalRequest(BaseModel):
+    seconds: int
+
+@router.post("/dev/autonomous-interval")
+async def set_autonomous_interval(req: IntervalRequest):
+    """自律行動の間隔を変更"""
+    scheduler.set_interval(req.seconds)
+    return {"interval": scheduler._interval}
+
+
+@router.post("/dev/autonomous-trigger")
+async def trigger_autonomous():
+    """自律行動を即時実行"""
+    scheduler.trigger_now()
+    return {"triggered": True}
+
+
+class ToolRoundsRequest(BaseModel):
+    rounds: int
+
+@router.post("/dev/tool-max-rounds")
+async def set_tool_max_rounds(req: ToolRoundsRequest):
+    """ツール最大ラウンド数を変更"""
+    import config
+    config.TOOL_MAX_ROUNDS = max(1, min(30, req.rounds))
+    return {"tool_max_rounds": config.TOOL_MAX_ROUNDS}
+
+
+@router.post("/dev/reset-db")
+async def reset_db():
+    """iku_logs以外の全テーブルをクリア"""
+    from sqlalchemy import text
+    async with async_session() as session:
+        for table in ["messages", "conversations", "memory_summaries", "tool_actions"]:
+            await session.execute(text(f"DELETE FROM {table}"))
+        for fts in ["messages_fts", "memory_summaries_fts", "tool_actions_fts"]:
+            await session.execute(text(f"DELETE FROM {fts}"))
+        await session.commit()
+    return {"reset": True}
+
+
+@router.get("/dev/settings")
+async def get_dev_settings():
+    """開発用設定の現在値を取得"""
+    import config
+    return {
+        "autonomous_interval": scheduler._interval,
+        "tool_max_rounds": config.TOOL_MAX_ROUNDS,
+    }

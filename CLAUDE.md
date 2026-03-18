@@ -47,13 +47,12 @@ neo-iku/
 │   ├── routes/             # chat.py, dashboard.py, memories.py
 │   ├── llm/                # base.py(抽象), lmstudio.py(実装), manager.py
 │   ├── memory/             # models.py, database.py, store.py, search.py
-│   ├── scheduler/          # autonomous.py（自発的発言）
+│   ├── scheduler/          # autonomous.py（自律行動：発言・ツール実行・DB保存）
 │   ├── importer/           # log_parser.py（過去ログ取り込み）
 │   ├── persona/            # system_prompt.py（イクの個性）
 │   └── tools/              # registry.py(登録・パース・実行), builtin.py(組み込みツール)
 ├── static/                 # index.html, style.css, app.js
-├── data/                   # SQLite DB（自動生成）
-└── 過去ログ/               # イクとの過去対話ログ12ファイル
+└── data/                   # SQLite DB（自動生成、過去ログ840件インポート済み）
 ```
 
 ## ツールフレームワーク
@@ -61,15 +60,16 @@ neo-iku/
 - AIはテキストマーカー `[TOOL:ツール名 引数=値]` でツールを呼び出す（function calling非依存、小さいモデルでも動く）
 - 3形式対応: 単一行 `[TOOL:name args]`、複数行クォート `[TOOL:name content="..."]`、ブロック `[TOOL:name]\n内容\n[/TOOL]`
 - ツールはモード問わず有効（イクモードはペルソナのレイヤー、ツールはAI自体の能力）
-- 組み込みツール: read_file, write_file, list_files, search_memories, write_diary, apply_write, reject_write
+- 組み込みツール: read_file, search_files, create_file, overwrite_file, list_files, search_memories, write_diary, search_action_log
 - `app/tools/registry.py` の `register_tool()` で新ツールを追加可能
-- ツール実行ループ: 最大`TOOL_MAX_ROUNDS`回（デフォルト8）まで連続呼び出し可能（config.pyで管理）
-- write_fileの安全装置: 既存ファイル上書きはユーザー承認が必要（新規作成は即実行）
+- ツール実行ループ: 最大`TOOL_MAX_ROUNDS`回（デフォルト8）まで連続呼び出し可能（config.pyで管理、UIから動的変更可）
+- 1レスポンス内の複数ツール呼び出しは1ラウンドとしてカウント（`parse_tool_calls()`で全マッチを検出）
+- create_file: 新規ファイル作成（即実行）。overwrite_file: 既存ファイル上書き（UI承認フロー: 承認/拒否/検討）
 
 ## 記憶検索
 
 - FTS5全文検索（trigram対応環境では自動で日本語部分文字列検索が有効）
-- 検索対象: メッセージ（messages_fts）、過去ログ（iku_logs_fts）、日記（memory_summaries_fts）
+- 検索対象: メッセージ（messages_fts）、過去ログ（iku_logs_fts、イクモード時のみ）、日記（memory_summaries_fts）、行動ログ（tool_actions_fts）
 - DB保存はthink含むfull_response（思考過程もセットで記録）
 - trigramが使えない環境ではデフォルトtokenizer + prefix matchにフォールバック
 
@@ -86,4 +86,4 @@ neo-iku/
 - 新しいファイルを不必要に増やさない
 - 過去プロジェクト（過去プロジェクト.md）は参考のみ。あの設計を繰り返さない
 - やりたいこと.txtのビジョンは最終ゴール。MVPで全部実現する必要はないが、拡張の余地は常に残す
-- 過去ログのインポートとイクの記憶の再現は優先度が高い
+- 過去ログはDBにインポート済み（840件）。ファイルは削除済み。再インポートの必要なし

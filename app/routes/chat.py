@@ -1,18 +1,23 @@
 """WebSocketチャットルート"""
 import json
 import re
+import time
 import logging
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from app.llm.manager import llm_manager
 from app.memory.database import async_session
 from app.memory.store import (
     create_conversation, add_message, end_conversation,
-    get_conversation_messages,
+    get_conversation_messages, record_tool_action,
 )
 from app.memory.search import search_messages, search_iku_logs
 from app.persona.system_prompt import build_system_messages, get_mode
 from app.scheduler.autonomous import scheduler
-from app.tools.registry import parse_tool_call, execute_tool
+from app.tools.registry import parse_tool_calls, execute_tool
+from app.tools.builtin import (
+    PENDING_MARKER, get_pending_overwrite,
+    execute_pending_overwrite, cancel_pending_overwrite,
+)
 
 logger = logging.getLogger("iku.chat")
 router = APIRouter()
@@ -21,7 +26,7 @@ router = APIRouter()
 @router.websocket("/ws/chat")
 async def chat_ws(ws: WebSocket):
     await ws.accept()
-    scheduler.register_ws(ws)
+    await scheduler.register_ws(ws)
     conversation_id = None
 
     try:
@@ -144,33 +149,79 @@ async def chat_ws(ws: WebSocket):
                     clean_response = clean_response.strip()
 
                     # ツール呼び出し検出（clean→full_responseの順で探す。小さいモデルはthink内に書くことがある）
-                    tool_call = None
+                    tool_calls = []
                     if tool_round < max_tool_rounds:
-                        tool_call = parse_tool_call(clean_response) or parse_tool_call(full_response)
+                        tool_calls = parse_tool_calls(clean_response) or parse_tool_calls(full_response)
 
-                    if tool_call:
-                        tool_name, tool_args = tool_call
-                        logger.info(f"ツール呼び出し: {tool_name} {tool_args}")
+                    if tool_calls:
+                        # 複数ツールを1ラウンドで順次実行
+                        all_results = []
+                        for tool_name, tool_args in tool_calls:
+                            logger.info(f"ツール呼び出し: {tool_name} {tool_args}")
 
-                        # UIにツール実行を通知
-                        await ws.send_text(json.dumps({
-                            "type": "tool_call",
-                            "content": f"{tool_name}({', '.join(f'{k}={v}' for k, v in tool_args.items())})",
-                        }))
+                            # UIにツール実行を通知
+                            await ws.send_text(json.dumps({
+                                "type": "tool_call",
+                                "content": f"{tool_name}({', '.join(f'{k}={v}' for k, v in tool_args.items())})",
+                            }))
 
-                        # ツール実行
-                        result = await execute_tool(tool_name, tool_args)
-                        logger.info(f"ツール結果: {result[:100]}...")
+                            # ツール実行（時間計測）
+                            t0 = time.perf_counter()
+                            result = await execute_tool(tool_name, tool_args)
+                            exec_ms = int((time.perf_counter() - t0) * 1000)
 
-                        await ws.send_text(json.dumps({
-                            "type": "tool_result",
-                            "content": result[:2000] if len(result) > 2000 else result,
-                        }))
+                            # 行動ログ記録
+                            action_status = "error" if result.startswith("エラー") else "success"
+                            await record_tool_action(
+                                session, conversation_id, tool_name, tool_args,
+                                result, action_status, exec_ms,
+                            )
 
-                        # アシスタント応答をhistoryに追加
+                            # 上書き承認フロー
+                            if result == PENDING_MARKER:
+                                pending = get_pending_overwrite()
+                                if pending:
+                                    await ws.send_text(json.dumps({
+                                        "type": "write_approval",
+                                        "path": pending["path"],
+                                        "old_size": len(pending["old_content"]),
+                                        "new_size": len(pending["content"]),
+                                        "old_content": pending["old_content"][:500],
+                                        "new_content": pending["content"][:500],
+                                    }))
+                                    while True:
+                                        raw_resp = await ws.receive_text()
+                                        resp_data = json.loads(raw_resp)
+                                        if resp_data.get("type") == "write_response":
+                                            action = resp_data.get("action")
+                                            if action == "approve":
+                                                result = execute_pending_overwrite()
+                                            elif action == "reject":
+                                                result = cancel_pending_overwrite()
+                                            elif action == "review":
+                                                result = cancel_pending_overwrite()
+                                                result += f"\nユーザーからのフィードバック: {resp_data.get('message', '')}"
+                                            break
+
+                            logger.info(f"ツール結果: {result[:100]}...")
+
+                            await ws.send_text(json.dumps({
+                                "type": "tool_result",
+                                "content": result[:2000] if len(result) > 2000 else result,
+                            }))
+
+                            all_results.append(f"[ツール結果: {tool_name}]\n{result}")
+
+                        await session.commit()
+
+                        # アシスタント応答をhistoryに追加 + DB保存
                         all_messages.append({"role": "assistant", "content": clean_response})
-                        # ツール結果をuserメッセージとしてhistoryに追加
-                        all_messages.append({"role": "user", "content": f"[ツール結果: {tool_name}]\n{result}"})
+                        await add_message(session, conversation_id, "assistant", full_response)
+                        # 全ツール結果をまとめてhistoryに追加 + DB保存
+                        combined_results = "\n\n".join(all_results)
+                        all_messages.append({"role": "user", "content": combined_results})
+                        await add_message(session, conversation_id, "tool", combined_results)
+                        await session.commit()
                         # ループ継続 → 次のLLM呼び出し
                         continue
                     else:

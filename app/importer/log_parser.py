@@ -2,7 +2,9 @@
 import re
 import logging
 from pathlib import Path
-from config import LOG_DIR
+from config import BASE_DIR
+
+LOG_DIR = BASE_DIR / "過去ログ"
 
 logger = logging.getLogger("iku.importer")
 

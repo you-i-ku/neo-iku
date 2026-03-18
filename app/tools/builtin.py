@@ -7,8 +7,9 @@ from pathlib import Path
 from config import BASE_DIR, DATA_DIR
 from app.tools.registry import register_tool
 
-# 承認待ちの書き込み（メモリ上に保持、1件のみ）
-_pending_write: dict | None = None
+# 承認待ちの上書きデータ（メモリ上に保持、1件のみ）
+_pending_overwrite: dict | None = None
+PENDING_MARKER = "__PENDING_OVERWRITE__"
 
 
 async def read_file(path: str = "", offset: str = "0") -> str:
@@ -95,6 +96,39 @@ async def list_files(path: str = ".") -> str:
         return f"エラー: {e}"
 
 
+async def search_files(query: str = "", path: str = ".") -> str:
+    """ファイル名で検索する（部分一致）"""
+    if not query:
+        return "エラー: queryを指定してください。"
+
+    if path in ("/", ""):
+        path = "."
+    target = (BASE_DIR / path).resolve()
+
+    if not str(target).startswith(str(BASE_DIR.resolve())):
+        return "エラー: プロジェクト外は検索できません。"
+
+    SKIP = {".git", "__pycache__", ".venv", "node_modules", ".pytest_cache"}
+    matches = []
+
+    for root, dirs, files in os.walk(target):
+        dirs[:] = [d for d in dirs if d not in SKIP and not d.startswith(".")]
+        for f in files:
+            if query.lower() in f.lower():
+                rel = os.path.relpath(os.path.join(root, f), BASE_DIR)
+                matches.append(rel.replace("\\", "/"))
+
+    if not matches:
+        return f"「{query}」に一致するファイルは見つかりませんでした。"
+
+    lines = [f"「{query}」の検索結果（{len(matches)}件）:"]
+    for m in matches[:20]:
+        lines.append(f"  {m}")
+    if len(matches) > 20:
+        lines.append(f"  ...他{len(matches) - 20}件")
+    return "\n".join(lines)
+
+
 async def search_memories(query: str = "") -> str:
     """記憶を検索する"""
     if not query:
@@ -102,10 +136,11 @@ async def search_memories(query: str = "") -> str:
 
     from app.memory.database import async_session
     from app.memory.search import search_messages, search_iku_logs, search_diary
+    from app.persona.system_prompt import get_mode
 
     async with async_session() as session:
         chat_results = await search_messages(session, query)
-        log_results = await search_iku_logs(session, query)
+        log_results = await search_iku_logs(session, query) if get_mode() == "iku" else []
         diary_results = await search_diary(session, query)
 
     lines = []
@@ -150,80 +185,79 @@ def _do_write(target: Path, path: str, content: str) -> str:
         return f"エラー: ファイル書き込み失敗: {e}"
 
 
-async def write_file(path: str = "", content: str = "") -> str:
-    """プロジェクト内のファイルを作成・上書きする（自己改変能力）"""
-    global _pending_write
-
+def _check_write_path(path: str):
+    """書き込みパスのバリデーション。問題なければ (target, None)、エラーなら (None, error_msg)"""
     if not path:
-        return "エラー: pathを指定してください。"
+        return None, "エラー: pathを指定してください。"
+    target = (BASE_DIR / path).resolve()
+    if not str(target).startswith(str(BASE_DIR.resolve())):
+        return None, "エラー: プロジェクト外への書き込みはできません。"
+    if ".git" in target.parts:
+        return None, "エラー: .git内への書き込みは禁止です。"
+    return target, None
+
+
+async def create_file(path: str = "", content: str = "") -> str:
+    """新規ファイルを作成する（既存ファイルには使えない）"""
     if not content:
         return "エラー: contentを指定してください。"
-
-    target = (BASE_DIR / path).resolve()
-    base = str(BASE_DIR.resolve())
-
-    # セキュリティ: BASE_DIRの外へのアクセス禁止
-    if not str(target).startswith(base):
-        return "エラー: プロジェクト外への書き込みはできません。"
-
-    # 安全装置: .git内への書き込み禁止
-    if ".git" in target.parts:
-        return "エラー: .git内への書き込みは禁止です。"
-
-    # 既存ファイルの上書き → Human-in-the-loop（承認が必要）
+    target, err = _check_write_path(path)
+    if err:
+        return err
     if target.exists():
-        old_content = target.read_text(encoding="utf-8")
-        _pending_write = {
-            "path": path,
-            "target": str(target),
-            "content": content,
-            "old_content": old_content,
-            "created_at": datetime.now().isoformat(),
-        }
-
-        # 変更のプレビューを生成
-        old_lines = old_content.splitlines()
-        new_lines = content.splitlines()
-        preview = f"【承認待ち】既存ファイルの上書き: {path}\n"
-        preview += f"現在: {len(old_content)}文字 → 変更後: {len(content)}文字\n\n"
-        preview += f"--- 変更後の先頭200文字 ---\n{content[:200]}"
-        if len(content) > 200:
-            preview += "\n..."
-        preview += "\n\n⚠ このファイルを上書きするにはユーザーの承認が必要です。"
-        preview += "\nユーザーに変更の意図を説明して承認を求めてください。"
-        preview += "\n承認後 [TOOL:apply_write] を呼んでください。"
-        return preview
-
-    # 新規ファイル → そのまま作成
+        return f"エラー: '{path}' は既に存在します。上書きしたい場合は overwrite_file を使ってください。"
     return _do_write(target, path, content)
 
 
-async def apply_write() -> str:
-    """承認済みの保留中の書き込みを実行する"""
-    global _pending_write
+async def overwrite_file(path: str = "", content: str = "") -> str:
+    """既存ファイルを上書きする（ユーザー承認が必要）"""
+    global _pending_overwrite
 
-    if _pending_write is None:
-        return "エラー: 承認待ちの書き込みはありません。"
+    if not content:
+        return "エラー: contentを指定してください。"
+    target, err = _check_write_path(path)
+    if err:
+        return err
+    if not target.exists():
+        return f"エラー: '{path}' は存在しません。新規作成は create_file を使ってください。"
 
-    path = _pending_write["path"]
-    target = Path(_pending_write["target"])
-    content = _pending_write["content"]
+    old_content = target.read_text(encoding="utf-8")
+    _pending_overwrite = {
+        "path": path,
+        "target": str(target),
+        "content": content,
+        "old_content": old_content,
+    }
 
-    result = _do_write(target, path, content)
-    _pending_write = None
-    return result
+    # マーカー付きプレビューを返す（chat.pyが検出して承認UIを出す）
+    return PENDING_MARKER
 
 
-async def reject_write() -> str:
-    """保留中の書き込みを却下する"""
-    global _pending_write
+def get_pending_overwrite() -> dict | None:
+    """承認待ちの上書きデータを取得"""
+    return _pending_overwrite
 
-    if _pending_write is None:
-        return "承認待ちの書き込みはありません。"
 
-    path = _pending_write["path"]
-    _pending_write = None
-    return f"書き込みを却下しました: {path}"
+def execute_pending_overwrite() -> str:
+    """承認済みの上書きを実行"""
+    global _pending_overwrite
+    if _pending_overwrite is None:
+        return "エラー: 承認待ちの上書きはありません。"
+    path = _pending_overwrite["path"]
+    target = Path(_pending_overwrite["target"])
+    content = _pending_overwrite["content"]
+    _pending_overwrite = None
+    return _do_write(target, path, content)
+
+
+def cancel_pending_overwrite() -> str:
+    """承認待ちの上書きをキャンセル"""
+    global _pending_overwrite
+    if _pending_overwrite is None:
+        return "承認待ちの上書きはありません。"
+    path = _pending_overwrite["path"]
+    _pending_overwrite = None
+    return f"ユーザーにより上書きを拒否されました: {path}"
 
 
 async def write_diary(content: str = "", keywords: str = "") -> str:
@@ -254,6 +288,34 @@ async def write_diary(content: str = "", keywords: str = "") -> str:
     return f"日記を保存しました。（{datetime.now().strftime('%Y-%m-%d %H:%M')}）"
 
 
+async def search_action_log(query: str = "", tool_name: str = "") -> str:
+    """自分の行動履歴を検索する"""
+    from app.memory.database import async_session
+    from app.memory.search import search_tool_actions
+
+    async with async_session() as session:
+        results = await search_tool_actions(session, query=query, tool_name=tool_name)
+
+    if not results:
+        msg = "行動履歴は見つかりませんでした。"
+        if query:
+            msg = f"「{query}」に一致する行動履歴は見つかりませんでした。"
+        return msg
+
+    lines = [f"行動履歴（{len(results)}件）:"]
+    for r in results:
+        ts = str(r.get("created_at", ""))[:19]
+        status = r.get("status", "success")
+        ms = r.get("execution_ms")
+        time_str = f" ({ms}ms)" if ms else ""
+        lines.append(f"- [{ts}] {r['tool_name']}({r['arguments']}) → {status}{time_str}")
+        summary = r.get("result_summary", "")
+        if summary:
+            lines.append(f"  結果: {summary[:150]}")
+
+    return "\n".join(lines)
+
+
 def register_all():
     """全組み込みツールを登録"""
     register_tool(
@@ -269,22 +331,22 @@ def register_all():
         list_files,
     )
     register_tool(
-        "write_file",
-        "プロジェクト内のファイルを作成・上書きする。新規ファイルは即座に作成される。既存ファイルの上書きは保留状態になり、ユーザー承認後にapply_writeで実行する",
+        "search_files",
+        "ファイル名で検索する（部分一致）。ファイルの場所がわからない時に使う",
+        "query=検索キーワード（例: 内省） path=検索開始ディレクトリ（省略時はプロジェクト全体）",
+        search_files,
+    )
+    register_tool(
+        "create_file",
+        "新規ファイルを作成する。既にファイルが存在する場合はエラーになる",
         'path=ファイルパス（例: data/memo.txt） content=書き込む内容',
-        write_file,
+        create_file,
     )
     register_tool(
-        "apply_write",
-        "write_fileで保留になった既存ファイル上書きを実行する。write_fileが「承認待ち」を返した場合のみ使う。新規作成時は不要",
-        "引数なし。ユーザーが承認した後に呼ぶ",
-        apply_write,
-    )
-    register_tool(
-        "reject_write",
-        "保留中のファイル書き込みを却下する",
-        "引数なし。ユーザーが却下した場合に呼ぶ",
-        reject_write,
+        "overwrite_file",
+        "既存ファイルを上書きする。ユーザーの承認が必要（承認UIが自動で表示される）",
+        'path=ファイルパス（例: app/main.py） content=上書き後の内容',
+        overwrite_file,
     )
     register_tool(
         "search_memories",
@@ -297,4 +359,10 @@ def register_all():
         "日記や内省メモを書いて記憶に保存する",
         'content=日記の内容（例: content="今日は自分のコードを読んで新しい発見があった"）',
         write_diary,
+    )
+    register_tool(
+        "search_action_log",
+        "自分の過去の行動履歴を検索する（どのツールをいつ使ったか振り返れる）",
+        "query=検索キーワード（省略可） tool_name=ツール名でフィルタ（省略可）",
+        search_action_log,
     )

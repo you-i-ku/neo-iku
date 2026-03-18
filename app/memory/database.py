@@ -46,6 +46,7 @@ async def init_db():
             "messages_fts": f"USING fts5(content, content_rowid='id'{tokenize_opt})",
             "iku_logs_fts": f"USING fts5(content, content_rowid='id'{tokenize_opt})",
             "memory_summaries_fts": f"USING fts5(content, keywords, content_rowid='id'{tokenize_opt})",
+            "tool_actions_fts": f"USING fts5(tool_name, arguments, result_summary{tokenize_opt})",
         }
         for table_name, definition in fts_tables.items():
             if await _needs_rebuild(conn, table_name, use_trigram):
@@ -82,6 +83,16 @@ async def init_db():
         if diary_count > 0 and diary_fts_count == 0:
             await conn.execute(text(
                 "INSERT INTO memory_summaries_fts(rowid, content, keywords) SELECT id, content, keywords FROM memory_summaries"
+            ))
+
+        row = await conn.execute(text("SELECT COUNT(*) FROM tool_actions_fts"))
+        action_fts_count = row.scalar()
+        row = await conn.execute(text("SELECT COUNT(*) FROM tool_actions"))
+        action_count = row.scalar()
+
+        if action_count > 0 and action_fts_count == 0:
+            await conn.execute(text(
+                "INSERT INTO tool_actions_fts(rowid, tool_name, arguments, result_summary) SELECT id, tool_name, arguments, result_summary FROM tool_actions"
             ))
 
 

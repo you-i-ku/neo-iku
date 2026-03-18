@@ -43,6 +43,20 @@ class IkuLog(Base):
     sequence = Column(Integer, nullable=False)  # ファイル内の順序
 
 
+class ToolAction(Base):
+    """ツール実行履歴（メタ認知の基盤）"""
+    __tablename__ = "tool_actions"
+
+    id = Column(Integer, primary_key=True)
+    conversation_id = Column(Integer, nullable=True)
+    tool_name = Column(String(100), nullable=False)
+    arguments = Column(Text, nullable=False)       # JSON文字列
+    result_summary = Column(Text, nullable=False)   # 結果の先頭500文字
+    status = Column(String(20), default="success")  # success / error
+    execution_ms = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class MemorySummary(Base):
     """将来イク自身が自発的に生成する要約用（今は未使用）"""
     __tablename__ = "memory_summaries"

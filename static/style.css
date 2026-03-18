@@ -218,6 +218,107 @@ body {
     content: "→ ";
 }
 
+.message.autonomous-tool {
+    align-self: flex-start;
+    background: #1a1030;
+    border: 1px solid #2d1f5e;
+    border-left: 3px solid #8b5cf6;
+    color: #7c6aad;
+    font-size: 12px;
+    font-family: "Consolas", "Courier New", monospace;
+    padding: 6px 12px;
+    max-width: 90%;
+}
+
+/* ファイル上書き承認UI */
+.message.write-approval {
+    align-self: flex-start;
+    background: #1a1a0d;
+    border: 1px solid #4a4520;
+    border-left: 3px solid #d29922;
+    max-width: 90%;
+    padding: 16px;
+}
+
+.write-approval-header {
+    font-weight: 600;
+    color: #d29922;
+    margin-bottom: 8px;
+}
+
+.write-approval-meta {
+    font-size: 12px;
+    color: #8b949e;
+    margin-bottom: 12px;
+}
+
+.write-approval details {
+    margin-bottom: 8px;
+}
+
+.write-approval summary {
+    font-size: 13px;
+    color: #8b949e;
+    cursor: pointer;
+}
+
+.write-preview {
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 11px;
+    color: #8b949e;
+    background: #0d1117;
+    padding: 8px;
+    border-radius: 4px;
+    max-height: 150px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin-top: 4px;
+}
+
+.write-approval-buttons {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.write-btn {
+    padding: 6px 16px;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.write-btn.approve { background: #238636; color: #fff; }
+.write-btn.approve:hover { background: #2ea043; }
+.write-btn.reject { background: #6e3030; color: #f08080; }
+.write-btn.reject:hover { background: #8b3a3a; }
+.write-btn.review { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
+.write-btn.review:hover { background: #30363d; }
+.write-btn.send-review { background: #1f6feb; color: #fff; }
+.write-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.write-review-area {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+    align-items: flex-end;
+}
+
+.write-review-area textarea {
+    flex: 1;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #c9d1d9;
+    padding: 8px;
+    font-size: 13px;
+    font-family: inherit;
+    resize: none;
+    outline: none;
+}
+
 .message.error {
     align-self: center;
     background: #3d1f1f;
@@ -316,6 +417,11 @@ body {
     font-size: 14px;
 }
 
+.countdown {
+    font-variant-numeric: tabular-nums;
+    color: #8b5cf6;
+}
+
 .model-select {
     background: #161b22;
     color: #c9d1d9;
@@ -411,6 +517,105 @@ body {
     background: #21262d;
     padding: 1px 6px;
     border-radius: 3px;
+}
+
+/* 開発用ツール */
+.dev-tools {
+    border: 1px solid #d29922;
+    border-radius: 8px;
+    padding: 12px 16px !important;
+    background: #1a1a0d;
+}
+
+.dev-tools h3 {
+    color: #d29922 !important;
+}
+
+.dev-tools-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.dev-item {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.dev-item label {
+    font-size: 12px;
+    color: #8b949e;
+}
+
+.dev-row {
+    display: flex;
+    gap: 6px;
+}
+
+.dev-row input {
+    flex: 1;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    color: #c9d1d9;
+    padding: 6px 8px;
+    font-size: 13px;
+    outline: none;
+    min-width: 0;
+}
+
+.dev-row input:focus {
+    border-color: #d29922;
+}
+
+.dev-row button {
+    background: #21262d;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    padding: 6px 12px;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.dev-row button:hover {
+    background: #30363d;
+}
+
+.dev-btn {
+    width: 100%;
+    padding: 8px;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.dev-btn.trigger {
+    background: #1a1040;
+    color: #a78bfa;
+    border-color: #7c3aed;
+}
+
+.dev-btn.trigger:hover {
+    background: #2d1f5e;
+}
+
+.dev-btn.danger {
+    background: #3d1f1f;
+    color: #f08080;
+    border-color: #6e3030;
+}
+
+.dev-btn.danger:hover {
+    background: #4a2424;
+}
+
+.dev-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
 }
 
 /* ログパネル */

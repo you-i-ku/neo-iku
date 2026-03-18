@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>イク — neo-iku</title>
-    <link rel="stylesheet" href="/static/style.css?v=5">
+    <link rel="stylesheet" href="/static/style.css?v=8">
 </head>
 <body>
     <div class="container">
@@ -48,6 +48,10 @@
                                 <option value="">読み込み中...</option>
                             </select>
                         </div>
+                        <div class="status-item">
+                            <span class="label">次の自律行動</span>
+                            <span id="autonomous-countdown" class="value countdown">—</span>
+                        </div>
                     </div>
                 </div>
 
@@ -59,6 +63,29 @@
                         <button id="search-btn">検索</button>
                     </div>
                     <div id="memory-list" class="memory-list"></div>
+                </div>
+
+                <!-- 開発用ツール -->
+                <div class="section dev-tools">
+                    <h3>開発用ツール</h3>
+                    <div class="dev-tools-grid">
+                        <div class="dev-item">
+                            <label>自律行動間隔（秒）</label>
+                            <div class="dev-row">
+                                <input id="dev-interval" type="number" min="10" value="300">
+                                <button id="dev-interval-btn">設定</button>
+                            </div>
+                        </div>
+                        <div class="dev-item">
+                            <label>ツール最大ラウンド</label>
+                            <div class="dev-row">
+                                <input id="dev-rounds" type="number" min="1" max="30" value="8">
+                                <button id="dev-rounds-btn">設定</button>
+                            </div>
+                        </div>
+                        <button id="dev-trigger-btn" class="dev-btn trigger">今すぐ自律行動</button>
+                        <button id="dev-reset-btn" class="dev-btn danger">DBリセット（過去ログ以外）</button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -73,6 +100,6 @@
             <div id="log-content" class="log-content"></div>
         </div>
     </div>
-    <script src="/static/app.js?v=5"></script>
+    <script src="/static/app.js?v=8"></script>
 </body>
 </html>

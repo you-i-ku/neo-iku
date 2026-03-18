@@ -22,6 +22,45 @@ async def search_diary(session: AsyncSession, query: str, limit: int = MEMORY_SE
                              columns=["id", "content", "keywords", "created_at", "source"])
 
 
+async def search_tool_actions(session: AsyncSession, query: str = "",
+                               tool_name: str = "", limit: int = 10) -> list[dict]:
+    """ツール実行履歴を検索（FTS5 + tool_nameフィルタ）"""
+    # クエリもツール名フィルタもない場合は最新を返す
+    if not query.strip() and not tool_name.strip():
+        from sqlalchemy import text
+        result = await session.execute(text(
+            "SELECT id, tool_name, arguments, result_summary, status, execution_ms, created_at "
+            "FROM tool_actions ORDER BY id DESC LIMIT :limit"
+        ), {"limit": limit})
+        return [dict(zip(["id", "tool_name", "arguments", "result_summary", "status", "execution_ms", "created_at"], row))
+                for row in result.fetchall()]
+
+    if query.strip():
+        # FTS5検索
+        results = await _fts_search(
+            session, "tool_actions_fts", "tool_actions", query, limit,
+            columns=["id", "tool_name", "arguments", "result_summary", "status", "execution_ms", "created_at"],
+        )
+    else:
+        results = []
+
+    # tool_nameフィルタ
+    if tool_name.strip():
+        if results:
+            results = [r for r in results if r["tool_name"] == tool_name.strip()]
+        else:
+            # クエリなし + tool_nameフィルタのみ
+            from sqlalchemy import text
+            result = await session.execute(text(
+                "SELECT id, tool_name, arguments, result_summary, status, execution_ms, created_at "
+                "FROM tool_actions WHERE tool_name = :name ORDER BY id DESC LIMIT :limit"
+            ), {"name": tool_name.strip(), "limit": limit})
+            results = [dict(zip(["id", "tool_name", "arguments", "result_summary", "status", "execution_ms", "created_at"], row))
+                       for row in result.fetchall()]
+
+    return results
+
+
 def _build_fts_query(query: str, use_trigram: bool) -> str:
     """検索クエリを構築する。trigramの場合は各単語をフレーズとして扱う"""
     words = query.strip().split()

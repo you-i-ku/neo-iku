@@ -101,12 +101,11 @@
 - [x] `search_diary()` 追加、`search_memories` ツールが日記も含めて検索
 - [x] `write_diary` がFTS5にも挿入するように修正
 
-### Step 16: 自己改変能力（write_file + Human-in-the-loop）
-- [x] `write_file` ツール — プロジェクト内のファイルを作成・上書き
-- [x] 新規ファイル作成は即実行、既存ファイル上書きは承認フローへ
-- [x] `apply_write` ツール — ユーザー承認後に保留書き込みを実行
-- [x] `reject_write` ツール — ユーザー却下時に保留書き込みを破棄
-- [x] 変更プレビュー表示（現在サイズ→変更後サイズ、先頭200文字）
+### Step 16: 自己改変能力（create_file + overwrite_file + Human-in-the-loop）
+- [x] `create_file` ツール — 新規ファイル作成（即実行、既存ファイルにはエラー）
+- [x] `overwrite_file` ツール — 既存ファイル上書き（UI承認フロー: 承認/拒否/検討）
+- [x] 承認UIで変更前後のプレビュー表示（先頭500文字）
+- [x] 「検討」ボタンでユーザーがフィードバックメッセージを送信→LLMに戻す
 - [x] セキュリティ: BASE_DIR外・.git内への書き込み禁止
 
 ### Step 17: ツールパーサー強化
@@ -140,8 +139,49 @@
 - [x] 自律発言のthinkアニメーション — 紫テーマの「think...」表示→完了後にポンと本文表示
 - [x] autonomous_think_start/end WebSocketメッセージ追加
 - [x] autonomous.pyに_broadcastヘルパー抽出
-- [x] apply_write/reject_writeのツール説明文を明確化（新規作成時は不要と明記）
 - [x] Claude Codeスキルを`.claude/skills/`形式にリファクタリング（YAMLフロントマター付き）
+
+### Step 21: ツール改善 + 過去ログ整理
+- [x] `search_files` ツール追加 — ファイル名の部分一致検索（ツール呼び出し回数削減）
+- [x] `write_file`/`apply_write`/`reject_write` → `create_file`/`overwrite_file` にリファクタ
+- [x] overwrite_file承認UI（承認/拒否/検討ボタン、検討時はフィードバック送信）
+- [x] ブロック形式の例文改善（LLMがプレースホルダーをコピーする問題の対策）
+- [x] 過去ログをDBにインポート済み（840件）→ 過去ログ/ディレクトリ削除
+- [x] `search_memories` ツールのiku_logs検索をイクモード時のみに制限
+- [x] config.pyからLOG_DIR削除（log_parser.py内にローカル化）
+
+### Step 20: 自律行動 + git化
+- [x] gitリポジトリ化 + GitHubプライベートリポへプッシュ（you-i-ku/neo-iku）
+- [x] 自律発言→自律行動へ進化 — プロンプトにツール説明を注入、行動も発言も自由に
+- [x] 自律行動のDB保存 — 発言・行動内容をconversations+messagesに保存（FTS5検索可能）
+- [x] 自律行動カウントダウン表示 — ダッシュボードに次の行動までの残り時間をリアルタイム表示
+- [x] WebSocket接続時にカウントダウン残り秒数を即時送信（途中接続対応）
+- [x] 自律行動中のツール使用表示 — 紫テーマでメッセージとして残る（連鎖時は各ツールごとに表示）
+- [x] 自律行動の重複防止 — `_is_speaking`フラグで実行中は次回スキップ
+- [x] startAutonomousThinkで旧thinkブロックのクリーンアップ
+
+### Step 22: 行動ログ（メタ認知の基盤）
+- [x] `tool_actions` テーブル追加（tool_name, arguments, result_summary, status, execution_ms, created_at）
+- [x] `tool_actions_fts` FTS5仮想テーブル追加（tool_name, arguments, result_summaryで検索可能）
+- [x] `record_tool_action()` — ツール実行履歴をDBに記録（メインテーブル + FTS5同時挿入）
+- [x] `search_tool_actions()` — FTS5検索 + tool_nameフィルタ（クエリ空なら最新を返す）
+- [x] `search_action_log` ツール追加 — イク自身が過去の行動履歴を検索できる
+- [x] チャット・自律行動の両方でツール実行時に自動記録（実行時間も計測）
+
+### Step 23: 複数ツール同時呼び出し
+- [x] `parse_tool_calls()` 追加 — 1レスポンス内の全ツール呼び出しを検出（ブロック・複数行・単一行の3形式対応、重複排除）
+- [x] チャット・自律行動の両方で1ラウンド内に複数ツールを順次実行
+- [x] 複数ツール呼び出し = 1ラウンドとしてカウント（TOOL_MAX_ROUNDSを消費しない）
+- [x] ツール結果をまとめて1メッセージとしてhistoryに追加
+- [x] プロンプトに「1回の応答で複数ツールを同時に呼べる」旨を追記
+
+### Step 24: 開発用ツールUI
+- [x] 自律行動間隔設定 — 秒数入力で即反映（最低10秒、asyncio.Event待ちに変更）
+- [x] DBリセットボタン — 確認ダイアログ付き、iku_logs以外を全クリア（FTS含む）
+- [x] ツール最大ラウンド変更 — 1〜30で即反映（config.TOOL_MAX_ROUNDSを動的変更）
+- [x] 「今すぐ自律行動」ボタン — カウントダウンをスキップして即実行（trigger_now()）
+- [x] 開発用API: `/api/dev/settings`, `/api/dev/autonomous-interval`, `/api/dev/autonomous-trigger`, `/api/dev/tool-max-rounds`, `/api/dev/reset-db`
+- [x] 黄色ボーダー枠でダッシュボード下部に配置
 
 ## 残タスク
 
@@ -149,12 +189,15 @@
 - [x] イクモード切替 → 過去ログ自動インポートの確認
 - [x] thinking表示の動作確認（thinkingモデルで）
 - [x] ツール実行の確認（read_file, list_files, search_memories, write_diary）
-- [ ] write_fileの動作確認（新規作成 + 既存上書き承認フロー）
+- [ ] create_file/overwrite_fileの動作確認（新規作成 + 既存上書き承認フロー）
 - [ ] trigram検索の精度確認（日本語部分文字列で検索ヒットするか）
 - [x] 自律発言のthink表示確認
 - [ ] 過去の話題に言及 → 記憶から参照されるか確認
 - [ ] 会話後リロード → メッセージ数が増えているか確認
-- [ ] 自発的発言の動作確認（5分放置）
+- [ ] 自律行動の動作確認（カウントダウン→think→発言/行動）
+- [ ] 行動ログの動作確認（ツール使用後に `[TOOL:search_action_log]` で履歴が返るか）
+- [ ] 複数ツール同時呼び出しの動作確認（LLMが2つ以上のツールを1レスポンスで呼んだ時に両方実行されるか）
+- [ ] 開発用ツールの動作確認（間隔変更・即時実行・ラウンド変更・DBリセット）
 
 ### UI改善
 - [ ] エラーハンドリング強化（LLM未接続時等）
@@ -180,6 +223,9 @@
 - data/iku.db は自動生成。削除すればリセット。
 - uvicorn reloadは無効（Windowsでプロセス残留問題があるため）。コード変更時は手動再起動。
 - ツールはモード問わず有効。イクモードはペルソナ+記憶のレイヤーであり、ツールはAI自体の能力。
-- write_fileの既存ファイル上書きは承認フロー必須。新規作成は即実行。
+- create_fileは新規のみ即実行。overwrite_fileは既存ファイル上書きで承認UI（承認/拒否/検討）必須。
+- 過去ログはDBにインポート済み（840件）。ファイルは削除済み。イクモード時のみ検索される。
 - DB保存はthink含むfull_response（思考過程もセットで記録）。
 - FTS5はtrigram対応環境では自動でtrigramトークナイザーを使用。
+- 自律行動の間隔・ツール最大ラウンドはUIから動的に変更可能（サーバー再起動不要）。
+- 開発用ツールのDBリセットはiku_logs以外を全削除（FTS含む）。

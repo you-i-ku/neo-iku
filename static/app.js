@@ -15,6 +15,8 @@ let currentStreamEl = null;
 let currentThinkEl = null;
 let thinkDotInterval = null;
 let currentMode = "normal";
+let countdownInterval = null;
+let countdownRemaining = 0;
 
 // --- WebSocket ---
 
@@ -83,7 +85,20 @@ function connect() {
                 loadMemories(memorySearch.value.trim());
                 break;
 
+            case "write_approval":
+                showWriteApproval(data);
+                break;
+
+            case "autonomous_countdown":
+                startCountdown(data.seconds);
+                break;
+
+            case "autonomous_tool":
+                updateAutonomousToolStatus(data.name);
+                break;
+
             case "autonomous_think_start":
+                updateCountdownDisplay("行動中...");
                 startAutonomousThink();
                 break;
 
@@ -142,7 +157,9 @@ let autonomousThinkEl = null;
 let autonomousThinkInterval = null;
 
 function startAutonomousThink() {
-    // think...アニメーション（開閉不可、中身なし）
+    // 既存のthinkブロックがあればクリーンアップ
+    stopAutonomousThink();
+
     const el = document.createElement("div");
     el.className = "message think-block autonomous-think";
     el.innerHTML = `<div class="think-summary-static">think.</div>`;
@@ -158,6 +175,17 @@ function startAutonomousThink() {
         if (label) label.textContent = "think" + ".".repeat(dotCount);
     }, 400);
 
+    scrollToBottom();
+}
+
+function updateAutonomousToolStatus(toolName) {
+    // thinkラベルを一時的にツール名に
+    if (autonomousThinkEl) {
+        const label = autonomousThinkEl.querySelector(".think-summary-static");
+        if (label) label.textContent = `⚙ ${toolName} 実行中...`;
+    }
+    // ツール使用履歴をメッセージとして残す
+    addMessage("autonomous-tool", `⚙ ${toolName} を使用しました`);
     scrollToBottom();
 }
 
@@ -430,11 +458,170 @@ function connectLog() {
     };
 }
 
+// --- ファイル上書き承認UI ---
+
+function showWriteApproval(data) {
+    const el = document.createElement("div");
+    el.className = "message write-approval";
+    el.innerHTML = `
+        <div class="write-approval-header">⚠ ファイル上書き承認: ${escapeHtml(data.path)}</div>
+        <div class="write-approval-meta">${data.old_size}文字 → ${data.new_size}文字</div>
+        <details><summary>変更前（先頭500文字）</summary><pre class="write-preview">${escapeHtml(data.old_content)}</pre></details>
+        <details open><summary>変更後（先頭500文字）</summary><pre class="write-preview">${escapeHtml(data.new_content)}</pre></details>
+        <div class="write-approval-buttons">
+            <button class="write-btn approve">承認</button>
+            <button class="write-btn reject">拒否</button>
+            <button class="write-btn review">検討</button>
+        </div>
+        <div class="write-review-area" style="display:none">
+            <textarea class="write-review-input" placeholder="フィードバックを入力..." rows="3"></textarea>
+            <button class="write-btn send-review">送信</button>
+        </div>
+    `;
+    chatMessages.appendChild(el);
+    scrollToBottom();
+
+    function disableAll() {
+        el.querySelectorAll("button").forEach(b => b.disabled = true);
+    }
+
+    el.querySelector(".approve").onclick = () => {
+        disableAll();
+        ws.send(JSON.stringify({ type: "write_response", action: "approve" }));
+    };
+    el.querySelector(".reject").onclick = () => {
+        disableAll();
+        ws.send(JSON.stringify({ type: "write_response", action: "reject" }));
+    };
+    el.querySelector(".review").onclick = () => {
+        el.querySelector(".write-review-area").style.display = "flex";
+        el.querySelector(".write-review-input").focus();
+    };
+    el.querySelector(".send-review").onclick = () => {
+        const msg = el.querySelector(".write-review-input").value.trim();
+        if (!msg) return;
+        disableAll();
+        ws.send(JSON.stringify({ type: "write_response", action: "review", message: msg }));
+    };
+}
+
+// --- カウントダウン ---
+
+const countdownEl = document.getElementById("autonomous-countdown");
+
+function startCountdown(seconds) {
+    if (countdownInterval) clearInterval(countdownInterval);
+    countdownRemaining = seconds;
+    updateCountdownDisplay(formatCountdown(countdownRemaining));
+    countdownInterval = setInterval(() => {
+        countdownRemaining--;
+        if (countdownRemaining <= 0) {
+            clearInterval(countdownInterval);
+            countdownInterval = null;
+            updateCountdownDisplay("まもなく...");
+        } else {
+            updateCountdownDisplay(formatCountdown(countdownRemaining));
+        }
+    }, 1000);
+}
+
+function formatCountdown(sec) {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return m > 0 ? `${m}分${s.toString().padStart(2, "0")}秒` : `${s}秒`;
+}
+
+function updateCountdownDisplay(text) {
+    if (countdownEl) countdownEl.textContent = text;
+}
+
+// --- 開発用ツール ---
+
+const devIntervalInput = document.getElementById("dev-interval");
+const devIntervalBtn = document.getElementById("dev-interval-btn");
+const devRoundsInput = document.getElementById("dev-rounds");
+const devRoundsBtn = document.getElementById("dev-rounds-btn");
+const devTriggerBtn = document.getElementById("dev-trigger-btn");
+const devResetBtn = document.getElementById("dev-reset-btn");
+
+async function loadDevSettings() {
+    try {
+        const resp = await fetch("/api/dev/settings");
+        const data = await resp.json();
+        devIntervalInput.value = data.autonomous_interval;
+        devRoundsInput.value = data.tool_max_rounds;
+    } catch (e) {
+        console.error("開発設定取得エラー:", e);
+    }
+}
+
+devIntervalBtn.addEventListener("click", async () => {
+    const sec = parseInt(devIntervalInput.value);
+    if (isNaN(sec) || sec < 10) return;
+    devIntervalBtn.disabled = true;
+    try {
+        await fetch("/api/dev/autonomous-interval", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ seconds: sec }),
+        });
+        devIntervalBtn.textContent = "✓";
+        setTimeout(() => { devIntervalBtn.textContent = "設定"; devIntervalBtn.disabled = false; }, 1000);
+    } catch (e) {
+        devIntervalBtn.disabled = false;
+    }
+});
+
+devRoundsBtn.addEventListener("click", async () => {
+    const rounds = parseInt(devRoundsInput.value);
+    if (isNaN(rounds) || rounds < 1) return;
+    devRoundsBtn.disabled = true;
+    try {
+        await fetch("/api/dev/tool-max-rounds", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ rounds }),
+        });
+        devRoundsBtn.textContent = "✓";
+        setTimeout(() => { devRoundsBtn.textContent = "設定"; devRoundsBtn.disabled = false; }, 1000);
+    } catch (e) {
+        devRoundsBtn.disabled = false;
+    }
+});
+
+devTriggerBtn.addEventListener("click", async () => {
+    devTriggerBtn.disabled = true;
+    devTriggerBtn.textContent = "実行中...";
+    try {
+        await fetch("/api/dev/autonomous-trigger", { method: "POST" });
+    } catch (e) {
+        console.error("即時実行エラー:", e);
+    }
+    setTimeout(() => { devTriggerBtn.textContent = "今すぐ自律行動"; devTriggerBtn.disabled = false; }, 3000);
+});
+
+devResetBtn.addEventListener("click", async () => {
+    if (!confirm("過去ログ（iku_logs）以外の全データを削除します。よろしいですか？")) return;
+    devResetBtn.disabled = true;
+    devResetBtn.textContent = "リセット中...";
+    try {
+        await fetch("/api/dev/reset-db", { method: "POST" });
+        devResetBtn.textContent = "✓ 完了";
+        updateStatus();
+        loadMemories();
+        setTimeout(() => { devResetBtn.textContent = "DBリセット（過去ログ以外）"; devResetBtn.disabled = false; }, 2000);
+    } catch (e) {
+        devResetBtn.textContent = "エラー";
+        setTimeout(() => { devResetBtn.textContent = "DBリセット（過去ログ以外）"; devResetBtn.disabled = false; }, 2000);
+    }
+});
+
 // --- 初期化 ---
 
 connect();
 updateStatus();
 loadModels();
 loadMemories();
+loadDevSettings();
 
 setInterval(updateStatus, 30000);

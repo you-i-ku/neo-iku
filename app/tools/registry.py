@@ -45,10 +45,15 @@ def build_tools_prompt() -> str:
     lines.append('例: [TOOL:search_memories query=過去の会話]')
     lines.append('例: [TOOL:write_diary content=今日は自分のコードを読んで面白い発見があった]')
     lines.append("")
-    lines.append("複数行の内容を書き込む場合はブロック形式を使ってください:")
-    lines.append("[TOOL:write_file path=ファイルパス]")
-    lines.append("ここに内容を書く（複数行OK）")
-    lines.append("[/TOOL]")
+    lines.append("1回の応答で複数のツールを同時に呼び出すこともできます:")
+    lines.append('例: [TOOL:read_file path=README.md]')
+    lines.append('[TOOL:read_file path=config.py]')
+    lines.append("")
+    lines.append("複数行の内容を書き込む場合はブロック形式を使えます:")
+    lines.append("  [TOOL:create_file path=ファイルパス]")
+    lines.append("  （ここに書き込みたい内容をそのまま全文書く。何行でもOK）")
+    lines.append("  [/TOOL]")
+    lines.append("※[TOOL]〜[/TOOL]の間がそのままファイルに書き込まれます。省略せず、実際の内容を全て書いてください。")
     return "\n".join(lines)
 
 
@@ -149,6 +154,55 @@ def parse_tool_call(text: str) -> tuple[str, dict] | None:
     args = _parse_args(args_str)
 
     return (name, args)
+
+
+def parse_tool_calls(text: str) -> list[tuple[str, dict]]:
+    """テキストから全てのツール呼び出しを検出し [(name, args_dict), ...] を返す。
+    重複検出を避けるためマッチ済み範囲を除外する。"""
+    results = []
+    matched_spans = []
+
+    def _overlaps(start: int, end: int) -> bool:
+        return any(s <= start < e or s < end <= e for s, e in matched_spans)
+
+    # 1. ブロック形式を先にチェック
+    for m in _BLOCK_PATTERN.finditer(text):
+        if _overlaps(m.start(), m.end()):
+            continue
+        name = m.group(1)
+        args_str = m.group(2).strip()
+        block_content = m.group(3)
+        args = _parse_args(args_str)
+        if "content" not in args:
+            args["content"] = _clean_content(block_content)
+        results.append((m.start(), name, args))
+        matched_spans.append((m.start(), m.end()))
+
+    # 2. 複数行クォート形式
+    for m in _MULTILINE_PATTERN.finditer(text):
+        if _overlaps(m.start(), m.end()):
+            continue
+        name = m.group(1)
+        args_str = m.group(2).strip()
+        args = _parse_args(args_str)
+        if "content" in args:
+            args["content"] = _clean_content(args["content"])
+        results.append((m.start(), name, args))
+        matched_spans.append((m.start(), m.end()))
+
+    # 3. 単一行形式
+    for m in _TOOL_PATTERN.finditer(text):
+        if _overlaps(m.start(), m.end()):
+            continue
+        name = m.group(1)
+        args_str = m.group(2).strip()
+        args = _parse_args(args_str)
+        results.append((m.start(), name, args))
+        matched_spans.append((m.start(), m.end()))
+
+    # 出現順にソートしてpositionを除去
+    results.sort(key=lambda x: x[0])
+    return [(name, args) for _, name, args in results]
 
 
 async def execute_tool(name: str, args: dict) -> str:

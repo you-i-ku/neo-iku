@@ -1,8 +1,9 @@
 """記憶CRUD操作"""
+import json
 from datetime import datetime
 from sqlalchemy import select, text, func
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.memory.models import Conversation, Message, IkuLog
+from app.memory.models import Conversation, Message, IkuLog, ToolAction
 
 
 async def create_conversation(session: AsyncSession, is_imported: bool = False) -> Conversation:
@@ -61,3 +62,33 @@ async def count_messages(session: AsyncSession) -> int:
 async def count_conversations(session: AsyncSession) -> int:
     result = await session.execute(select(func.count(Conversation.id)))
     return result.scalar() or 0
+
+
+async def record_tool_action(
+    session: AsyncSession,
+    conversation_id: int | None,
+    tool_name: str,
+    args: dict,
+    result: str,
+    status: str = "success",
+    execution_ms: int | None = None,
+) -> ToolAction:
+    """ツール実行履歴を記録"""
+    args_json = json.dumps(args, ensure_ascii=False)
+    result_summary = result[:500]
+
+    action = ToolAction(
+        conversation_id=conversation_id,
+        tool_name=tool_name,
+        arguments=args_json,
+        result_summary=result_summary,
+        status=status,
+        execution_ms=execution_ms,
+    )
+    session.add(action)
+    await session.flush()
+    # FTS5にも挿入
+    await session.execute(text(
+        "INSERT INTO tool_actions_fts(rowid, tool_name, arguments, result_summary) VALUES (:id, :name, :args, :summary)"
+    ), {"id": action.id, "name": tool_name, "args": args_json, "summary": result_summary})
+    return action
