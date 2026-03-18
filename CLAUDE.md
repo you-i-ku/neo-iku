@@ -33,7 +33,7 @@
 - Python + FastAPI + vanilla HTML/CSS/JS
 - SQLite + SQLAlchemy（将来PostgreSQLに移行可能）
 - LM Studio（OpenAI互換API, localhost:1234）
-- 依存: fastapi, uvicorn, sqlalchemy, aiosqlite, httpx
+- 依存: fastapi, uvicorn, sqlalchemy, aiosqlite, httpx, duckduckgo-search
 
 ## プロジェクト構造
 
@@ -50,7 +50,7 @@ neo-iku/
 │   ├── scheduler/          # autonomous.py（自律行動：発言・ツール実行・DB保存）
 │   ├── importer/           # log_parser.py（過去ログ取り込み）
 │   ├── persona/            # system_prompt.py（イクの個性）
-│   └── tools/              # registry.py(登録・パース・実行), builtin.py(組み込みツール)
+│   └── tools/              # registry.py(登録・パース・実行), builtin.py(組み込みツール), code_analysis.py(構文+リスク), custom/(カスタムツール)
 ├── static/                 # index.html, style.css, app.js
 └── data/                   # SQLite DB（自動生成、過去ログ840件インポート済み）
 ```
@@ -60,15 +60,21 @@ neo-iku/
 - AIはテキストマーカー `[TOOL:ツール名 引数=値]` でツールを呼び出す（function calling非依存、小さいモデルでも動く）
 - 3形式対応: 単一行 `[TOOL:name args]`、複数行クォート `[TOOL:name content="..."]`、ブロック `[TOOL:name]\n内容\n[/TOOL]`
 - ツールはモード問わず有効（イクモードはペルソナのレイヤー、ツールはAI自体の能力）
-- 組み込みツール: read_file, search_files, create_file, overwrite_file, list_files, search_memories, write_diary, exec_code, search_action_log
+- 組み込みツール: read_file, search_files, create_file, overwrite_file, list_files, search_memories, write_diary, exec_code, search_action_log, web_search, create_tool
 - `app/tools/registry.py` の `register_tool()` で新ツールを追加可能
 - ツール実行ループ: 最大`TOOL_MAX_ROUNDS`回（デフォルト8）まで連続呼び出し可能（config.pyで管理、UIから動的変更可）
 - 1レスポンス内の複数ツール呼び出しは1ラウンドとしてカウント（`parse_tool_calls()`で全マッチを検出）
 - ツール上限到達時: LLMがまだツールを呼ぼうとしていたらフィードバックメッセージを返し、ツールなしで応答を完了させる
-- create_file: 新規ファイル作成（即実行）。overwrite_file: 既存ファイル上書き（UI承認フロー: 承認/拒否/検討）
-- exec_code: Pythonコード実行（UI承認フロー: 承認/拒否。実行前にgit自動バックアップ。ストリーミングターミナルポップアップで結果表示）
-- `register_tool()` の `required_args` で必須引数を指定可能。欠けた呼び出しは自動スキップ（LLMが会話中にツール名を言及した際の誤検出防止）
+- create_file: 新規ファイル作成（即実行）。overwrite_file: 既存ファイル上書き（UI承認フロー: 承認/拒否＋コメント）
+- exec_code: Pythonコード実行（構文チェック+リスク分析→UI承認フロー: 承認/拒否＋コメント。実行前にgit自動バックアップ。ストリーミングターミナルポップアップで結果表示）
+- create_tool: 新ツール作成（構文チェック+リスク分析→UI承認フロー: 承認/拒否＋コメント。`app/tools/custom/{name}.py`に保存、起動時に自動ロード）
+- web_search: DuckDuckGoでWeb検索（APIキー不要、`duckduckgo-search`ライブラリ使用）
+- 承認/拒否のどちらにもコメント欄あり（任意）。コメントがあればLLMにフィードバックされる
+- `app/tools/code_analysis.py`: 構文チェック（ast.parse）+ リスク静的解析（AST walk）。exec_code・create_toolの承認UIにリスクレベル（🔴HIGH/🟡MEDIUM/🟢LOW）を表示
+- 応答中断: ストリーミング中に停止ボタンで即中断可能。入力欄のテキストがフィードバックとしてLLMに伝わる
+- `register_tool()` の `required_args` で必須引数を指定可能。引数なし→スキップ（会話中の言及）、パース失敗→エラーをLLMに返す
 - 引数パーサーはクォート内の `\n`→改行、`\t`→タブのエスケープシーケンス変換に対応
+- ツールループ中のユーザー割り込み: WebSocketをasyncio.Queueで管理し、次のLLM呼び出し前にユーザーメッセージをhistoryに挿入
 
 ## 記憶検索
 

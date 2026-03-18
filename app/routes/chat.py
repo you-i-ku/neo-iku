@@ -22,6 +22,8 @@ from app.tools.builtin import (
     PENDING_EXEC_MARKER, get_pending_exec,
     pop_pending_exec, cancel_pending_exec,
     _git_auto_backup,
+    PENDING_CREATE_TOOL_MARKER, get_pending_create_tool,
+    execute_pending_create_tool, cancel_pending_create_tool,
 )
 from config import BASE_DIR, EXEC_CODE_TIMEOUT
 
@@ -131,6 +133,59 @@ async def chat_ws(ws: WebSocket):
     await scheduler.register_ws(ws)
     conversation_id = None
 
+    # WebSocketメッセージをキューで管理（割り込み・停止対応）
+    msg_queue: asyncio.Queue = asyncio.Queue()
+    pending_user_msgs: list[str] = []
+    stop_event = asyncio.Event()
+    stop_feedback = ""
+
+    async def ws_reader():
+        """WebSocketからのメッセージを読み続けてキューに入れる。
+        stopメッセージはキューを経由せず即座にフラグを立てる。"""
+        nonlocal stop_feedback
+        try:
+            while True:
+                raw = await ws.receive_text()
+                data = json.loads(raw)
+                if data.get("type") == "stop":
+                    stop_feedback = data.get("feedback", "")
+                    stop_event.set()
+                else:
+                    await msg_queue.put(data)
+        except WebSocketDisconnect:
+            await msg_queue.put(None)
+        except Exception:
+            await msg_queue.put(None)
+
+    reader_task = asyncio.create_task(ws_reader())
+
+    async def wait_for_response(response_type: str) -> dict:
+        """特定のtype（write_response/exec_response）を待つ。
+        待っている間に来た通常メッセージはpending_user_msgsに溜める。"""
+        while True:
+            data = await msg_queue.get()
+            if data is None:
+                raise WebSocketDisconnect()
+            if data.get("type") == response_type:
+                return data
+            # 通常のチャットメッセージ → 割り込みキューへ
+            user_text = data.get("message", "").strip()
+            if user_text:
+                pending_user_msgs.append(user_text)
+
+    def drain_pending_messages():
+        """キューに溜まったメッセージを回収"""
+        while not msg_queue.empty():
+            try:
+                data = msg_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if data is None:
+                return  # disconnected
+            user_text = data.get("message", "").strip()
+            if user_text:
+                pending_user_msgs.append(user_text)
+
     try:
         async with async_session() as session:
             conv = await create_conversation(session)
@@ -138,8 +193,10 @@ async def chat_ws(ws: WebSocket):
             await session.commit()
 
             while True:
-                raw = await ws.receive_text()
-                data = json.loads(raw)
+                # ユーザーメッセージ待ち（キューから）
+                data = await msg_queue.get()
+                if data is None:
+                    break  # disconnected
                 user_text = data.get("message", "").strip()
                 if not user_text:
                     continue
@@ -157,11 +214,26 @@ async def chat_ws(ws: WebSocket):
                 history = [{"role": m.role, "content": m.content} for m in conv_messages]
                 all_messages = system_msgs + history
 
-                # ツール実行ループ（最大5回）
+                # ツール実行ループ（最大N回）
                 from config import TOOL_MAX_ROUNDS
                 max_tool_rounds = TOOL_MAX_ROUNDS
 
                 for tool_round in range(max_tool_rounds + 2):  # +2: 上限到達フィードバック後の最終応答用
+
+                    # --- ユーザー割り込みチェック ---
+                    drain_pending_messages()
+                    if pending_user_msgs:
+                        for msg in pending_user_msgs:
+                            all_messages.append({"role": "user", "content": msg})
+                            await add_message(session, conversation_id, "user", msg)
+                            await ws.send_text(json.dumps({
+                                "type": "user_interrupt_ack",
+                                "content": msg,
+                            }))
+                            logger.info(f"ユーザー割り込み: {msg[:50]}...")
+                        pending_user_msgs.clear()
+                        await session.commit()
+
                     # LLMからストリーミング応答（think/回答を分離）
                     llm = llm_manager.get()
                     full_response = ""
@@ -169,9 +241,14 @@ async def chat_ws(ws: WebSocket):
                     think_buffer = ""
                     response_buffer = ""
 
+                    stopped = False
                     try:
                         chunk_count = 0
                         async for chunk in llm.stream_chat(all_messages):
+                            # 停止チェック
+                            if stop_event.is_set():
+                                stopped = True
+                                break
                             chunk_count += 1
                             if chunk_count == 1:
                                 logger.debug(f"最初のチャンク: {repr(chunk[:50])}")
@@ -228,6 +305,22 @@ async def chat_ws(ws: WebSocket):
                         if in_think:
                             await ws.send_text(json.dumps({"type": "think_end"}))
                             in_think = False
+
+                        if stopped:
+                            # ユーザーが出力を中断
+                            stop_event.clear()
+                            logger.info(f"ユーザーが出力を中断 ({chunk_count}チャンク)")
+                            await ws.send_text(json.dumps({"type": "stream_end"}))
+                            await ws.send_text(json.dumps({"type": "stopped"}))
+                            # 部分応答を保存
+                            stop_note = "ユーザーにより出力を中断されました。"
+                            if stop_feedback:
+                                stop_note += f"\n理由: {stop_feedback}"
+                            if full_response.strip():
+                                await add_message(session, conversation_id, "assistant", full_response)
+                            await add_message(session, conversation_id, "user", stop_note)
+                            await session.commit()
+                            break  # ツールループから抜ける
 
                         logger.debug(f"ストリーム完了: {chunk_count}チャンク, {len(full_response)}文字")
                         await ws.send_text(json.dumps({"type": "stream_end"}))
@@ -301,42 +394,72 @@ async def chat_ws(ws: WebSocket):
                                         "old_content": pending["old_content"][:500],
                                         "new_content": pending["content"][:500],
                                     }))
-                                    while True:
-                                        raw_resp = await ws.receive_text()
-                                        resp_data = json.loads(raw_resp)
-                                        if resp_data.get("type") == "write_response":
-                                            action = resp_data.get("action")
-                                            if action == "approve":
-                                                result = execute_pending_overwrite()
-                                            elif action == "reject":
-                                                result = cancel_pending_overwrite()
-                                            elif action == "review":
-                                                result = cancel_pending_overwrite()
-                                                result += f"\nユーザーからのフィードバック: {resp_data.get('message', '')}"
-                                            break
+                                    resp_data = await wait_for_response("write_response")
+                                    action = resp_data.get("action")
+                                    feedback = resp_data.get("feedback", "")
+                                    if action == "approve":
+                                        result = execute_pending_overwrite()
+                                        if feedback:
+                                            result += f"\nユーザーからのコメント: {feedback}"
+                                    elif action == "reject":
+                                        result = cancel_pending_overwrite()
+                                        result = "ユーザーにより上書きを拒否されました。"
+                                        if feedback:
+                                            result += f"\n理由: {feedback}"
 
                             # コード実行承認フロー（ストリーミング）
                             if result == PENDING_EXEC_MARKER:
                                 pending = get_pending_exec()
                                 if pending:
+                                    risk = pending.get("risk", {})
                                     await ws.send_text(json.dumps({
                                         "type": "exec_approval",
                                         "code": pending["code"][:2000],
+                                        "risk_level": risk.get("level", "LOW"),
+                                        "risk_emoji": risk.get("emoji", "🟢"),
+                                        "risk_reasons": risk.get("reasons", []),
                                     }))
-                                    while True:
-                                        raw_resp = await ws.receive_text()
-                                        resp_data = json.loads(raw_resp)
-                                        if resp_data.get("type") == "exec_response":
-                                            action = resp_data.get("action")
-                                            if action == "approve":
-                                                code = pop_pending_exec()
-                                                result = await _stream_exec_code(ws, code)
-                                            elif action == "reject":
-                                                result = cancel_pending_exec()
-                                            elif action == "review":
-                                                result = cancel_pending_exec()
-                                                result += f"\nユーザーからのフィードバック: {resp_data.get('message', '')}"
-                                            break
+                                    resp_data = await wait_for_response("exec_response")
+                                    action = resp_data.get("action")
+                                    feedback = resp_data.get("feedback", "")
+                                    if action == "approve":
+                                        code = pop_pending_exec()
+                                        result = await _stream_exec_code(ws, code)
+                                        if feedback:
+                                            result += f"\nユーザーからのコメント: {feedback}"
+                                    elif action == "reject":
+                                        result = cancel_pending_exec()
+                                        result = "ユーザーによりコード実行を拒否されました。"
+                                        if feedback:
+                                            result += f"\n理由: {feedback}"
+
+                            # カスタムツール作成承認フロー
+                            if result == PENDING_CREATE_TOOL_MARKER:
+                                pending = get_pending_create_tool()
+                                if pending:
+                                    risk = pending.get("risk", {})
+                                    await ws.send_text(json.dumps({
+                                        "type": "create_tool_approval",
+                                        "name": pending["name"],
+                                        "description": pending["description"],
+                                        "args_desc": pending["args_desc"],
+                                        "code": pending["code"][:2000],
+                                        "risk_level": risk.get("level", "LOW"),
+                                        "risk_emoji": risk.get("emoji", "🟢"),
+                                        "risk_reasons": risk.get("reasons", []),
+                                    }))
+                                    resp_data = await wait_for_response("create_tool_response")
+                                    action = resp_data.get("action")
+                                    feedback = resp_data.get("feedback", "")
+                                    if action == "approve":
+                                        result = execute_pending_create_tool()
+                                        if feedback:
+                                            result += f"\nユーザーからのコメント: {feedback}"
+                                    elif action == "reject":
+                                        result = cancel_pending_create_tool()
+                                        result = "ユーザーによりツール作成を拒否されました。"
+                                        if feedback:
+                                            result += f"\n理由: {feedback}"
 
                             logger.info(f"ツール結果: {result[:100]}...")
 
@@ -372,6 +495,7 @@ async def chat_ws(ws: WebSocket):
     except Exception as e:
         logger.error(f"チャットエラー: {e}")
     finally:
+        reader_task.cancel()
         scheduler.unregister_ws(ws)
         if conversation_id:
             try:

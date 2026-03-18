@@ -294,20 +294,14 @@ body {
 .write-btn.approve:hover { background: #2ea043; }
 .write-btn.reject { background: #6e3030; color: #f08080; }
 .write-btn.reject:hover { background: #8b3a3a; }
-.write-btn.review { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
-.write-btn.review:hover { background: #30363d; }
-.write-btn.send-review { background: #1f6feb; color: #fff; }
 .write-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-.write-review-area {
-    display: flex;
-    gap: 8px;
+.approval-feedback-area {
     margin-top: 8px;
-    align-items: flex-end;
 }
 
-.write-review-area textarea {
-    flex: 1;
+.approval-feedback {
+    width: 100%;
     background: #161b22;
     border: 1px solid #30363d;
     border-radius: 6px;
@@ -315,8 +309,16 @@ body {
     padding: 8px;
     font-size: 13px;
     font-family: inherit;
-    resize: none;
     outline: none;
+    box-sizing: border-box;
+}
+
+.approval-feedback:focus {
+    border-color: #58a6ff;
+}
+
+.approval-feedback:disabled {
+    opacity: 0.5;
 }
 
 /* コード実行承認UI */
@@ -340,6 +342,79 @@ body {
 }
 
 .exec-approval summary {
+    font-size: 13px;
+    color: #8b949e;
+    cursor: pointer;
+}
+
+/* リスク表示 */
+.risk-section {
+    margin: 8px 0;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 13px;
+}
+
+.risk-section.risk-high {
+    background: #2d0b0b;
+    border: 1px solid #6e2020;
+}
+
+.risk-section.risk-medium {
+    background: #2d2400;
+    border: 1px solid #6e5a10;
+}
+
+.risk-section.risk-low {
+    background: #0b2d0b;
+    border: 1px solid #1e6e20;
+}
+
+.risk-badge {
+    font-weight: 600;
+}
+
+.risk-reasons {
+    margin: 4px 0 0 0;
+    padding-left: 20px;
+    color: #c9d1d9;
+}
+
+.risk-reasons li {
+    margin: 2px 0;
+}
+
+/* ツール作成承認UI */
+.message.create-tool-approval {
+    align-self: flex-start;
+    background: #0d1a1a;
+    border: 1px solid #204a4a;
+    border-left: 3px solid #30b0b0;
+    max-width: 90%;
+    padding: 16px;
+}
+
+.create-tool-header {
+    font-weight: 600;
+    color: #30b0b0;
+    margin-bottom: 8px;
+}
+
+.create-tool-meta {
+    font-size: 13px;
+    color: #8b949e;
+    margin-bottom: 8px;
+}
+
+.create-tool-meta div {
+    margin: 2px 0;
+}
+
+.create-tool-approval details {
+    margin-bottom: 8px;
+}
+
+.create-tool-approval summary {
     font-size: 13px;
     color: #8b949e;
     cursor: pointer;
@@ -530,6 +605,24 @@ body {
     background: #21262d;
     color: #6e7681;
     cursor: not-allowed;
+}
+
+.input-area button.stop-btn {
+    background: #da3633;
+}
+
+.input-area button.stop-btn:hover {
+    background: #f85149;
+}
+
+.message.system {
+    align-self: center;
+    background: #21262d;
+    border: 1px solid #30363d;
+    color: #8b949e;
+    font-size: 12px;
+    padding: 4px 12px;
+    border-radius: 12px;
 }
 
 /* ダッシュボード */

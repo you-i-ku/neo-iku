@@ -198,7 +198,7 @@ class AutonomousScheduler:
                         logger.info(f"自律行動ツール: {tool_name} {tool_args}")
                         args_str = " ".join(f"{k}={v}" for k, v in tool_args.items()) if tool_args else ""
                         await self._broadcast(_json.dumps({"type": "autonomous_tool", "name": tool_name, "args": args_str}))
-                        if tool_name in ("overwrite_file", "exec_code"):
+                        if tool_name in ("overwrite_file", "exec_code", "create_tool"):
                             result = "エラー: この操作は自律行動中にはできません。チャットで提案してください。"
                             exec_ms = 0
                         else:

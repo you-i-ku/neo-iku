@@ -313,7 +313,14 @@ async def exec_code(code: str = "") -> str:
     if not code:
         return "エラー: codeを指定してください。"
 
-    _pending_exec = {"code": code}
+    # 構文チェック（失敗したらLLMに自動返却、ユーザーには見せない）
+    from app.tools.code_analysis import check_syntax, analyze_risk
+    ok, err = check_syntax(code)
+    if not ok:
+        return f"エラー: {err}\nコードを修正して再度呼び出してください。"
+
+    risk = analyze_risk(code)
+    _pending_exec = {"code": code, "risk": risk}
     return PENDING_EXEC_MARKER
 
 
@@ -441,6 +448,181 @@ async def search_action_log(query: str = "", tool_name: str = "") -> str:
     return "\n".join(lines)
 
 
+async def web_search(query: str = "", max_results: str = "5") -> str:
+    """DuckDuckGoでWeb検索する"""
+    if not query:
+        return "エラー: queryを指定してください。"
+
+    import asyncio
+    n = min(int(max_results), 10)
+
+    def _search():
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            return list(ddgs.text(query, max_results=n))
+
+    try:
+        results = await asyncio.get_event_loop().run_in_executor(None, _search)
+    except Exception as e:
+        return f"検索エラー: {e}"
+
+    if not results:
+        return f"「{query}」の検索結果はありませんでした。"
+
+    lines = [f"「{query}」の検索結果（{len(results)}件）:"]
+    for i, r in enumerate(results, 1):
+        lines.append(f"\n{i}. {r['title']}")
+        lines.append(f"   URL: {r['href']}")
+        lines.append(f"   {r['body']}")
+
+    return "\n".join(lines)
+
+
+# --- カスタムツール作成 ---
+
+_pending_create_tool: dict | None = None
+PENDING_CREATE_TOOL_MARKER = "__PENDING_CREATE_TOOL__"
+
+CUSTOM_TOOLS_DIR = BASE_DIR / "app" / "tools" / "custom"
+
+
+async def create_tool(name: str = "", description: str = "", args_desc: str = "", code: str = "") -> str:
+    """新しいツールを作成する（ユーザー承認が必要）"""
+    global _pending_create_tool
+    import re as _re
+
+    if not name or not code:
+        return "エラー: nameとcodeは必須です。"
+
+    if not _re.match(r'^[a-z][a-z0-9_]*$', name):
+        return "エラー: ツール名は英小文字・数字・アンダースコアのみ（先頭は英小文字）。"
+
+    from app.tools.registry import get_tool
+    if get_tool(name):
+        return f"エラー: ツール '{name}' は既に登録されています。"
+
+    # 構文チェック
+    from app.tools.code_analysis import check_syntax, analyze_risk
+    ok, err = check_syntax(code)
+    if not ok:
+        return f"エラー: {err}\nコードを修正して再度呼び出してください。"
+
+    # async def が含まれているかチェック
+    import ast
+    tree = ast.parse(code)
+    async_funcs = [n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef)]
+    if not async_funcs:
+        return "エラー: コードに async def 関数が必要です。例: async def my_tool(arg1: str = '') -> str:"
+
+    risk = analyze_risk(code)
+    _pending_create_tool = {
+        "name": name,
+        "description": description or f"カスタムツール: {name}",
+        "args_desc": args_desc or "",
+        "code": code,
+        "func_name": async_funcs[0].name,
+        "risk": risk,
+    }
+    return PENDING_CREATE_TOOL_MARKER
+
+
+def get_pending_create_tool() -> dict | None:
+    return _pending_create_tool
+
+
+def execute_pending_create_tool() -> str:
+    """承認済みのカスタムツールを保存・登録"""
+    global _pending_create_tool
+    if _pending_create_tool is None:
+        return "エラー: 承認待ちのツール作成がありません。"
+
+    data = _pending_create_tool
+    _pending_create_tool = None
+
+    name = data["name"]
+    description = data["description"]
+    args_desc = data["args_desc"]
+    code = data["code"]
+    func_name = data["func_name"]
+
+    # ファイル保存
+    CUSTOM_TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+    file_path = CUSTOM_TOOLS_DIR / f"{name}.py"
+
+    header = f'"""カスタムツール: {name}\ndescription: {description}\nargs_desc: {args_desc}\ncreated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n"""\n\n'
+    file_path.write_text(header + code, encoding="utf-8")
+
+    # ランタイム登録
+    try:
+        func = _load_custom_tool_func(file_path, func_name)
+        register_tool(name, description, args_desc, func)
+        return f"ツール '{name}' を作成・登録しました。（{file_path.relative_to(BASE_DIR)}）"
+    except Exception as e:
+        # 登録失敗時はファイルも消す
+        file_path.unlink(missing_ok=True)
+        return f"エラー: ツールの登録に失敗しました: {e}"
+
+
+def cancel_pending_create_tool() -> str:
+    global _pending_create_tool
+    _pending_create_tool = None
+    return "ツール作成がキャンセルされました。"
+
+
+def _load_custom_tool_func(file_path: Path, func_name: str):
+    """Pythonファイルから指定された関数をロードして返す"""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(f"custom_tool_{file_path.stem}", file_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    func = getattr(module, func_name)
+    return func
+
+
+def load_custom_tools():
+    """app/tools/custom/ のカスタムツールを全て読み込んで登録"""
+    import ast as _ast
+    import logging
+    logger = logging.getLogger("iku.tools")
+
+    if not CUSTOM_TOOLS_DIR.exists():
+        return
+
+    for py_file in sorted(CUSTOM_TOOLS_DIR.glob("*.py")):
+        if py_file.name.startswith("_"):
+            continue
+
+        try:
+            source = py_file.read_text(encoding="utf-8")
+            tree = _ast.parse(source)
+
+            # docstringからメタデータ取得
+            docstring = _ast.get_docstring(tree) or ""
+            description = ""
+            args_desc = ""
+            for line in docstring.split("\n"):
+                if line.startswith("description:"):
+                    description = line[len("description:"):].strip()
+                elif line.startswith("args_desc:"):
+                    args_desc = line[len("args_desc:"):].strip()
+
+            # async def を探す
+            async_funcs = [n for n in _ast.walk(tree) if isinstance(n, _ast.AsyncFunctionDef)]
+            if not async_funcs:
+                logger.warning(f"カスタムツール {py_file.name}: async defが見つかりません。スキップ。")
+                continue
+
+            func_name = async_funcs[0].name
+            name = py_file.stem
+
+            func = _load_custom_tool_func(py_file, func_name)
+            register_tool(name, description or f"カスタムツール: {name}", args_desc, func)
+            logger.info(f"カスタムツール登録: {name} ({py_file.name})")
+
+        except Exception as e:
+            logger.error(f"カスタムツール {py_file.name} の読み込みエラー: {e}")
+
+
 def register_all():
     """全組み込みツールを登録"""
     register_tool(
@@ -504,3 +686,19 @@ def register_all():
         exec_code,
         required_args=["code"],
     )
+    register_tool(
+        "web_search",
+        "DuckDuckGoでWeb検索する。外の世界の情報を得られる",
+        "query=検索キーワード max_results=最大件数（デフォルト5、最大10）",
+        web_search,
+        required_args=["query"],
+    )
+    register_tool(
+        "create_tool",
+        "新しいツールを作成して自分の能力を拡張する。ユーザーの承認が必要",
+        'name=ツール名（英小文字） description=ツールの説明 args_desc=引数の説明 code=async def関数のPythonコード',
+        create_tool,
+        required_args=["name", "code"],
+    )
+    # カスタムツール読み込み（起動時に永続化されたツールを復元）
+    load_custom_tools()

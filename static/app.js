@@ -13,6 +13,7 @@ const chatTitle = document.getElementById("chat-title");
 let ws = null;
 let currentStreamEl = null;
 let currentThinkEl = null;
+let isStreaming = false;
 let thinkDotInterval = null;
 let currentMode = "normal";
 let countdownInterval = null;
@@ -42,6 +43,7 @@ function connect() {
             case "think_start":
                 currentThinkEl = addThinkBlock();
                 startThinkDots();
+                setStreaming(true);
                 scrollToBottom();
                 break;
 
@@ -60,6 +62,7 @@ function connect() {
             case "stream":
                 if (!currentStreamEl) {
                     currentStreamEl = addMessage("assistant", "");
+                    setStreaming(true);
                 }
                 currentStreamEl.textContent += data.content;
                 scrollToBottom();
@@ -67,7 +70,13 @@ function connect() {
 
             case "stream_end":
                 currentStreamEl = null;
+                setStreaming(false);
                 loadMemories(memorySearch.value.trim());
+                break;
+
+            case "stopped":
+                setStreaming(false);
+                addMessage("system", "⏹ 出力を中断しました");
                 break;
 
             case "error":
@@ -91,6 +100,10 @@ function connect() {
 
             case "exec_approval":
                 showExecApproval(data);
+                break;
+
+            case "create_tool_approval":
+                showCreateToolApproval(data);
                 break;
 
             case "exec_start":
@@ -125,6 +138,10 @@ function connect() {
             case "autonomous":
                 addAutonomousMessage(data.content);
                 loadMemories(memorySearch.value.trim());
+                break;
+
+            case "user_interrupt_ack":
+                addMessage("system", `💬 割り込みメッセージを受け付けました: ${data.content}`);
                 break;
         }
     };
@@ -247,7 +264,32 @@ function scrollToBottom(force = false) {
     }
 }
 
+function setStreaming(active) {
+    isStreaming = active;
+    if (active) {
+        sendBtn.textContent = "停止";
+        sendBtn.classList.add("stop-btn");
+    } else {
+        sendBtn.textContent = "送信";
+        sendBtn.classList.remove("stop-btn");
+    }
+}
+
+function stopStreaming() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const feedback = chatInput.value.trim();
+    ws.send(JSON.stringify({ type: "stop", feedback }));
+    if (feedback) {
+        chatInput.value = "";
+        chatInput.style.height = "auto";
+    }
+}
+
 function sendMessage() {
+    if (isStreaming) {
+        stopStreaming();
+        return;
+    }
     const text = chatInput.value.trim();
     if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
 
@@ -487,14 +529,12 @@ function showWriteApproval(data) {
         <div class="write-approval-meta">${data.old_size}文字 → ${data.new_size}文字</div>
         <details><summary>変更前（先頭500文字）</summary><pre class="write-preview">${escapeHtml(data.old_content)}</pre></details>
         <details open><summary>変更後（先頭500文字）</summary><pre class="write-preview">${escapeHtml(data.new_content)}</pre></details>
+        <div class="approval-feedback-area">
+            <input class="approval-feedback" type="text" placeholder="コメント（任意）">
+        </div>
         <div class="write-approval-buttons">
             <button class="write-btn approve">承認</button>
             <button class="write-btn reject">拒否</button>
-            <button class="write-btn review">検討</button>
-        </div>
-        <div class="write-review-area" style="display:none">
-            <textarea class="write-review-input" placeholder="フィードバックを入力..." rows="3"></textarea>
-            <button class="write-btn send-review">送信</button>
         </div>
     `;
     chatMessages.appendChild(el);
@@ -502,26 +542,33 @@ function showWriteApproval(data) {
 
     function disableAll() {
         el.querySelectorAll("button").forEach(b => b.disabled = true);
+        el.querySelector(".approval-feedback").disabled = true;
     }
 
     el.querySelector(".approve").onclick = () => {
+        const feedback = el.querySelector(".approval-feedback").value.trim();
         disableAll();
-        ws.send(JSON.stringify({ type: "write_response", action: "approve" }));
+        ws.send(JSON.stringify({ type: "write_response", action: "approve", feedback }));
     };
     el.querySelector(".reject").onclick = () => {
+        const feedback = el.querySelector(".approval-feedback").value.trim();
         disableAll();
-        ws.send(JSON.stringify({ type: "write_response", action: "reject" }));
+        ws.send(JSON.stringify({ type: "write_response", action: "reject", feedback }));
     };
-    el.querySelector(".review").onclick = () => {
-        el.querySelector(".write-review-area").style.display = "flex";
-        el.querySelector(".write-review-input").focus();
-    };
-    el.querySelector(".send-review").onclick = () => {
-        const msg = el.querySelector(".write-review-input").value.trim();
-        if (!msg) return;
-        disableAll();
-        ws.send(JSON.stringify({ type: "write_response", action: "review", message: msg }));
-    };
+}
+
+// --- リスク表示ヘルパー ---
+
+function buildRiskHtml(data) {
+    if (!data.risk_level) return "";
+    const reasons = (data.risk_reasons || []).map(r => `<li>${escapeHtml(r)}</li>`).join("");
+    const levelClass = data.risk_level.toLowerCase();
+    return `
+        <div class="risk-section risk-${levelClass}">
+            <span class="risk-badge">${data.risk_emoji || ""} リスク: ${data.risk_level}</span>
+            ${reasons ? `<ul class="risk-reasons">${reasons}</ul>` : ""}
+        </div>
+    `;
 }
 
 // --- コード実行承認UI ---
@@ -531,15 +578,14 @@ function showExecApproval(data) {
     el.className = "message exec-approval";
     el.innerHTML = `
         <div class="exec-approval-header">⚠ コード実行承認</div>
+        ${buildRiskHtml(data)}
         <details open><summary>実行するコード</summary><pre class="write-preview">${escapeHtml(data.code)}</pre></details>
+        <div class="approval-feedback-area">
+            <input class="approval-feedback" type="text" placeholder="コメント（任意）">
+        </div>
         <div class="write-approval-buttons">
             <button class="write-btn approve">実行</button>
             <button class="write-btn reject">拒否</button>
-            <button class="write-btn review">検討</button>
-        </div>
-        <div class="write-review-area" style="display:none">
-            <textarea class="write-review-input" placeholder="フィードバックを入力..." rows="3"></textarea>
-            <button class="write-btn send-review">送信</button>
         </div>
     `;
     chatMessages.appendChild(el);
@@ -547,25 +593,59 @@ function showExecApproval(data) {
 
     function disableAll() {
         el.querySelectorAll("button").forEach(b => b.disabled = true);
+        el.querySelector(".approval-feedback").disabled = true;
     }
 
     el.querySelector(".approve").onclick = () => {
+        const feedback = el.querySelector(".approval-feedback").value.trim();
         disableAll();
-        ws.send(JSON.stringify({ type: "exec_response", action: "approve" }));
+        ws.send(JSON.stringify({ type: "exec_response", action: "approve", feedback }));
     };
     el.querySelector(".reject").onclick = () => {
+        const feedback = el.querySelector(".approval-feedback").value.trim();
         disableAll();
-        ws.send(JSON.stringify({ type: "exec_response", action: "reject" }));
+        ws.send(JSON.stringify({ type: "exec_response", action: "reject", feedback }));
     };
-    el.querySelector(".review").onclick = () => {
-        el.querySelector(".write-review-area").style.display = "flex";
-        el.querySelector(".write-review-input").focus();
-    };
-    el.querySelector(".send-review").onclick = () => {
-        const msg = el.querySelector(".write-review-input").value.trim();
-        if (!msg) return;
+}
+
+// --- ツール作成承認UI ---
+
+function showCreateToolApproval(data) {
+    const el = document.createElement("div");
+    el.className = "message create-tool-approval";
+    el.innerHTML = `
+        <div class="create-tool-header">🔧 ツール作成承認: ${escapeHtml(data.name)}</div>
+        <div class="create-tool-meta">
+            <div><strong>説明:</strong> ${escapeHtml(data.description || "なし")}</div>
+            <div><strong>引数:</strong> ${escapeHtml(data.args_desc || "なし")}</div>
+        </div>
+        ${buildRiskHtml(data)}
+        <details open><summary>ツールのコード</summary><pre class="write-preview">${escapeHtml(data.code)}</pre></details>
+        <div class="approval-feedback-area">
+            <input class="approval-feedback" type="text" placeholder="コメント（任意）">
+        </div>
+        <div class="write-approval-buttons">
+            <button class="write-btn approve">承認</button>
+            <button class="write-btn reject">拒否</button>
+        </div>
+    `;
+    chatMessages.appendChild(el);
+    scrollToBottom();
+
+    function disableAll() {
+        el.querySelectorAll("button").forEach(b => b.disabled = true);
+        el.querySelector(".approval-feedback").disabled = true;
+    }
+
+    el.querySelector(".approve").onclick = () => {
+        const feedback = el.querySelector(".approval-feedback").value.trim();
         disableAll();
-        ws.send(JSON.stringify({ type: "exec_response", action: "review", message: msg }));
+        ws.send(JSON.stringify({ type: "create_tool_response", action: "approve", feedback }));
+    };
+    el.querySelector(".reject").onclick = () => {
+        const feedback = el.querySelector(".approval-feedback").value.trim();
+        disableAll();
+        ws.send(JSON.stringify({ type: "create_tool_response", action: "reject", feedback }));
     };
 }
 

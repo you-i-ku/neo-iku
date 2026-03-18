@@ -20,7 +20,13 @@
 - **自己改変** — 自分のコードを読んで書き換えられる（既存ファイルの上書きはユーザー承認が必要）
 - **コード実行** — Pythonコードを実行できる（承認UI + ストリーミングターミナルでリアルタイム監視、実行前にgit自動バックアップ）
 - **行動ログ** — ツール実行履歴を自動記録し、自分の過去の行動を振り返れる（メタ認知の基盤）
+- **Web検索** — DuckDuckGoによるWeb検索ツール（APIキー不要、環境理解の第一歩）
+- **応答中断** — ストリーミング中に停止ボタンで即中断、フィードバック付きで方向修正可能
+- **コード安全性** — 構文チェック（ast.parse）+ リスク静的解析（AST walk）で🔴🟡🟢表示
+- **ツール自己作成** — イク自身が新しいツールを作成・永続化できる（Human-in-the-loop承認）
 - **モデル選択** — LM Studioのロード済みモデルをダッシュボードから切替可能
+- **ユーザー割り込み** — ツール実行ループ中でもメッセージを送れる。次のLLM呼び出し前に割り込み挿入され、AIの方向を変えられる
+- **承認フィードバック** — ファイル上書き・コード実行の承認/拒否時にコメントを添えてLLMに理由を伝えられる
 - **開発用ツール** — 自律行動間隔変更・即時実行・ツールラウンド数変更・DBリセットをUIから操作
 
 ## 構成
@@ -55,7 +61,9 @@ neo-iku/
 │   │   └── system_prompt.py    # イクのシステムプロンプト・記憶コンテキスト構築
 │   └── tools/
 │       ├── registry.py         # ツール登録・パーサー・実行エンジン（3形式対応）
-│       └── builtin.py          # 組み込みツール（read_file, search_files, create_file, overwrite_file, list_files, search_memories, write_diary, search_action_log）
+│       ├── builtin.py          # 組み込みツール（read_file, search_files, create_file, overwrite_file, list_files, search_memories, write_diary, exec_code, search_action_log, web_search, create_tool）
+│       ├── code_analysis.py    # コード構文チェック + リスク静的解析（AST walk）
+│       └── custom/             # カスタムツール保存先（イク自身が作成、起動時に自動ロード）
 │
 ├── static/
 │   ├── index.html              # チャット+ダッシュボード画面
@@ -74,7 +82,7 @@ neo-iku/
 | DB | SQLite + SQLAlchemy（非同期） |
 | 全文検索 | SQLite FTS5 |
 | LLM | LM Studio（OpenAI互換API, localhost:1234） |
-| 依存 | fastapi, uvicorn, sqlalchemy, aiosqlite, httpx |
+| 依存 | fastapi, uvicorn, sqlalchemy, aiosqlite, httpx, duckduckgo-search |
 
 ## セットアップ
 
@@ -225,12 +233,14 @@ llm_manager.register("my_provider", MyProvider())
 | `read_file` | プロジェクト内のファイルを読む（offset対応） | 不要 |
 | `search_files` | ファイル名で部分一致検索 | 不要 |
 | `create_file` | 新規ファイルを作成（既存ファイルにはエラー） | 不要 |
-| `overwrite_file` | 既存ファイルを上書き（承認UIが表示される） | 承認/拒否/検討 |
+| `overwrite_file` | 既存ファイルを上書き（承認UIが表示される） | 承認/拒否 |
 | `list_files` | ディレクトリ構成をツリー表示 | 不要 |
 | `search_memories` | 会話・過去ログ・日記を横断検索（過去ログはイクモード時のみ） | 不要 |
 | `write_diary` | 日記・内省メモを保存 | 不要 |
-| `exec_code` | Pythonコードを実行（git自動バックアップ付き） | 承認/拒否 |
+| `exec_code` | Pythonコードを実行（構文チェック+リスク分析付き、git自動バックアップ） | 承認/拒否 |
 | `search_action_log` | 自分の過去の行動履歴を検索（メタ認知） | 不要 |
+| `web_search` | DuckDuckGoでWeb検索（APIキー不要） | 不要 |
+| `create_tool` | 新しいツールを作成して永続化（`app/tools/custom/`に保存） | 承認/拒否 |
 
 ツール呼び出し形式（3種類対応、複数同時呼び出し可）:
 ```
@@ -251,7 +261,6 @@ llm_manager.register("my_provider", MyProvider())
 
 - **ベクトル検索**: `memory/search.py` の中身をpgvector等に差し替えるだけ（FTS5で不足した場合）
 - **複数LLM**: `BaseLLMProvider` を継承してファイル1つ追加 → `register()` で登録
-- **Web検索**: ツールとして追加（環境理解の第一歩）
 - **自律行動の改善**: タイマー方式から内発的きっかけへ
 - **PC全体アクセス**: 現在はプロジェクト内のみ、将来はPC全体のファイルにアクセス可能に
 - **DB移行**: SQLAlchemyの接続URLをPostgreSQLに変えるだけ
