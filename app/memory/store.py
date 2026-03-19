@@ -72,6 +72,7 @@ async def record_tool_action(
     result: str,
     status: str = "success",
     execution_ms: int | None = None,
+    expected_result: str | None = None,
 ) -> ToolAction:
     """ツール実行履歴を記録"""
     args_json = json.dumps(args, ensure_ascii=False)
@@ -82,6 +83,7 @@ async def record_tool_action(
         tool_name=tool_name,
         arguments=args_json,
         result_summary=result_summary,
+        expected_result=expected_result,
         status=status,
         execution_ms=execution_ms,
     )

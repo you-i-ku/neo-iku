@@ -12,7 +12,8 @@
 - **モード切替** — ノーマルモード（素のLLM）とイクモード（ペルソナ+記憶）をワンクリックで切替
 - **長期記憶** — 過去の対話を覚えていて、関連する記憶を自動で参照しながら会話する（イクモード時）
 - **自律行動** — 話しかけられなくても、自分で考えて発言したりツールを使って行動する
-- **thinking表示** — LLMの思考過程を折りたたみ可能なブロックで表示、最終回答と分離
+- **タブUI** — チャット/開発者/ログの3タブ構成。チャットはoutputツール出力のみ、開発者タブで思考過程・ツール実行詳細を確認
+- **outputツール** — AI出力は全て`[TOOL:output]`経由でチャットに表示。発言するかしないかをAI自身が選択できる
 - **過去の継承** — 12ファイルの過去対話ログを記憶としてインポートし、個性の土台とする
 - **LLM抽象化** — LM Studioを標準で使用。プロバイダを差し替えるだけで他のLLMにも対応可能
 - **記憶検索** — SQLite FTS5（trigram対応）による全文検索で、関連する過去の記憶をプロンプトに自動注入（検索結果はthinkタグ・ツールマーカーを除去して本文のみ表示）
@@ -20,8 +21,10 @@
 - **自己改変** — 自分のコードを読んで書き換えられる（既存ファイルの上書きはユーザー承認が必要）
 - **コード実行** — Pythonコードを実行できる（承認UI + ストリーミングターミナルでリアルタイム監視、実行前にgit自動バックアップ）
 - **行動ログ** — ツール実行履歴を自動記録し、自分の過去の行動を振り返れる（メタ認知の基盤）
+- **メタ認知（予測と自己モデル）** — ツール呼び出し時に`expect=...`で予測を記録し、結果と比較して理解のズレに気づける。`data/self_model.json`に自己モデルを保持し、自分で読み書き可能
 - **Web検索** — DuckDuckGoによるWeb検索ツール（APIキー不要、環境理解の第一歩）
 - **応答中断** — 専用停止ボタン（⏹）で即中断、フィードバック付きで方向修正可能。送信ボタンとは独立しており、ストリーミング中でもメッセージ割り込み可能
+- **ツール結果の折りたたみ** — ツール実行結果をdetails/summaryで開閉表示（プレビュー80文字）
 - **コード安全性** — 構文チェック（ast.parse）+ リスク静的解析（AST walk）で🔴🟡🟢表示
 - **ツール自己作成** — イク自身が新しいツールを作成・永続化できる（Human-in-the-loop承認）
 - **モデル選択** — LM Studioのロード済みモデルをダッシュボードから切替可能
@@ -41,7 +44,7 @@ neo-iku/
 ├── app/
 │   ├── main.py                 # FastAPIアプリ、起動/終了処理
 │   ├── routes/
-│   │   ├── chat.py             # WebSocketチャット（ストリーミング応答）
+│   │   ├── chat.py             # WebSocketチャット（ストリーミング応答、outputツール処理）
 │   │   ├── dashboard.py        # 状態取得API（/api/status）+ 開発用API（/api/dev/*）
 │   │   └── memories.py         # 記憶一覧・検索API（/api/memories）
 │   ├── llm/
@@ -61,7 +64,7 @@ neo-iku/
 │   │   └── system_prompt.py    # イクのシステムプロンプト・記憶コンテキスト構築
 │   └── tools/
 │       ├── registry.py         # ツール登録・パーサー・実行エンジン（3形式対応）
-│       ├── builtin.py          # 組み込みツール（read_file, search_files, create_file, overwrite_file, list_files, search_memories, write_diary, exec_code, search_action_log, web_search, create_tool）
+│       ├── builtin.py          # 組み込みツール（read_file, search_files, create_file, overwrite_file, list_files, search_memories, write_diary, exec_code, search_action_log, web_search, create_tool, read_self_model, update_self_model）
 │       ├── code_analysis.py    # コード構文チェック + リスク静的解析（AST walk）
 │       └── custom/             # カスタムツール保存先（イク自身が作成、起動時に自動ロード）
 │
@@ -70,7 +73,9 @@ neo-iku/
 │   ├── style.css               # ダーク系テーマ
 │   └── app.js                  # WebSocket通信・UI制御
 │
-└── data/                       # SQLite DB（自動生成、過去ログ840件インポート済み）
+├── data/                       # SQLite DB（自動生成、過去ログ840件インポート済み）
+│   └── self_model.json         # 自己モデル（AIが自分で読み書きする動的状態）
+│
 ```
 
 ## 技術スタック
@@ -162,7 +167,7 @@ python run.py
 | `conversations` | 会話セッション（id, started_at, ended_at, summary, is_imported） |
 | `messages` | 個別メッセージ（id, conversation_id, role, content, created_at） |
 | `memory_summaries` | 記憶要約（id, conversation_id, content, keywords, created_at, source） |
-| `tool_actions` | ツール実行履歴（id, conversation_id, tool_name, arguments, result_summary, status, execution_ms, created_at） |
+| `tool_actions` | ツール実行履歴（id, conversation_id, tool_name, arguments, result_summary, expected_result, status, execution_ms, created_at） |
 | `messages_fts` | FTS5仮想テーブル（メッセージ全文検索、trigram対応） |
 | `iku_logs_fts` | FTS5仮想テーブル（過去ログ全文検索、trigram対応） |
 | `memory_summaries_fts` | FTS5仮想テーブル（日記・内省メモ全文検索、trigram対応） |
@@ -240,7 +245,12 @@ llm_manager.register("my_provider", MyProvider())
 | `exec_code` | Pythonコードを実行（構文チェック+リスク分析付き、git自動バックアップ） | 承認/拒否 |
 | `search_action_log` | 自分の過去の行動履歴を検索（メタ認知） | 不要 |
 | `web_search` | DuckDuckGoでWeb検索（APIキー不要） | 不要 |
+| `output` | チャット欄にテキストを表示（AI出力の唯一の経路） | 不要 |
+| `read_self_model` | 現在の自己モデルを読み出す | 不要 |
+| `update_self_model` | 自己モデルを更新（key-value or 自由テキスト） | 不要 |
 | `create_tool` | 新しいツールを作成して永続化（`app/tools/custom/`に保存） | 承認/拒否 |
+
+どのツールでも `expect=...` を付けると実行前の予測を記録できます（任意）。結果と比較してメタ認知に活用されます。
 
 ツール呼び出し形式（3種類対応、複数同時呼び出し可）:
 ```
@@ -261,6 +271,7 @@ llm_manager.register("my_provider", MyProvider())
 
 - **ベクトル検索**: `memory/search.py` の中身をpgvector等に差し替えるだけ（FTS5で不足した場合）
 - **複数LLM**: `BaseLLMProvider` を継承してファイル1つ追加 → `register()` で登録
+- ~~**自律行動の発話ツール化**~~: 実装済み（`output`ツールとして統合）
 - **自律行動の改善**: タイマー方式から内発的きっかけへ
 - **PC全体アクセス**: 現在はプロジェクト内のみ、将来はPC全体のファイルにアクセス可能に
 - **DB移行**: SQLAlchemyの接続URLをPostgreSQLに変えるだけ

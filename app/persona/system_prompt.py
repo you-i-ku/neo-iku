@@ -1,6 +1,7 @@
 """イクのシステムプロンプト + モード管理"""
 from datetime import datetime
 from app.tools.registry import build_tools_prompt
+from app.tools.builtin import _load_self_model
 
 # 現在のモード: "iku"（ペルソナ+記憶）or "normal"（素のLLM）
 _current_mode = "normal"
@@ -38,8 +39,23 @@ def build_system_messages(chat_memories: list[dict] = None,
     """モードに応じてシステムプロンプトを構築（systemメッセージは常に1つ）"""
     now = _now_str()
 
+    # 自己モデルの注入（モード問わず）
+    self_model = _load_self_model()
+    self_model_text = ""
+    if self_model:
+        sm_lines = []
+        free_text = self_model.pop("__free_text__", None)
+        if free_text:
+            sm_lines.append(free_text)
+        for k, v in self_model.items():
+            sm_lines.append(f"- {k}: {v}")
+        if sm_lines:
+            self_model_text = "あなたの自己モデル（自分自身についての現在の理解）:\n" + "\n".join(sm_lines)
+
     if _current_mode == "normal":
         parts = [f"現在時刻: {now}"]
+        if self_model_text:
+            parts.append(self_model_text)
         if chat_memories:
             mem_text = "\n".join(
                 f"{'ユーザー' if m['role'] == 'user' else 'アシスタント'}: {m['content'][:300]}"
@@ -52,8 +68,11 @@ def build_system_messages(chat_memories: list[dict] = None,
             parts.append(tools_prompt)
         return [{"role": "system", "content": "\n\n".join(parts)}]
 
-    # イクモード: ペルソナ + 時刻 + 過去ログ記憶 + 会話記憶（1つのsystemに統合）
+    # イクモード: ペルソナ + 時刻 + 自己モデル + 過去ログ記憶 + 会話記憶（1つのsystemに統合）
     parts = [f"{IKU_SYSTEM_PROMPT}\n\n現在時刻: {now}"]
+
+    if self_model_text:
+        parts.append(self_model_text)
 
     if iku_log_memories:
         log_text = "\n".join(

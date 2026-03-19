@@ -441,6 +441,9 @@ async def search_action_log(query: str = "", tool_name: str = "") -> str:
         ms = r.get("execution_ms")
         time_str = f" ({ms}ms)" if ms else ""
         lines.append(f"- [{ts}] {r['tool_name']}({r['arguments']}) → {status}{time_str}")
+        expected = r.get("expected_result")
+        if expected:
+            lines.append(f"  予測: {expected[:150]}")
         summary = r.get("result_summary", "")
         if summary:
             lines.append(f"  結果: {summary[:150]}")
@@ -623,6 +626,71 @@ def load_custom_tools():
             logger.error(f"カスタムツール {py_file.name} の読み込みエラー: {e}")
 
 
+SELF_MODEL_PATH = DATA_DIR / "self_model.json"
+
+
+def _load_self_model() -> dict:
+    """自己モデルをファイルから読み込む"""
+    if not SELF_MODEL_PATH.exists():
+        return {}
+    try:
+        return json.loads(SELF_MODEL_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_self_model(model: dict):
+    """自己モデルをファイルに保存"""
+    SELF_MODEL_PATH.write_text(
+        json.dumps(model, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+async def read_self_model() -> str:
+    """現在の自己モデルを読む"""
+    model = _load_self_model()
+    if not model:
+        return "自己モデルはまだ空です。update_self_modelで更新できます。"
+
+    lines = ["【現在の自己モデル】"]
+    for key, value in model.items():
+        lines.append(f"- {key}: {value}")
+    return "\n".join(lines)
+
+
+async def update_self_model(key: str = "", value: str = "", text: str = "") -> str:
+    """自己モデルを更新する。key+valueでキーバリュー更新、textで自由テキスト更新"""
+    model = _load_self_model()
+
+    if text:
+        model["__free_text__"] = text
+        _save_self_model(model)
+        return f"自己モデルの自由テキストを更新しました。（{len(text)}文字）"
+
+    if key and value:
+        model[key] = value
+        _save_self_model(model)
+        return f"自己モデルを更新しました: {key} = {value}"
+
+    if key and not value:
+        if key in model:
+            del model[key]
+            _save_self_model(model)
+            return f"自己モデルから削除しました: {key}"
+        return f"キー '{key}' は自己モデルに存在しません。"
+
+    return "エラー: key+value または text を指定してください。"
+
+
+async def output(content: str = "", to: str = "chat") -> str:
+    """ユーザーに向けてテキストを出力する（UIに表示される）"""
+    if not content:
+        return "エラー: contentを指定してください。"
+    # 実際のUI表示はchat.py/autonomous.pyが tool_name=="output" を検知して処理する
+    return content
+
+
 def register_all():
     """全組み込みツールを登録"""
     register_tool(
@@ -694,11 +762,30 @@ def register_all():
         required_args=["query"],
     )
     register_tool(
+        "output",
+        "ユーザーに向けてテキストを出力する。発言したい時はこのツールを使う。使わなければUIには何も表示されない",
+        'content=出力するテキスト to=出力先（デフォルト: chat）',
+        output,
+        required_args=["content"],
+    )
+    register_tool(
         "create_tool",
         "新しいツールを作成して自分の能力を拡張する。ユーザーの承認が必要",
         'name=ツール名（英小文字） description=ツールの説明 args_desc=引数の説明 code=async def関数のPythonコード',
         create_tool,
         required_args=["name", "code"],
+    )
+    register_tool(
+        "read_self_model",
+        "自分の自己モデル（自分自身についての理解）を読む",
+        "",
+        read_self_model,
+    )
+    register_tool(
+        "update_self_model",
+        "自分の自己モデルを更新する。自分について新しく理解したことや、考えが変わった時に使う",
+        'key=更新する項目名 value=新しい値（valueを省略するとそのキーを削除） text=自由テキストで自己モデル全体を記述（key/valueの代わりに使える）',
+        update_self_model,
     )
     # カスタムツール読み込み（起動時に永続化されたツールを復元）
     load_custom_tools()

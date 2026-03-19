@@ -4,103 +4,112 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>イク — neo-iku</title>
-    <link rel="stylesheet" href="/static/style.css?v=16">
+    <link rel="stylesheet" href="/static/style.css?v=27">
 </head>
 <body>
-    <div class="container">
-        <!-- 左パネル: チャット -->
-        <div class="panel chat-panel">
-            <div class="panel-header">
-                <h2 id="chat-title">チャット</h2>
-                <span id="connection-status" class="status-dot offline"></span>
-                <div class="mode-toggle">
-                    <button id="mode-btn" class="mode-btn normal" title="クリックでモード切替">ノーマル</button>
-                </div>
-            </div>
-            <div id="chat-messages" class="messages"></div>
-            <div class="input-area">
-                <textarea id="chat-input" placeholder="メッセージを入力..." rows="2"></textarea>
-                <button id="send-btn">送信</button>
-                <button id="stop-btn" disabled title="出力を停止">⏹</button>
-            </div>
+    <!-- ステータスバー -->
+    <div class="status-bar">
+        <span id="connection-status" class="status-dot offline"></span>
+        <span id="status-llm" class="status-bar-item">LLM: —</span>
+        <span class="status-bar-sep">|</span>
+        <span id="status-memories" class="status-bar-item">記憶: —</span>
+        <span class="status-bar-sep">|</span>
+        <span id="status-countdown" class="status-bar-item countdown">次の自律: —</span>
+        <span class="status-bar-sep">|</span>
+        <span id="status-mode" class="status-bar-item">モード: —</span>
+        <div class="status-bar-right">
+            <button id="mode-btn" class="mode-btn normal" title="クリックでモード切替">ノーマル</button>
         </div>
+    </div>
 
-        <!-- 右パネル: ダッシュボード -->
-        <div class="panel dashboard-panel">
-            <div class="panel-header">
-                <h2>ダッシュボード</h2>
-            </div>
-            <div class="dashboard-content">
-                <!-- 状態 -->
-                <div class="section">
-                    <h3>状態</h3>
-                    <div class="status-grid">
-                        <div class="status-item">
-                            <span class="label">LLM</span>
-                            <span id="llm-status" class="value">—</span>
-                        </div>
-                        <div class="status-item">
-                            <span class="label">メッセージ数</span>
-                            <span id="message-count" class="value">—</span>
-                        </div>
-                        <div class="status-item">
-                            <span class="label">モデル</span>
-                            <select id="model-select" class="model-select">
-                                <option value="">読み込み中...</option>
-                            </select>
-                        </div>
-                        <div class="status-item">
-                            <span class="label">次の自律行動</span>
-                            <span id="autonomous-countdown" class="value countdown">—</span>
-                        </div>
-                    </div>
+    <!-- タブバー -->
+    <div class="tab-bar">
+        <button class="tab-btn active" data-tab="chat">チャット</button>
+        <button class="tab-btn" data-tab="dev">開発者</button>
+        <button class="tab-btn" data-tab="log">ログ</button>
+    </div>
+
+    <!-- チャットタブ -->
+    <div id="tab-chat" class="tab-content active">
+        <div id="chat-messages" class="messages"></div>
+        <div class="input-area">
+            <textarea id="chat-input" placeholder="メッセージを入力..." rows="2"></textarea>
+            <button id="send-btn">送信</button>
+            <button id="stop-btn" disabled title="出力を停止">⏹</button>
+        </div>
+    </div>
+
+    <!-- 開発者タブ -->
+    <div id="tab-dev" class="tab-content">
+        <div class="dev-layout">
+            <!-- 左: 思考ログ -->
+            <div class="dev-left">
+                <div class="dev-section-header">思考ログ</div>
+                <div id="thought-log" class="thought-log">
+                    <div class="thought-log-empty">AIの思考過程がここに表示されます</div>
                 </div>
-
-                <!-- 開発用ツール -->
-                <details class="section dev-tools">
-                    <summary class="dev-tools-summary">開発用ツール</summary>
-                    <div class="dev-tools-grid">
-                        <div class="dev-item">
-                            <label>自律行動間隔（秒）</label>
-                            <div class="dev-row">
-                                <input id="dev-interval" type="number" min="10" value="300">
-                                <button id="dev-interval-btn">設定</button>
+            </div>
+            <!-- 右: 設定・ステータス・記憶 -->
+            <div class="dev-right">
+                <div class="dev-right-scroll">
+                    <!-- 設定 -->
+                    <div class="section">
+                        <h3>設定</h3>
+                        <div class="dev-tools-grid">
+                            <div class="dev-item">
+                                <label>モデル</label>
+                                <select id="model-select" class="model-select">
+                                    <option value="">読み込み中...</option>
+                                </select>
                             </div>
-                        </div>
-                        <div class="dev-item">
-                            <label>ツール最大ラウンド</label>
-                            <div class="dev-row">
-                                <input id="dev-rounds" type="number" min="1" max="30" value="8">
-                                <button id="dev-rounds-btn">設定</button>
+                            <div class="dev-item">
+                                <label>自律行動間隔（秒）</label>
+                                <div class="dev-row">
+                                    <input id="dev-interval" type="number" min="10" value="300">
+                                    <button id="dev-interval-btn">設定</button>
+                                </div>
                             </div>
+                            <div class="dev-item">
+                                <label>ツール最大ラウンド</label>
+                                <div class="dev-row">
+                                    <input id="dev-rounds" type="number" min="1" max="30" value="8">
+                                    <button id="dev-rounds-btn">設定</button>
+                                </div>
+                            </div>
+                            <button id="dev-trigger-btn" class="dev-btn trigger">今すぐ自律行動</button>
+                            <button id="dev-reset-btn" class="dev-btn danger">DBリセット（過去ログ以外）</button>
                         </div>
-                        <button id="dev-trigger-btn" class="dev-btn trigger">今すぐ自律行動</button>
-                        <button id="dev-reset-btn" class="dev-btn danger">DBリセット（過去ログ以外）</button>
                     </div>
-                </details>
 
-                <!-- 記憶検索 -->
-                <div class="section">
-                    <h3>記憶</h3>
-                    <div class="search-area">
-                        <input id="memory-search" type="text" placeholder="記憶を検索...">
-                        <button id="search-btn">検索</button>
+                    <!-- 記憶検索 -->
+                    <div class="section">
+                        <h3>記憶</h3>
+                        <div class="search-area">
+                            <input id="memory-search" type="text" placeholder="記憶を検索...">
+                            <button id="search-btn">検索</button>
+                        </div>
+                        <div id="memory-list" class="memory-list"></div>
                     </div>
-                    <div id="memory-list" class="memory-list"></div>
                 </div>
             </div>
         </div>
     </div>
-    <!-- ログパネル -->
-    <div id="log-panel" class="log-panel">
-        <div class="log-header" id="log-toggle">
-            <span>ログ</span>
-            <span id="log-arrow">▲</span>
+
+    <!-- ログタブ -->
+    <div id="tab-log" class="tab-content">
+        <div class="log-tab-header">
+            <div class="log-filters">
+                <button class="log-filter-btn active" data-level="ALL">ALL</button>
+                <button class="log-filter-btn" data-level="DEBUG">DEBUG</button>
+                <button class="log-filter-btn" data-level="INFO">INFO</button>
+                <button class="log-filter-btn" data-level="WARNING">WARNING</button>
+                <button class="log-filter-btn" data-level="ERROR">ERROR</button>
+            </div>
+            <button id="log-clear-btn" class="log-clear-btn">クリア</button>
         </div>
-        <div id="log-body" class="log-body" style="display:none">
-            <div id="log-content" class="log-content"></div>
-        </div>
+        <div id="log-content" class="log-content-full"></div>
     </div>
-    <script src="/static/app.js?v=16"></script>
+
+    <script src="/static/app.js?v=27"></script>
 </body>
 </html>

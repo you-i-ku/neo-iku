@@ -28,6 +28,12 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+        # tool_actionsにexpected_resultカラム追加（既存DBマイグレーション）
+        try:
+            await conn.execute(text("SELECT expected_result FROM tool_actions LIMIT 1"))
+        except Exception:
+            await conn.execute(text("ALTER TABLE tool_actions ADD COLUMN expected_result TEXT"))
+
         # trigram tokenizer対応チェック（日本語検索に必須）
         use_trigram = False
         try:

@@ -52,6 +52,7 @@ class ToolAction(Base):
     tool_name = Column(String(100), nullable=False)
     arguments = Column(Text, nullable=False)       # JSON文字列
     result_summary = Column(Text, nullable=False)   # 結果の先頭500文字
+    expected_result = Column(Text, nullable=True)    # 実行前の予測（メタ認知用）
     status = Column(String(20), default="success")  # success / error
     execution_ms = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)

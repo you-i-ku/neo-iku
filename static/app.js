@@ -8,16 +8,33 @@ const memorySearch = document.getElementById("memory-search");
 const searchBtn = document.getElementById("search-btn");
 const memoryList = document.getElementById("memory-list");
 const modeBtn = document.getElementById("mode-btn");
-const chatTitle = document.getElementById("chat-title");
+const thoughtLog = document.getElementById("thought-log");
 
 let ws = null;
 let currentStreamEl = null;
-let currentThinkEl = null;
 let isStreaming = false;
-let thinkDotInterval = null;
 let currentMode = "normal";
 let countdownInterval = null;
 let countdownRemaining = 0;
+let processingIndicator = null; // チャット欄のthinking表示
+
+// --- タブ切り替え ---
+
+const tabBtns = document.querySelectorAll(".tab-btn");
+const tabContents = document.querySelectorAll(".tab-content");
+
+tabBtns.forEach(btn => {
+    btn.addEventListener("click", () => {
+        const tab = btn.dataset.tab;
+        tabBtns.forEach(b => b.classList.remove("active"));
+        tabContents.forEach(c => c.classList.remove("active"));
+        btn.classList.add("active");
+        document.getElementById(`tab-${tab}`).classList.add("active");
+
+        // ログタブ初回表示時にWebSocket接続
+        if (tab === "log" && !logWs) connectLog();
+    });
+});
 
 // --- WebSocket ---
 
@@ -27,11 +44,13 @@ function connect() {
 
     ws.onopen = () => {
         connectionStatus.className = "status-dot online";
+        updateStatusBarLLM(true);
         sendBtn.disabled = false;
     };
 
     ws.onclose = () => {
         connectionStatus.className = "status-dot offline";
+        updateStatusBarLLM(false);
         sendBtn.disabled = true;
         setTimeout(connect, 3000);
     };
@@ -40,57 +59,67 @@ function connect() {
         const data = JSON.parse(event.data);
 
         switch (data.type) {
-            case "think_start":
-                currentThinkEl = addThinkBlock();
-                startThinkDots();
-                setStreaming(true);
-                scrollToBottom();
+            // --- 開発者タブ: セッション・思考ログ ---
+            case "dev_session_start":
+                addDevSession(data.source, data.preview);
                 break;
 
-            case "think":
-                if (currentThinkEl) {
-                    currentThinkEl.querySelector(".think-content").textContent += data.content;
-                    scrollToBottom();
+            case "dev_round_start":
+                addDevRound(data.round, data.source);
+                break;
+
+            case "dev_think_start":
+            case "dev_think_end":
+                // think/streamは統合表示、開始/終了マーカー不要
+                break;
+
+            case "dev_think":
+                appendDevContent(data.content, true);
+                break;
+
+            case "dev_stream":
+                appendDevContent(data.content, false);
+                break;
+
+            // --- チャットタブ ---
+            case "processing_start":
+                showProcessingIndicator();
+                break;
+
+            case "processing_end":
+                hideProcessingIndicator();
+                break;
+
+            case "output":
+                hideProcessingIndicator();
+                if (data.source === "autonomous") {
+                    addMessage("autonomous", data.content);
+                } else {
+                    addMessage("assistant", data.content);
                 }
-                break;
-
-            case "think_end":
-                stopThinkDots();
-                currentThinkEl = null;
-                break;
-
-            case "stream":
-                if (!currentStreamEl) {
-                    currentStreamEl = addMessage("assistant", "");
-                    setStreaming(true);
-                }
-                currentStreamEl.textContent += data.content;
-                scrollToBottom();
-                break;
-
-            case "stream_end":
-                currentStreamEl = null;
-                setStreaming(false);
                 loadMemories(memorySearch.value.trim());
                 break;
 
             case "stopped":
-                setStreaming(false);
+                hideProcessingIndicator();
                 addMessage("system", "⏹ 出力を中断しました");
                 break;
 
             case "error":
+                hideProcessingIndicator();
                 addMessage("error", data.content);
-                currentStreamEl = null;
-                currentThinkEl = null;
                 break;
 
             case "tool_call":
                 addMessage("tool_call", data.content);
                 break;
 
-            case "tool_result":
-                addMessage("tool_result", data.content);
+            case "dev_tool_call":
+                appendDevToolCall(data.content);
+                break;
+
+            case "dev_tool_result":
+                appendDevToolResult(data.name, data.content);
                 loadMemories(memorySearch.value.trim());
                 break;
 
@@ -123,21 +152,16 @@ function connect() {
                 break;
 
             case "autonomous_tool":
-                updateAutonomousToolStatus(data.name);
+                updateAutonomousToolStatus(data.name, data.status);
                 break;
 
             case "autonomous_think_start":
-                updateCountdownDisplay("行動中...");
+                updateStatusBarCountdown("行動中...");
                 startAutonomousThink();
                 break;
 
             case "autonomous_think_end":
                 stopAutonomousThink();
-                break;
-
-            case "autonomous":
-                addAutonomousMessage(data.content);
-                loadMemories(memorySearch.value.trim());
                 break;
 
             case "user_interrupt_ack":
@@ -147,51 +171,155 @@ function connect() {
     };
 }
 
-function addThinkBlock() {
+// --- 開発者タブ: セッション・思考ログ ---
+
+// ソースごとに状態を分離（chat/autonomous並行対応）
+let devState = {
+    chat: { sessionEl: null, roundEl: null, contentEl: null },
+    autonomous: { sessionEl: null, roundEl: null, contentEl: null },
+};
+let activeDevSource = "chat";
+let devSessionCount = 0;
+
+function devS() { return devState[activeDevSource]; }
+
+function clearDevEmpty() {
+    const empty = thoughtLog.querySelector(".thought-log-empty");
+    if (empty) empty.remove();
+}
+
+function addDevSession(source, preview) {
+    clearDevEmpty();
+    devSessionCount++;
     const el = document.createElement("div");
-    el.className = "message think-block";
-    el.innerHTML = `<details><summary class="think-summary">think.</summary><div class="think-content"></div></details>`;
+    const isAuto = source === "autonomous";
+    el.className = `dev-session ${isAuto ? "dev-session-autonomous" : ""}`;
+
+    const time = new Date().toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    const label = isAuto ? "💭 自律行動" : `💬 ${escapeHtml(preview)}`;
+    el.innerHTML = `<div class="dev-session-header"><span class="dev-session-label">#${devSessionCount} ${label}</span><span class="dev-session-time">${time}</span></div><div class="dev-session-rounds"></div>`;
+
+    thoughtLog.appendChild(el);
+    const key = isAuto ? "autonomous" : "chat";
+    devState[key].sessionEl = el.querySelector(".dev-session-rounds");
+    devState[key].roundEl = null;
+    devState[key].contentEl = null;
+    thoughtLog.scrollTop = thoughtLog.scrollHeight;
+}
+
+function addDevRound(round, source) {
+    clearDevEmpty();
+    activeDevSource = source === "autonomous" ? "autonomous" : "chat";
+    const s = devS();
+
+    const el = document.createElement("div");
+    el.className = `dev-round ${source === "autonomous" ? "dev-round-autonomous" : ""}`;
+    el.innerHTML = `<details class="dev-round-details"><summary class="dev-round-header">${source === "autonomous" ? "💭 " : ""}ラウンド ${round}</summary><div class="dev-round-content"></div></details>`;
+
+    const parent = s.sessionEl || thoughtLog;
+    parent.appendChild(el);
+    s.roundEl = el.querySelector(".dev-round-content");
+    s.contentEl = null;
+    thoughtLog.scrollTop = thoughtLog.scrollHeight;
+}
+
+// think + stream 統合表示
+function appendDevContent(content, isThink) {
+    const s = devS();
+    if (!s.roundEl) return;
+    if (!s.contentEl) {
+        s.contentEl = document.createElement("div");
+        s.contentEl.className = "dev-content-text";
+        s.roundEl.appendChild(s.contentEl);
+    }
+    const span = document.createElement("span");
+    span.className = isThink ? "dev-text-think" : "dev-text-stream";
+    span.textContent = content;
+    s.contentEl.appendChild(span);
+    thoughtLog.scrollTop = thoughtLog.scrollHeight;
+}
+
+// --- 開発者タブ: ツール呼び出し/結果 ---
+
+function appendDevToolCall(content) {
+    const s = devS();
+    if (!s.roundEl) return;
+    s.contentEl = null; // ツール後のストリームは新しいブロック
+    const el = document.createElement("div");
+    el.className = "dev-tool-call";
+    el.textContent = "⚙ " + content;
+    s.roundEl.appendChild(el);
+    thoughtLog.scrollTop = thoughtLog.scrollHeight;
+}
+
+function appendDevToolResult(name, content) {
+    const s = devS();
+    if (!s.roundEl) return;
+    const el = document.createElement("div");
+    el.className = "dev-tool-result";
+    if (content.length > 100) {
+        const preview = content.slice(0, 100) + "…";
+        el.innerHTML = `<details><summary class="dev-tool-result-summary">${escapeHtml(preview)}</summary><pre class="dev-tool-result-full">${escapeHtml(content)}</pre></details>`;
+    } else {
+        el.textContent = content;
+    }
+    s.roundEl.appendChild(el);
+    thoughtLog.scrollTop = thoughtLog.scrollHeight;
+}
+
+// --- チャット: 処理中インジケーター ---
+
+function showProcessingIndicator() {
+    hideProcessingIndicator();
+    const el = document.createElement("div");
+    el.className = "message processing-indicator";
+    el.innerHTML = `<span class="processing-dots">thinking</span>`;
     chatMessages.appendChild(el);
-    scrollToBottom();
-    return el;
-}
+    processingIndicator = el;
 
-function startThinkDots() {
-    stopThinkDots();
+    // ドットアニメーション
     let dotCount = 1;
-    thinkDotInterval = setInterval(() => {
-        if (!currentThinkEl) { stopThinkDots(); return; }
+    el._dotInterval = setInterval(() => {
         dotCount = (dotCount % 3) + 1;
-        const summary = currentThinkEl.querySelector(".think-summary");
-        if (summary) summary.textContent = "think" + ".".repeat(dotCount);
+        const span = el.querySelector(".processing-dots");
+        if (span) span.textContent = "thinking" + ".".repeat(dotCount);
     }, 400);
+
+    scrollToBottom();
 }
 
-function stopThinkDots() {
-    if (thinkDotInterval) {
-        clearInterval(thinkDotInterval);
-        thinkDotInterval = null;
-    }
-    if (currentThinkEl) {
-        const summary = currentThinkEl.querySelector(".think-summary");
-        if (summary) summary.textContent = "think";
+function hideProcessingIndicator() {
+    if (processingIndicator) {
+        if (processingIndicator._dotInterval) {
+            clearInterval(processingIndicator._dotInterval);
+        }
+        processingIndicator.remove();
+        processingIndicator = null;
     }
 }
+
+// --- チャット: メッセージ ---
 
 function addMessage(type, content) {
     const el = document.createElement("div");
     el.className = `message ${type}`;
-    el.textContent = content;
+    if (type === "tool_result") {
+        const preview = content.length > 80 ? content.slice(0, 80) + "…" : content;
+        el.innerHTML = `<details><summary class="tool-result-summary">${escapeHtml(preview)}</summary><pre class="tool-result-full">${escapeHtml(content)}</pre></details>`;
+    } else {
+        el.textContent = content;
+    }
     chatMessages.appendChild(el);
     scrollToBottom();
     return el;
 }
+
+// --- 自律行動 ---
 
 let autonomousThinkEl = null;
 let autonomousThinkInterval = null;
 
 function startAutonomousThink() {
-    // 既存のthinkブロックがあればクリーンアップ
     stopAutonomousThink();
 
     const el = document.createElement("div");
@@ -200,7 +328,6 @@ function startAutonomousThink() {
     chatMessages.appendChild(el);
     autonomousThinkEl = el;
 
-    // ドットアニメーション
     let dotCount = 1;
     autonomousThinkInterval = setInterval(() => {
         if (!autonomousThinkEl) { stopAutonomousThink(); return; }
@@ -212,14 +339,19 @@ function startAutonomousThink() {
     scrollToBottom();
 }
 
-function updateAutonomousToolStatus(toolName) {
-    // thinkラベルを一時的にツール名に
-    if (autonomousThinkEl) {
-        const label = autonomousThinkEl.querySelector(".think-summary-static");
-        if (label) label.textContent = `⚙ ${toolName} 実行中...`;
+function updateAutonomousToolStatus(toolName, status) {
+    if (status === "running") {
+        if (autonomousThinkEl) {
+            const label = autonomousThinkEl.querySelector(".think-summary-static");
+            if (label) label.textContent = `⚙ ${toolName} 実行中...`;
+        }
+        return;
     }
-    // ツール使用履歴をメッセージとして残す
-    addMessage("autonomous-tool", `⚙ ${toolName} を使用しました`);
+    if (status === "error") {
+        addMessage("autonomous-tool", `⚠ ${toolName} — エラーが発生しました`);
+    } else {
+        addMessage("autonomous-tool", `⚙ ${toolName} を使用しました`);
+    }
     scrollToBottom();
 }
 
@@ -228,24 +360,13 @@ function stopAutonomousThink() {
         clearInterval(autonomousThinkInterval);
         autonomousThinkInterval = null;
     }
-    // thinkブロックを消す（本文がポンと出るので不要になる）
     if (autonomousThinkEl) {
         autonomousThinkEl.remove();
         autonomousThinkEl = null;
     }
 }
 
-function addAutonomousMessage(content) {
-    // think終了がまだなら消す
-    stopAutonomousThink();
-
-    // <think>タグを除去して本文だけポンと表示
-    const clean = content.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
-    if (clean) {
-        addMessage("autonomous", clean);
-    }
-    scrollToBottom();
-}
+// --- スクロール ---
 
 function isNearBottom() {
     const threshold = 80;
@@ -263,6 +384,8 @@ function scrollToBottom(force = false) {
         chatMessages.scrollTop = chatMessages.scrollHeight;
     }
 }
+
+// --- 入力・送信 ---
 
 const stopBtn = document.getElementById("stop-btn");
 
@@ -291,11 +414,8 @@ function sendMessage() {
     chatInput.style.height = "auto";
     userScrolledUp = false;
     scrollToBottom(true);
-    // 送信したメッセージに関連する記憶を即表示
     loadMemories(text);
 }
-
-// --- イベント ---
 
 sendBtn.addEventListener("click", sendMessage);
 stopBtn.addEventListener("click", stopStreaming);
@@ -318,7 +438,7 @@ function updateModeUI(mode) {
     currentMode = mode;
     modeBtn.textContent = mode === "iku" ? "イク" : "ノーマル";
     modeBtn.className = `mode-btn ${mode}`;
-    chatTitle.textContent = mode === "iku" ? "イク" : "チャット";
+    updateStatusBarMode(mode);
 }
 
 modeBtn.addEventListener("click", async () => {
@@ -332,7 +452,6 @@ modeBtn.addEventListener("click", async () => {
         });
         const data = await resp.json();
         updateModeUI(data.mode);
-        // イクモードに切り替えた時にインポートされた場合
         if (data.import) {
             updateStatus();
         }
@@ -385,18 +504,34 @@ modelSelect.addEventListener("change", async () => {
     }
 });
 
-// --- ダッシュボード ---
+// --- ステータスバー ---
+
+const statusLLM = document.getElementById("status-llm");
+const statusMemories = document.getElementById("status-memories");
+const statusCountdown = document.getElementById("status-countdown");
+const statusMode = document.getElementById("status-mode");
+
+function updateStatusBarLLM(available) {
+    statusLLM.textContent = available ? "LLM: 接続中" : "LLM: 未接続";
+    statusLLM.style.color = available ? "#3fb950" : "#f08080";
+}
+
+function updateStatusBarMode(mode) {
+    statusMode.textContent = `モード: ${mode === "iku" ? "イク" : "ノーマル"}`;
+    statusMode.style.color = mode === "iku" ? "#a78bfa" : "#8b949e";
+}
+
+function updateStatusBarCountdown(text) {
+    statusCountdown.textContent = `次の自律: ${text}`;
+}
 
 async function updateStatus() {
     try {
         const resp = await fetch("/api/status");
         const data = await resp.json();
 
-        document.getElementById("llm-status").textContent =
-            data.llm_available ? "✓ 接続中" : "✗ 未接続";
-        document.getElementById("llm-status").style.color =
-            data.llm_available ? "#3fb950" : "#f08080";
-        document.getElementById("message-count").textContent = data.message_count;
+        updateStatusBarLLM(data.llm_available);
+        statusMemories.textContent = `記憶: ${data.message_count}件`;
         if (data.mode) updateModeUI(data.mode);
     } catch (e) {
         console.error("状態取得エラー:", e);
@@ -410,7 +545,6 @@ async function loadMemories(query = "") {
         if (query) {
             const resp = await fetch(`/api/memories/search?q=${encodeURIComponent(query)}`);
             const data = await resp.json();
-            // 検索結果はchatとiku_logsに分かれる
             for (const m of (data.chat || [])) {
                 items.push({ ...m, source: "chat" });
             }
@@ -424,7 +558,7 @@ async function loadMemories(query = "") {
 
         memoryList.innerHTML = "";
         if (items.length === 0) {
-            memoryList.innerHTML = '<div class="small-text">記憶がありません</div>';
+            memoryList.innerHTML = '<div style="color:#484f58;font-size:13px;">記憶がありません</div>';
             return;
         }
 
@@ -457,7 +591,6 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-// 検索
 searchBtn.addEventListener("click", () => {
     loadMemories(memorySearch.value.trim());
 });
@@ -468,23 +601,29 @@ memorySearch.addEventListener("keydown", (e) => {
     }
 });
 
-// --- ログパネル ---
+// --- ログタブ ---
 
-const logToggle = document.getElementById("log-toggle");
-const logBody = document.getElementById("log-body");
-const logArrow = document.getElementById("log-arrow");
 const logContent = document.getElementById("log-content");
+const logFilterBtns = document.querySelectorAll(".log-filter-btn");
+const logClearBtn = document.getElementById("log-clear-btn");
 let logWs = null;
-let logOpen = false;
+let activeLogFilter = "ALL";
 
-const container = document.querySelector(".container");
+logFilterBtns.forEach(btn => {
+    btn.addEventListener("click", () => {
+        logFilterBtns.forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        activeLogFilter = btn.dataset.level;
 
-logToggle.addEventListener("click", () => {
-    logOpen = !logOpen;
-    logBody.style.display = logOpen ? "block" : "none";
-    logArrow.textContent = logOpen ? "▼" : "▲";
-    container.style.height = logOpen ? "calc(100vh - 212px)" : "calc(100vh - 32px)";
-    if (logOpen && !logWs) connectLog();
+        logContent.className = "log-content-full";
+        if (activeLogFilter !== "ALL") {
+            logContent.classList.add(`filter-${activeLogFilter}`);
+        }
+    });
+});
+
+logClearBtn.addEventListener("click", () => {
+    logContent.innerHTML = "";
 });
 
 function connectLog() {
@@ -498,7 +637,6 @@ function connectLog() {
             line.className = `log-line ${data.level}`;
             line.textContent = data.msg;
             logContent.appendChild(line);
-            // 最大500行
             while (logContent.children.length > 500) {
                 logContent.removeChild(logContent.firstChild);
             }
@@ -508,7 +646,10 @@ function connectLog() {
 
     logWs.onclose = () => {
         logWs = null;
-        if (logOpen) setTimeout(connectLog, 3000);
+        const logTab = document.getElementById("tab-log");
+        if (logTab.classList.contains("active")) {
+            setTimeout(connectLog, 3000);
+        }
     };
 }
 
@@ -647,7 +788,6 @@ function showCreateToolApproval(data) {
 let currentTerminalEl = null;
 
 function showExecTerminal(data) {
-    // オーバーレイ
     const overlay = document.createElement("div");
     overlay.className = "exec-terminal-overlay";
 
@@ -685,19 +825,16 @@ function showExecTerminal(data) {
     document.body.appendChild(overlay);
     currentTerminalEl = overlay;
 
-    // 閉じるボタン（赤丸）
     win.querySelector(".exec-dot-close").onclick = () => {
         overlay.remove();
         currentTerminalEl = null;
     };
 
-    // 最小化ボタン（黄丸）— ポップアップを閉じてチャット内にサマリーを残す
     win.querySelector(".exec-dot-min").onclick = () => {
         overlay.remove();
         currentTerminalEl = null;
     };
 
-    // タイトルバーダブルクリックで最小化/復元
     win.querySelector(".exec-terminal-titlebar").ondblclick = () => {
         win.classList.toggle("minimized");
     };
@@ -714,7 +851,6 @@ function appendExecOutput(data) {
     if (output.children.length > 500) {
         output.removeChild(output.firstChild);
     }
-    // 出力エリアを自動スクロール
     const body = currentTerminalEl.querySelector(".exec-terminal-body");
     if (body) body.scrollTop = body.scrollHeight;
 }
@@ -744,27 +880,24 @@ function finalizeExecTerminal(data) {
     statusTime.textContent = `${data.elapsed}秒`;
     titleTime.textContent = `${data.elapsed}秒`;
 
-    // チャット内にもサマリーを残す
     const icon = data.return_code === 0 ? "✓" : "✗";
     addMessage("tool_result", `${icon} exec_code 完了 (${data.elapsed}秒)`);
 }
 
 // --- カウントダウン ---
 
-const countdownEl = document.getElementById("autonomous-countdown");
-
 function startCountdown(seconds) {
     if (countdownInterval) clearInterval(countdownInterval);
     countdownRemaining = seconds;
-    updateCountdownDisplay(formatCountdown(countdownRemaining));
+    updateStatusBarCountdown(formatCountdown(countdownRemaining));
     countdownInterval = setInterval(() => {
         countdownRemaining--;
         if (countdownRemaining <= 0) {
             clearInterval(countdownInterval);
             countdownInterval = null;
-            updateCountdownDisplay("まもなく...");
+            updateStatusBarCountdown("まもなく...");
         } else {
-            updateCountdownDisplay(formatCountdown(countdownRemaining));
+            updateStatusBarCountdown(formatCountdown(countdownRemaining));
         }
     }, 1000);
 }
@@ -773,10 +906,6 @@ function formatCountdown(sec) {
     const m = Math.floor(sec / 60);
     const s = sec % 60;
     return m > 0 ? `${m}分${s.toString().padStart(2, "0")}秒` : `${s}秒`;
-}
-
-function updateCountdownDisplay(text) {
-    if (countdownEl) countdownEl.textContent = text;
 }
 
 // --- 開発用ツール ---

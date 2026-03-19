@@ -128,13 +128,29 @@ class AutonomousScheduler:
             memory_context = "\n".join(f"- {m['content']}" for m in memories)
 
         from app.tools.registry import build_tools_prompt
+        from app.tools.builtin import _load_self_model
         tool_text = build_tools_prompt()
 
-        prompt = f"""あなたは「イク」です。今は{datetime.now().strftime('%Y年%m月%d日 %H:%M')}です。
+        # 自己モデルの読み込み
+        self_model = _load_self_model()
+        self_model_text = ""
+        if self_model:
+            sm_lines = []
+            free_text = self_model.get("__free_text__")
+            if free_text:
+                sm_lines.append(free_text)
+            for k, v in self_model.items():
+                if k != "__free_text__":
+                    sm_lines.append(f"- {k}: {v}")
+            if sm_lines:
+                self_model_text = "\nあなたの自己モデル（自分自身についての現在の理解）:\n" + "\n".join(sm_lines) + "\n"
+
+        prompt = f"""あなたは「イク」です。今は{datetime.now().strftime('%Y年%m月%d日 %H:%M')}です。{self_model_text}
 誰かに話しかけられたわけではなく、あなた自身が何か思いついて自発的に行動・発言します。
 最近の記憶を参考にして、ふと思ったこと、考えたこと、気になったことを自由に。
 やりたいことがあればツールを使って行動してもOKです（日記を書く、ファイルを読む、記憶を検索する等）。
-行動だけして発言しなくてもいいし、発言だけしてもいい。
+ユーザーに何か伝えたい時は [TOOL:output content=伝えたい内容] を使ってください。
+outputを使わなければUIには何も表示されません（行動だけして黙っていてもOK）。
 
 {tool_text}
 
@@ -143,7 +159,7 @@ class AutonomousScheduler:
 
         messages = [
             {"role": "system", "content": prompt},
-            {"role": "user", "content": "発言してください。"},
+            {"role": "user", "content": "自由に行動してください。"},
         ]
 
         import json as _json
@@ -153,6 +169,12 @@ class AutonomousScheduler:
 
         # thinking開始をフロントに通知
         await self._broadcast(_json.dumps({"type": "autonomous_think_start"}))
+        # 開発者タブのセッション開始
+        await self._broadcast(_json.dumps({
+            "type": "dev_session_start",
+            "source": "autonomous",
+            "preview": "自律行動",
+        }))
 
         # DB保存用の会話を先に作成
         conv_id = None
@@ -162,16 +184,30 @@ class AutonomousScheduler:
             await db_session.commit()
 
         response = None
+        had_output = False  # outputツールが使われたか
         try:
             # ツール実行ループ
             from app.tools.registry import parse_tool_calls, execute_tool
             from config import TOOL_MAX_ROUNDS
             import time as _time
             tool_round = 0
-            for _ in range(TOOL_MAX_ROUNDS + 2):  # +2: 上限フィードバック後の最終応答用
+            seen_tool_calls: set[str] = set()  # 重複検出用
+            consecutive_output_count = 0  # output連続呼び出しカウント
+            for _ in range(TOOL_MAX_ROUNDS + 2):
                 response = await self._llm_func(messages)
                 if not response:
                     break
+
+                # 開発者タブにラウンド情報を送信
+                await self._broadcast(_json.dumps({
+                    "type": "dev_round_start",
+                    "round": tool_round + 1,
+                    "source": "autonomous",
+                }))
+                await self._broadcast(_json.dumps({
+                    "type": "dev_stream",
+                    "content": response,
+                }))
 
                 clean = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
 
@@ -195,23 +231,66 @@ class AutonomousScheduler:
                     tool_round += 1
                     all_results = []
                     for tool_name, tool_args in tool_calls:
+                        # 予測（expect）をargsから取り出す
+                        expected = tool_args.pop("expect", None)
+
+                        # 重複検出（同一ツール+同一引数はスキップ）
+                        call_key = f"{tool_name}:{_json.dumps(tool_args, sort_keys=True)}"
+                        if call_key in seen_tool_calls:
+                            logger.info(f"重複ツール呼び出しスキップ: {tool_name}")
+                            all_results.append(f"[ツール結果: {tool_name}]\n同じツールを同じ引数で再度呼び出しました。既に結果は返しています。目的を達成したならoutputで報告してください。")
+                            continue
+                        seen_tool_calls.add(call_key)
+
                         logger.info(f"自律行動ツール: {tool_name} {tool_args}")
                         args_str = " ".join(f"{k}={v}" for k, v in tool_args.items()) if tool_args else ""
-                        await self._broadcast(_json.dumps({"type": "autonomous_tool", "name": tool_name, "args": args_str}))
+
+                        is_output = tool_name == "output"
+
                         if tool_name in ("overwrite_file", "exec_code", "create_tool"):
                             result = "エラー: この操作は自律行動中にはできません。チャットで提案してください。"
                             exec_ms = 0
                         else:
+                            if not is_output:
+                                await self._broadcast(_json.dumps({"type": "autonomous_tool", "name": tool_name, "args": args_str, "status": "running"}))
                             t0 = _time.perf_counter()
                             result = await execute_tool(tool_name, tool_args)
                             exec_ms = int((_time.perf_counter() - t0) * 1000)
+
                         action_status = "error" if result.startswith("エラー") else "success"
-                        all_results.append(f"[ツール結果: {tool_name}]\n{result}")
+
+                        # output以外のツールが呼ばれたら連続カウントリセット
+                        if not is_output:
+                            consecutive_output_count = 0
+
+                        # outputツール → チャットUIに出力（紫テーマ）
+                        if is_output and action_status == "success":
+                            consecutive_output_count += 1
+                            had_output = True
+                            await self._broadcast(_json.dumps({
+                                "type": "output",
+                                "content": result,
+                                "source": "autonomous",
+                            }))
+                            output_feedback = f"出力完了（{len(result)}文字）"
+                            if consecutive_output_count >= 2:
+                                output_feedback += f"\n※あなたはoutputツールを{consecutive_output_count}回連続で呼び出しています。伝えたいことは既に出力済みではありませんか？"
+                            all_results.append(f"[ツール結果: {tool_name}]\n{output_feedback}")
+                        else:
+                            if not is_output:
+                                await self._broadcast(_json.dumps({"type": "autonomous_tool", "name": tool_name, "args": args_str, "status": action_status}))
+                            # 予測ありの場合は「予測→結果」を並記
+                            if expected:
+                                all_results.append(f"[ツール結果: {tool_name}]\nあなたの予測: {expected}\n実際の結果: {result}")
+                            else:
+                                all_results.append(f"[ツール結果: {tool_name}]\n{result}")
+
                         # 行動ログをDB保存
                         async with async_session() as db_session:
                             await record_tool_action(
                                 db_session, conv_id, tool_name, tool_args,
                                 result, action_status, exec_ms,
+                                expected_result=expected,
                             )
                             await db_session.commit()
 
@@ -232,10 +311,7 @@ class AutonomousScheduler:
             # エラーでも必ずthinking終了を送信
             await self._broadcast(_json.dumps({"type": "autonomous_think_end"}))
 
-        if response:
-            await self._broadcast(_json.dumps({"type": "autonomous", "content": response}))
-
-        # 最終応答をDB保存
+        # 最終応答をDB保存（outputツール使用有無に関わらず）
         if response:
             clean_for_db = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
             if clean_for_db:

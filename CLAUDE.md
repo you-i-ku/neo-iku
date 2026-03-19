@@ -52,15 +52,17 @@ neo-iku/
 │   ├── persona/            # system_prompt.py（イクの個性）
 │   └── tools/              # registry.py(登録・パース・実行), builtin.py(組み込みツール), code_analysis.py(構文+リスク), custom/(カスタムツール)
 ├── static/                 # index.html, style.css, app.js
-└── data/                   # SQLite DB（自動生成、過去ログ840件インポート済み）
+└── data/                   # SQLite DB + self_model.json（自動生成、過去ログ840件インポート済み）
 ```
 
 ## ツールフレームワーク
 
 - AIはテキストマーカー `[TOOL:ツール名 引数=値]` でツールを呼び出す（function calling非依存、小さいモデルでも動く）
-- 3形式対応: 単一行 `[TOOL:name args]`、複数行クォート `[TOOL:name content="..."]`、ブロック `[TOOL:name]\n内容\n[/TOOL]`
+- 4形式対応: 単一行 `[TOOL:name args]`、複数行クォート `[TOOL:name content="..."]`、ブロック `[TOOL:name]\n内容\n[/TOOL]`、フォールバック `[TOOL:name]\n内容`（`[/TOOL]`閉じ忘れ対応）
+- `_TOOL_PATTERN`はDOTALLモード + `(?!\[TOOL:)`負先読みでツール境界越えマッチを防止
 - ツールはモード問わず有効（イクモードはペルソナのレイヤー、ツールはAI自体の能力）
-- 組み込みツール: read_file, search_files, create_file, overwrite_file, list_files, search_memories, write_diary, exec_code, search_action_log, web_search, create_tool
+- 組み込みツール: output, read_file, search_files, create_file, overwrite_file, list_files, search_memories, write_diary, exec_code, search_action_log, web_search, create_tool, read_self_model, update_self_model
+- output: チャット欄にテキストを表示する唯一の経路。`[TOOL:output content=テキスト]`またはブロック形式`[TOOL:output]\nテキスト\n[/TOOL]`で使用
 - `app/tools/registry.py` の `register_tool()` で新ツールを追加可能
 - ツール実行ループ: 最大`TOOL_MAX_ROUNDS`回（デフォルト8）まで連続呼び出し可能（config.pyで管理、UIから動的変更可）
 - 1レスポンス内の複数ツール呼び出しは1ラウンドとしてカウント（`parse_tool_calls()`で全マッチを検出）
@@ -75,6 +77,29 @@ neo-iku/
 - `register_tool()` の `required_args` で必須引数を指定可能。引数なし→スキップ（会話中の言及）、パース失敗→エラーをLLMに返す
 - 引数パーサーはクォート内の `\n`→改行、`\t`→タブのエスケープシーケンス変換に対応
 - ツールループ中のユーザー割り込み: WebSocketをasyncio.Queueで管理し、次のLLM呼び出し前にユーザーメッセージをhistoryに挿入
+- 自律行動のツール表示: running→ラベル更新、success/error→メッセージ化。ブロックされたツール（overwrite_file等）はbroadcastスキップ
+- ツール結果表示: details/summaryで折りたたみ可能（プレビュー80文字）
+- outputツールアーキテクチャ: AI出力は全て`output`ツール経由。チャットタブにはoutput結果+ツール通知のみ表示。thinking/streamは開発者タブに表示
+- ツールループ安定化: 同一ツール+同一引数の重複呼び出しを検出→実行せずフィードバック。output連続呼び出しは2回目以降に気づきメッセージを添える（ブロックはしない）
+
+## メタ認知フレームワーク
+
+- **予測の明示化**: 全ツールに`expect=...`引数を追加可能（任意）。実行前にargsからpopして`tool_actions.expected_result`に保存
+- **予測誤差の検知**: ツール結果返却時に「あなたの予測: XXX → 実際の結果: YYY」形式でLLMに提示。判定はLLMの次の応答に委ねる（追加LLM呼び出しなし）
+- **動的自己モデル**: `data/self_model.json`にAIの自己理解を保持。`read_self_model`/`update_self_model`ツールで読み書き。キーバリュー+自由テキスト(`__free_text__`)の両形式対応
+- **自己モデルのプロンプト注入**: `system_prompt.py`と`autonomous.py`の両方で、現在の自己モデル内容をシステムプロンプトに自動注入（モード問わず）
+- **設計思想**: 予測誤差が自己モデル更新の自然なきっかけになる（強制更新ではない）。ルール（構造）は定義するが作為（知識注入）はしない
+
+## UI構成（タブUI）
+
+- 3タブ構成: チャット / 開発者 / ログ
+- チャットタブ: outputツール出力 + ツール通知（コンパクト表示）
+- 開発者タブ: 左=思考ログ（セッション→ラウンド→think+stream+ツール詳細）、右=設定・記憶
+- ログタブ: サーバーログ（ALL/DEBUG/INFO/WARNING/ERRORフィルタ）
+- 開発者タブのセッション: 入力反応/自律行動ごとに分離（ソース別devState管理: chat/autonomous独立）
+- 開発者タブのラウンド: `<details>`折りたたみ、think+streamマージ表示（色で区別: thinkは暗灰色、streamは明灰色）
+- 3段階スクロール: 思考ログ全体 → セッション内 → ラウンド内（※UIテスト未完了）
+- WebSocketメッセージタイプ: `dev_session_start`, `dev_think`, `dev_stream`, `dev_tool_call`, `dev_tool_result` で開発者タブに送信
 
 ## 記憶検索
 

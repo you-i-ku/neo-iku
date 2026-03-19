@@ -33,10 +33,8 @@ router = APIRouter()
 
 async def _stream_exec_code(ws: WebSocket, code: str) -> str:
     """コードをストリーミング実行し、UIにリアルタイム出力を送る"""
-    # git自動バックアップ
     backup_msg = _git_auto_backup()
 
-    # ターミナル開始を通知
     await ws.send_text(json.dumps({
         "type": "exec_start",
         "code": code,
@@ -100,14 +98,12 @@ async def _stream_exec_code(ws: WebSocket, code: str) -> str:
 
     elapsed = time.perf_counter() - t0
 
-    # 終了通知
     await ws.send_text(json.dumps({
         "type": "exec_end",
         "return_code": return_code,
         "elapsed": round(elapsed, 2),
     }))
 
-    # LLMに返す結果テキスト
     result_parts = [backup_msg]
     if output_lines:
         result_parts.append("\n".join(output_lines))
@@ -133,15 +129,12 @@ async def chat_ws(ws: WebSocket):
     await scheduler.register_ws(ws)
     conversation_id = None
 
-    # WebSocketメッセージをキューで管理（割り込み・停止対応）
     msg_queue: asyncio.Queue = asyncio.Queue()
     pending_user_msgs: list[str] = []
     stop_event = asyncio.Event()
     stop_feedback = ""
 
     async def ws_reader():
-        """WebSocketからのメッセージを読み続けてキューに入れる。
-        stopメッセージはキューを経由せず即座にフラグを立てる。"""
         nonlocal stop_feedback
         try:
             while True:
@@ -160,28 +153,24 @@ async def chat_ws(ws: WebSocket):
     reader_task = asyncio.create_task(ws_reader())
 
     async def wait_for_response(response_type: str) -> dict:
-        """特定のtype（write_response/exec_response）を待つ。
-        待っている間に来た通常メッセージはpending_user_msgsに溜める。"""
         while True:
             data = await msg_queue.get()
             if data is None:
                 raise WebSocketDisconnect()
             if data.get("type") == response_type:
                 return data
-            # 通常のチャットメッセージ → 割り込みキューへ
             user_text = data.get("message", "").strip()
             if user_text:
                 pending_user_msgs.append(user_text)
 
     def drain_pending_messages():
-        """キューに溜まったメッセージを回収"""
         while not msg_queue.empty():
             try:
                 data = msg_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
             if data is None:
-                return  # disconnected
+                return
             user_text = data.get("message", "").strip()
             if user_text:
                 pending_user_msgs.append(user_text)
@@ -193,19 +182,16 @@ async def chat_ws(ws: WebSocket):
             await session.commit()
 
             while True:
-                # ユーザーメッセージ待ち（キューから）
                 data = await msg_queue.get()
                 if data is None:
-                    break  # disconnected
+                    break
                 user_text = data.get("message", "").strip()
                 if not user_text:
                     continue
 
-                # ユーザーメッセージ保存
                 await add_message(session, conversation_id, "user", user_text)
                 await session.commit()
 
-                # 常に記憶検索（モード問わず）
                 memories = await search_messages(session, user_text)
                 iku_memories = await search_iku_logs(session, user_text) if get_mode() == "iku" else None
 
@@ -214,11 +200,20 @@ async def chat_ws(ws: WebSocket):
                 history = [{"role": m.role, "content": m.content} for m in conv_messages]
                 all_messages = system_msgs + history
 
-                # ツール実行ループ（最大N回）
                 from config import TOOL_MAX_ROUNDS
                 max_tool_rounds = TOOL_MAX_ROUNDS
+                seen_tool_calls: set[str] = set()  # 重複検出用
+                consecutive_output_count = 0  # output連続呼び出しカウント
 
-                for tool_round in range(max_tool_rounds + 2):  # +2: 上限到達フィードバック後の最終応答用
+                # チャット処理開始（thinking表示 + 開発者タブのセッション開始）
+                await ws.send_text(json.dumps({"type": "processing_start"}))
+                await ws.send_text(json.dumps({
+                    "type": "dev_session_start",
+                    "source": "chat",
+                    "preview": user_text[:50],
+                }))
+
+                for tool_round in range(max_tool_rounds + 2):
 
                     # --- ユーザー割り込みチェック ---
                     drain_pending_messages()
@@ -234,28 +229,30 @@ async def chat_ws(ws: WebSocket):
                         pending_user_msgs.clear()
                         await session.commit()
 
-                    # LLMからストリーミング応答（think/回答を分離）
+                    # LLMからストリーミング応答（開発者タブに送信）
                     llm = llm_manager.get()
                     full_response = ""
                     in_think = False
-                    think_buffer = ""
-                    response_buffer = ""
 
                     stopped = False
                     try:
                         chunk_count = 0
+                        # 開発者タブ: ラウンド開始
+                        await ws.send_text(json.dumps({
+                            "type": "dev_round_start",
+                            "round": tool_round + 1,
+                            "source": "chat",
+                        }))
+
                         async for chunk in llm.stream_chat(all_messages):
-                            # 停止チェック
                             if stop_event.is_set():
                                 stopped = True
                                 break
                             chunk_count += 1
-                            if chunk_count == 1:
-                                logger.debug(f"最初のチャンク: {repr(chunk[:50])}")
                             full_response += chunk
 
-                            # <think>タグの検出・分離
-                            buf = (think_buffer if in_think else response_buffer) + chunk
+                            # <think>タグの検出・分離 → 開発者タブへ送信
+                            buf = chunk
                             while buf:
                                 if in_think:
                                     end_idx = buf.find("</think>")
@@ -263,15 +260,15 @@ async def chat_ws(ws: WebSocket):
                                         think_part = buf[:end_idx]
                                         if think_part:
                                             await ws.send_text(json.dumps({
-                                                "type": "think",
+                                                "type": "dev_think",
                                                 "content": think_part,
                                             }))
-                                        await ws.send_text(json.dumps({"type": "think_end"}))
+                                        await ws.send_text(json.dumps({"type": "dev_think_end"}))
                                         buf = buf[end_idx + 8:]
                                         in_think = False
                                     else:
                                         await ws.send_text(json.dumps({
-                                            "type": "think",
+                                            "type": "dev_think",
                                             "content": buf,
                                         }))
                                         buf = ""
@@ -281,38 +278,29 @@ async def chat_ws(ws: WebSocket):
                                         before = buf[:start_idx]
                                         if before:
                                             await ws.send_text(json.dumps({
-                                                "type": "stream",
+                                                "type": "dev_stream",
                                                 "content": before,
                                             }))
-                                        await ws.send_text(json.dumps({"type": "think_start"}))
+                                        await ws.send_text(json.dumps({"type": "dev_think_start"}))
                                         buf = buf[start_idx + 7:]
                                         in_think = True
                                     else:
-                                        if "<" in buf and buf.rstrip().endswith("<"):
-                                            response_buffer = buf
-                                            buf = ""
-                                        else:
-                                            await ws.send_text(json.dumps({
-                                                "type": "stream",
-                                                "content": buf,
-                                            }))
-                                            buf = ""
+                                        await ws.send_text(json.dumps({
+                                            "type": "dev_stream",
+                                            "content": buf,
+                                        }))
+                                        buf = ""
 
-                            think_buffer = ""
-                            response_buffer = ""
-
-                        # thinkタグが閉じないままストリーム終了した場合
+                        # thinkタグが閉じないままストリーム終了
                         if in_think:
-                            await ws.send_text(json.dumps({"type": "think_end"}))
+                            await ws.send_text(json.dumps({"type": "dev_think_end"}))
                             in_think = False
 
                         if stopped:
-                            # ユーザーが出力を中断
                             stop_event.clear()
                             logger.info(f"ユーザーが出力を中断 ({chunk_count}チャンク)")
-                            await ws.send_text(json.dumps({"type": "stream_end"}))
+                            await ws.send_text(json.dumps({"type": "processing_end"}))
                             await ws.send_text(json.dumps({"type": "stopped"}))
-                            # 部分応答を保存
                             stop_note = "ユーザーにより出力を中断されました。"
                             if stop_feedback:
                                 stop_note += f"\n理由: {stop_feedback}"
@@ -320,10 +308,9 @@ async def chat_ws(ws: WebSocket):
                                 await add_message(session, conversation_id, "assistant", full_response)
                             await add_message(session, conversation_id, "user", stop_note)
                             await session.commit()
-                            break  # ツールループから抜ける
+                            break
 
                         logger.debug(f"ストリーム完了: {chunk_count}チャンク, {len(full_response)}文字")
-                        await ws.send_text(json.dumps({"type": "stream_end"}))
                     except Exception as e:
                         logger.error(f"LLM応答エラー: {e}")
                         full_response = f"（接続エラー: LM Studioが起動しているか確認してください — {e}）"
@@ -331,24 +318,22 @@ async def chat_ws(ws: WebSocket):
                             "type": "error",
                             "content": full_response,
                         }))
+                        await ws.send_text(json.dumps({"type": "processing_end"}))
                         break
 
-                    # thinkタグ除去（頑強版: 閉じタグのみ・開きタグのみにも対応）
+                    # thinkタグ除去
                     clean_response = re.sub(r"<think>.*?</think>", "", full_response, flags=re.DOTALL)
-                    # </think> だけが残ってる場合（<think>が欠落）→ </think>より前を全部消す
                     if "</think>" in clean_response:
                         clean_response = clean_response.split("</think>")[-1]
-                    # <think> だけが残ってる場合（</think>が欠落）→ <think>以降を全部消す
                     if "<think>" in clean_response:
                         clean_response = clean_response.split("<think>")[0]
                     clean_response = clean_response.strip()
 
-                    # ツール呼び出し検出（clean→full_responseの順で探す。小さいモデルはthink内に書くことがある）
+                    # ツール呼び出し検出
                     tool_calls = []
                     if tool_round < max_tool_rounds:
                         tool_calls = parse_tool_calls(clean_response) or parse_tool_calls(full_response)
                     elif parse_tool_calls(clean_response) or parse_tool_calls(full_response):
-                        # 上限到達だがLLMがまだツールを呼ぼうとしている → フィードバック
                         limit_msg = f"[ツール実行上限（{max_tool_rounds}回）に達しました。ツールなしで応答を完了してください。]"
                         all_messages.append({"role": "assistant", "content": clean_response})
                         await add_message(session, conversation_id, "assistant", full_response)
@@ -359,18 +344,41 @@ async def chat_ws(ws: WebSocket):
                         continue
 
                     if tool_calls:
-                        # 複数ツールを1ラウンドで順次実行
                         all_results = []
                         for tool_name, tool_args in tool_calls:
+                            # 予測（expect）をargsから取り出す（ツール本体には渡さない）
+                            expected = tool_args.pop("expect", None)
+
+                            # 重複検出（同一ツール+同一引数はスキップ）
+                            call_key = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
+                            if call_key in seen_tool_calls:
+                                logger.info(f"重複ツール呼び出しスキップ: {tool_name}")
+                                all_results.append(f"[ツール結果: {tool_name}]\n同じツールを同じ引数で再度呼び出しました。既に結果は返しています。目的を達成したならoutputで報告してください。")
+                                continue
+                            seen_tool_calls.add(call_key)
+
                             logger.info(f"ツール呼び出し: {tool_name} {tool_args}")
 
-                            # UIにツール実行を通知
-                            await ws.send_text(json.dumps({
-                                "type": "tool_call",
-                                "content": f"{tool_name}({', '.join(f'{k}={v}' for k, v in tool_args.items())})",
-                            }))
+                            is_output = tool_name == "output"
 
-                            # ツール実行（時間計測）
+                            # outputツール以外はUIにツール呼び出しを通知
+                            if not is_output:
+                                tool_call_text = f"{tool_name}({', '.join(f'{k}={v}' for k, v in tool_args.items())})"
+                                await ws.send_text(json.dumps({
+                                    "type": "tool_call",
+                                    "content": tool_call_text,
+                                }))
+                                # 開発者タブにも通知
+                                await ws.send_text(json.dumps({
+                                    "type": "dev_tool_call",
+                                    "content": tool_call_text,
+                                }))
+
+                            # output以外のツールが呼ばれたら連続カウントリセット
+                            if not is_output:
+                                consecutive_output_count = 0
+
+                            # ツール実行
                             t0 = time.perf_counter()
                             result = await execute_tool(tool_name, tool_args)
                             exec_ms = int((time.perf_counter() - t0) * 1000)
@@ -380,7 +388,35 @@ async def chat_ws(ws: WebSocket):
                             await record_tool_action(
                                 session, conversation_id, tool_name, tool_args,
                                 result, action_status, exec_ms,
+                                expected_result=expected,
                             )
+
+                            # outputツール → チャットUIに出力
+                            if is_output and action_status == "success":
+                                consecutive_output_count += 1
+                                await ws.send_text(json.dumps({
+                                    "type": "tool_call",
+                                    "content": "output",
+                                }))
+                                await ws.send_text(json.dumps({
+                                    "type": "dev_tool_call",
+                                    "content": "output",
+                                }))
+                                await ws.send_text(json.dumps({
+                                    "type": "output",
+                                    "content": result,
+                                    "source": "chat",
+                                }))
+                                await ws.send_text(json.dumps({
+                                    "type": "dev_tool_result",
+                                    "name": "output",
+                                    "content": f"出力完了（{len(result)}文字）",
+                                }))
+                                output_feedback = f"出力完了（{len(result)}文字）"
+                                if consecutive_output_count >= 2:
+                                    output_feedback += f"\n※あなたはoutputツールを{consecutive_output_count}回連続で呼び出しています。伝えたいことは既に出力済みではありませんか？"
+                                all_results.append(f"[ツール結果: {tool_name}]\n{output_feedback}")
+                                continue
 
                             # 上書き承認フロー
                             if result == PENDING_MARKER:
@@ -407,7 +443,7 @@ async def chat_ws(ws: WebSocket):
                                         if feedback:
                                             result += f"\n理由: {feedback}"
 
-                            # コード実行承認フロー（ストリーミング）
+                            # コード実行承認フロー
                             if result == PENDING_EXEC_MARKER:
                                 pending = get_pending_exec()
                                 if pending:
@@ -463,31 +499,35 @@ async def chat_ws(ws: WebSocket):
 
                             logger.info(f"ツール結果: {result[:100]}...")
 
+                            # ツール結果は開発者タブに表示（チャット欄には出さない）
                             await ws.send_text(json.dumps({
-                                "type": "tool_result",
+                                "type": "dev_tool_result",
+                                "name": tool_name,
                                 "content": result[:2000] if len(result) > 2000 else result,
                             }))
 
-                            all_results.append(f"[ツール結果: {tool_name}]\n{result}")
+                            # 予測ありの場合は「予測→結果」を並記してLLMにフィードバック
+                            if expected:
+                                all_results.append(f"[ツール結果: {tool_name}]\nあなたの予測: {expected}\n実際の結果: {result}")
+                            else:
+                                all_results.append(f"[ツール結果: {tool_name}]\n{result}")
 
                         await session.commit()
 
-                        # アシスタント応答をhistoryに追加 + DB保存
                         all_messages.append({"role": "assistant", "content": clean_response})
                         await add_message(session, conversation_id, "assistant", full_response)
-                        # 全ツール結果をまとめてhistoryに追加 + DB保存
                         combined_results = "\n\n".join(all_results)
                         all_messages.append({"role": "user", "content": combined_results})
                         await add_message(session, conversation_id, "tool", combined_results)
                         await session.commit()
-                        # ループ継続 → 次のLLM呼び出し
                         continue
                     else:
                         # ツール呼び出しなし → ループ終了
                         if clean_response:
-                            # think含む全文を記録（過程もセットで保存）
                             await add_message(session, conversation_id, "assistant", full_response)
                             await session.commit()
+                        # 処理完了
+                        await ws.send_text(json.dumps({"type": "processing_end"}))
                         break
 
     except WebSocketDisconnect:
