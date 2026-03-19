@@ -29,3 +29,8 @@ MEMORY_SEARCH_LIMIT = 5
 # ツール
 TOOL_MAX_ROUNDS = 8  # 1回の応答で連続実行できるツール回数（暴走防止）
 EXEC_CODE_TIMEOUT = 30  # exec_codeのタイムアウト（秒）
+
+# 内発的動機システム
+MOTIVATION_DEFAULT_THRESHOLD = 60  # エネルギーがこの値を超えたら自律行動発火
+MOTIVATION_DEFAULT_DECAY = 5  # チェックごとの減衰量
+MOTIVATION_SIGNAL_BUFFER_SIZE = 100  # シグナルバッファの最大サイズ

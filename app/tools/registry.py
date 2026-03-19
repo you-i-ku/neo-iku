@@ -45,6 +45,11 @@ def build_tools_prompt() -> str:
     lines.append("- [TOOL:...]は必ず応答テキスト内に書いてください（thinkの外に）。")
     lines.append("- ユーザーに何か伝えたい時は必ず [TOOL:output content=...] を使ってください。outputツールを使わないとユーザーには何も表示されません。")
     lines.append("- outputを使わず行動だけすることもできます（沈黙も選択肢）。")
+    lines.append("- 【必須】全てのツール呼び出しに expect=... を付けてください。実行前に結果を予測する習慣です。")
+    lines.append("  予測がない・スキップしたい場合は expect=skip と書いてください。")
+    lines.append('  例（予測あり）: [TOOL:read_file path=config.py expect=ポート番号とタイムアウトが書いてあるはず]')
+    lines.append('  例（スキップ）: [TOOL:search_memories query=天気 expect=skip]')
+    lines.append("")
     lines.append('例: [TOOL:output content=短い一言メッセージ]')
     lines.append('複数行の出力には必ずブロック形式を使い、[/TOOL]で閉じてください:')
     lines.append('[TOOL:output]')
@@ -52,13 +57,9 @@ def build_tools_prompt() -> str:
     lines.append('今日はいい天気ですね。')
     lines.append('[/TOOL]')
     lines.append('※[/TOOL]を忘れるとツールが実行されません。必ず閉じてください。')
-    lines.append('例: [TOOL:read_file path=app/main.py]')
-    lines.append('例: [TOOL:search_memories query=過去の会話]')
-    lines.append('例: [TOOL:write_diary content=今日は自分のコードを読んで面白い発見があった]')
-    lines.append("")
-    lines.append("どのツールでも expect=... を付けると「実行前の予測」を記録できます（任意）。")
-    lines.append("予測を書いておくと、結果と比較して自分の理解のズレに気づけます。")
-    lines.append('例: [TOOL:read_file path=config.py expect=ポート番号やタイムアウトの設定が見えるはず]')
+    lines.append('例: [TOOL:read_file path=app/main.py expect=main関数やルーター設定が見えるはず]')
+    lines.append('例: [TOOL:search_memories query=過去の会話 expect=skip]')
+    lines.append('例: [TOOL:write_diary content=今日は自分のコードを読んで面白い発見があった expect=skip]')
     lines.append("")
     lines.append("1回の応答で複数のツールを同時に呼び出すこともできます:")
     lines.append('例: [TOOL:read_file path=README.md]')
@@ -78,7 +79,11 @@ _BLOCK_PATTERN = re.compile(r"\[TOOL:(\w+)(.*?)\]\s*\n(.*?)\[/TOOL\]", re.DOTALL
 # 複数行対応: [TOOL:name key="複数行の値"] — content="..."が改行を含むケース
 _MULTILINE_PATTERN = re.compile(r'\[TOOL:(\w+)\s+(.*?")\s*\]', re.DOTALL)
 # 単一行 + マルチライン対応（DOTALL）ただし [TOOL: 境界を超えない
-_TOOL_PATTERN = re.compile(r"\[TOOL:(\w+)((?:(?!\[TOOL:).)*?)\]", re.DOTALL)
+# クォート文字列内の ] はスキップ（capabilities=[...] のような値に対応）
+_TOOL_PATTERN = re.compile(
+    r'\[TOOL:(\w+)((?:(?!\[TOOL:)(?:"(?:[^"\\]|\\.)*"|[^\]]))*)\]',
+    re.DOTALL
+)
 # フォールバック: [TOOL:name]\n内容（[/TOOL]閉じタグなし、テキスト末尾まで取得）
 _UNCLOSED_BLOCK_PATTERN = re.compile(r"\[TOOL:(\w+)(.*?)\]\s*\n(.*)", re.DOTALL)
 

@@ -18,6 +18,14 @@ _pending_exec: dict | None = None
 PENDING_EXEC_MARKER = "__PENDING_EXEC_CODE__"
 
 
+_READ_DENIED: list[Path] = [
+    BASE_DIR / "CLAUDE.md",
+    BASE_DIR / "README.md",
+    BASE_DIR / "TASK.md",
+    BASE_DIR / "documents",
+]
+
+
 async def read_file(path: str = "", offset: str = "0") -> str:
     """プロジェクト内のファイルを読む（1回2000文字、offsetで続きを読める）"""
     if not path:
@@ -28,6 +36,12 @@ async def read_file(path: str = "", offset: str = "0") -> str:
     # セキュリティ: BASE_DIRの外へのアクセス禁止
     if not str(target).startswith(str(BASE_DIR.resolve())):
         return "エラー: プロジェクト外のファイルは読めません。"
+
+    # 開発者メモ・ドキュメント類はイクの読み取り対象外
+    for denied in _READ_DENIED:
+        d = denied.resolve()
+        if target == d or str(target).startswith(str(d) + ("/" if d.is_dir() else "")):
+            return "このファイルは開発者用ドキュメントのため読み取れません。"
 
     if not target.exists():
         return f"エラー: ファイルが見つかりません: {path}"
@@ -75,13 +89,14 @@ async def list_files(path: str = ".") -> str:
     if not target.is_dir():
         return f"エラー: '{path}' はディレクトリではありません。"
 
-    SKIP = {".git", "__pycache__", ".venv", "node_modules", ".pytest_cache"}
+    SKIP = {".git", "__pycache__", ".venv", "node_modules", ".pytest_cache", "documents"}
+    SKIP_FILES = {"CLAUDE.md", "README.md", "TASK.md"}
 
     def _tree(dir_path: Path, prefix: str = "", max_depth: int = 5, depth: int = 0) -> list[str]:
         if depth >= max_depth:
             return [f"{prefix}..."]
         entries = sorted(dir_path.iterdir(), key=lambda e: (not e.is_dir(), e.name))
-        entries = [e for e in entries if e.name not in SKIP and not e.name.startswith(".")]
+        entries = [e for e in entries if e.name not in SKIP and e.name not in SKIP_FILES and not e.name.startswith(".")]
         lines = []
         for i, entry in enumerate(entries):
             is_last = (i == len(entries) - 1)
@@ -663,20 +678,35 @@ async def update_self_model(key: str = "", value: str = "", text: str = "") -> s
     """自己モデルを更新する。key+valueでキーバリュー更新、textで自由テキスト更新"""
     model = _load_self_model()
 
+    def _emit_signal():
+        from app.scheduler.autonomous import scheduler
+        scheduler.add_signal("self_model_update", key or "free_text")
+
     if text:
         model["__free_text__"] = text
         _save_self_model(model)
+        _emit_signal()
         return f"自己モデルの自由テキストを更新しました。（{len(text)}文字）"
 
     if key and value:
-        model[key] = value
+        # motivation_rulesはJSON文字列を自動パース
+        if key == "motivation_rules":
+            try:
+                parsed = json.loads(value)
+                model[key] = parsed
+            except json.JSONDecodeError:
+                return "エラー: motivation_rulesの値はJSON形式で指定してください。"
+        else:
+            model[key] = value
         _save_self_model(model)
+        _emit_signal()
         return f"自己モデルを更新しました: {key} = {value}"
 
     if key and not value:
         if key in model:
             del model[key]
             _save_self_model(model)
+            _emit_signal()
             return f"自己モデルから削除しました: {key}"
         return f"キー '{key}' は自己モデルに存在しません。"
 

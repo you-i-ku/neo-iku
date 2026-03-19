@@ -192,6 +192,9 @@ async def chat_ws(ws: WebSocket):
                 await add_message(session, conversation_id, "user", user_text)
                 await session.commit()
 
+                # 動機シグナル: ユーザーメッセージ
+                scheduler.add_signal("user_message", user_text[:50])
+
                 memories = await search_messages(session, user_text)
                 iku_memories = await search_iku_logs(session, user_text) if get_mode() == "iku" else None
 
@@ -203,7 +206,7 @@ async def chat_ws(ws: WebSocket):
                 from config import TOOL_MAX_ROUNDS
                 max_tool_rounds = TOOL_MAX_ROUNDS
                 seen_tool_calls: set[str] = set()  # 重複検出用
-                consecutive_output_count = 0  # output連続呼び出しカウント
+                output_count = 0  # outputツール呼び出し回数（セッション通算）
 
                 # チャット処理開始（thinking表示 + 開発者タブのセッション開始）
                 await ws.send_text(json.dumps({"type": "processing_start"}))
@@ -348,6 +351,9 @@ async def chat_ws(ws: WebSocket):
                         for tool_name, tool_args in tool_calls:
                             # 予測（expect）をargsから取り出す（ツール本体には渡さない）
                             expected = tool_args.pop("expect", None)
+                            # skip / 空文字は「予測なし」として扱う
+                            if expected is not None and expected.strip().lower() in ("skip", "", "-", "なし", "none"):
+                                expected = None
 
                             # 重複検出（同一ツール+同一引数はスキップ）
                             call_key = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
@@ -374,10 +380,6 @@ async def chat_ws(ws: WebSocket):
                                     "content": tool_call_text,
                                 }))
 
-                            # output以外のツールが呼ばれたら連続カウントリセット
-                            if not is_output:
-                                consecutive_output_count = 0
-
                             # ツール実行
                             t0 = time.perf_counter()
                             result = await execute_tool(tool_name, tool_args)
@@ -391,9 +393,18 @@ async def chat_ws(ws: WebSocket):
                                 expected_result=expected,
                             )
 
+                            # 動機シグナル: ツール結果
+                            scheduler.add_signal(
+                                "tool_error" if action_status == "error" else "tool_success",
+                                tool_name,
+                            )
+                            # 動機シグナル: 予測誤差
+                            if expected and action_status == "success":
+                                scheduler.add_signal("prediction_error", f"{tool_name}")
+
                             # outputツール → チャットUIに出力
                             if is_output and action_status == "success":
-                                consecutive_output_count += 1
+                                output_count += 1
                                 await ws.send_text(json.dumps({
                                     "type": "tool_call",
                                     "content": "output",
@@ -413,8 +424,8 @@ async def chat_ws(ws: WebSocket):
                                     "content": f"出力完了（{len(result)}文字）",
                                 }))
                                 output_feedback = f"出力完了（{len(result)}文字）"
-                                if consecutive_output_count >= 2:
-                                    output_feedback += f"\n※あなたはoutputツールを{consecutive_output_count}回連続で呼び出しています。伝えたいことは既に出力済みではありませんか？"
+                                if output_count >= 2:
+                                    output_feedback += f"\n※あなたはこのセッションでoutputツールを{output_count}回呼び出しています。伝えたいことは既に出力済みではありませんか？"
                                 all_results.append(f"[ツール結果: {tool_name}]\n{output_feedback}")
                                 continue
 
@@ -508,7 +519,7 @@ async def chat_ws(ws: WebSocket):
 
                             # 予測ありの場合は「予測→結果」を並記してLLMにフィードバック
                             if expected:
-                                all_results.append(f"[ツール結果: {tool_name}]\nあなたの予測: {expected}\n実際の結果: {result}")
+                                all_results.append(f"[ツール結果: {tool_name}]\nあなたの予測: {expected}\n実際の結果: {result}\n（予測と結果にズレがあれば、自分の理解の何が違ったか振り返り、必要ならupdate_self_modelで自己モデルを更新できます）")
                             else:
                                 all_results.append(f"[ツール結果: {tool_name}]\n{result}")
 
