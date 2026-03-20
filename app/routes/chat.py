@@ -549,6 +549,8 @@ async def chat_ws(ws: WebSocket):
         reader_task.cancel()
         scheduler.unregister_ws(ws)
         if conversation_id:
+            # 動機シグナル: 会話終了
+            scheduler.add_signal("conversation_end")
             try:
                 async with async_session() as session:
                     await end_conversation(session, conversation_id)

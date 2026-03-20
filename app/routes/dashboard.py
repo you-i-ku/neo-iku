@@ -125,6 +125,16 @@ async def reset_db():
     return {"reset": True}
 
 
+class ConcurrentModeRequest(BaseModel):
+    enabled: bool
+
+@router.post("/dev/concurrent-mode")
+async def set_concurrent_mode(req: ConcurrentModeRequest):
+    """会話中の自律行動ON/OFF"""
+    scheduler._concurrent_mode = req.enabled
+    return {"concurrent_mode": scheduler._concurrent_mode}
+
+
 @router.get("/dev/settings")
 async def get_dev_settings():
     """開発用設定の現在値を取得"""
@@ -132,4 +142,6 @@ async def get_dev_settings():
     return {
         "autonomous_interval": scheduler._interval,
         "tool_max_rounds": config.TOOL_MAX_ROUNDS,
+        "concurrent_mode": scheduler._concurrent_mode,
+        "motivation_energy": round(scheduler._motivation_energy, 1),
     }

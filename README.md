@@ -22,6 +22,7 @@
 - **コード実行** — Pythonコードを実行できる（承認UI + ストリーミングターミナルでリアルタイム監視、実行前にgit自動バックアップ）
 - **行動ログ** — ツール実行履歴を自動記録し、自分の過去の行動を振り返れる（メタ認知の基盤）
 - **メタ認知（予測と自己モデル）** — ツール呼び出し時に`expect=...`で予測を記録し、結果と比較して理解のズレに気づける。`data/self_model.json`に自己モデルを保持し、自分で読み書き可能
+- **内発的動機** — I/Oイベント（ユーザーメッセージ、ツール実行、予測誤差等）をシグナルとして蓄積し、AI自身が定義したルール（weights/threshold/decay）でエネルギーを計算。閾値を超えると自律行動が発火する（タイマーではなく内発的きっかけ）
 - **Web検索** — DuckDuckGoによるWeb検索ツール（APIキー不要、環境理解の第一歩）
 - **応答中断** — 専用停止ボタン（⏹）で即中断、フィードバック付きで方向修正可能。送信ボタンとは独立しており、ストリーミング中でもメッセージ割り込み可能
 - **ツール結果の折りたたみ** — ツール実行結果をdetails/summaryで開閉表示（プレビュー80文字）
@@ -57,7 +58,7 @@ neo-iku/
 │   │   ├── store.py            # 記憶CRUD操作
 │   │   └── search.py           # FTS5全文検索（将来ベクトル検索に差し替え可能）
 │   ├── scheduler/
-│   │   └── autonomous.py       # 自発的発言スケジューラ（asyncioバックグラウンドタスク）
+│   │   └── autonomous.py       # 自律行動スケジューラ + 内発的動機システム（シグナル蓄積・エネルギー計算・閾値発火）
 │   ├── importer/
 │   │   └── log_parser.py       # 過去ログパーサー+インポーター
 │   ├── persona/
@@ -191,6 +192,7 @@ python run.py
 | `/api/dev/autonomous-interval` | POST | 自律行動間隔変更（`{"seconds": 300}`） |
 | `/api/dev/autonomous-trigger` | POST | 自律行動を即時実行 |
 | `/api/dev/tool-max-rounds` | POST | ツール最大ラウンド数変更（`{"rounds": 8}`） |
+| `/api/dev/concurrent-mode` | POST | 会話中の自律行動ON/OFF（`{"enabled": true}`) |
 | `/api/dev/reset-db` | POST | DBリセット（iku_logs以外を全クリア） |
 
 ## LLMプロバイダの追加
@@ -230,6 +232,9 @@ llm_manager.register("my_provider", MyProvider())
 | `TOOL_MAX_ROUNDS` | `8` | ツール連続実行の最大回数 |
 | `EXEC_CODE_TIMEOUT` | `30` | exec_codeのタイムアウト（秒） |
 | `MEMORY_SEARCH_LIMIT` | `5` | 記憶検索の最大取得件数 |
+| `MOTIVATION_DEFAULT_THRESHOLD` | `60` | 動機エネルギーの発火閾値（AIがルールで上書き可） |
+| `MOTIVATION_DEFAULT_DECAY` | `5` | チェックごとのエネルギー減衰量 |
+| `MOTIVATION_SIGNAL_BUFFER_SIZE` | `100` | シグナルバッファの最大サイズ |
 
 ## ツール一覧
 
@@ -272,6 +277,5 @@ llm_manager.register("my_provider", MyProvider())
 - **ベクトル検索**: `memory/search.py` の中身をpgvector等に差し替えるだけ（FTS5で不足した場合）
 - **複数LLM**: `BaseLLMProvider` を継承してファイル1つ追加 → `register()` で登録
 - ~~**自律行動の発話ツール化**~~: 実装済み（`output`ツールとして統合）
-- **自律行動の改善**: タイマー方式から内発的きっかけへ
 - **PC全体アクセス**: 現在はプロジェクト内のみ、将来はPC全体のファイルにアクセス可能に
 - **DB移行**: SQLAlchemyの接続URLをPostgreSQLに変えるだけ

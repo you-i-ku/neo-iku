@@ -308,7 +308,7 @@
 - [ ] イクが自発的に自己モデルを更新するか観察 → 未確認（自律行動では振り返りはするがupdate_self_modelは未使用）
 - [ ] 必要に応じてプロンプト調整
 
-##### Step 33: 内発的動機システム（設計確定）
+##### Step 33: 内発的動機システム（実装完了）
 
 **コンセプト: シグナル蓄積 + AIが書くルール + イベント駆動チェック**
 
@@ -318,45 +318,28 @@
 - 閾値超えたら自律行動発火（ここだけLLM）
 - ルールが未定義のとき→最初の自律行動プロンプトでAIに書かせる（ブートストラップ）
 
-**シグナル種別（コード側で検出）**
-- `prediction_error` — 予測誤差発生
-- `conversation_end` — 会話終了（WS切断/アイドル）
-- `user_message` — ユーザーメッセージ受信
-- `tool_success` / `tool_error` — ツール実行結果
-- `self_model_update` — 自己モデル更新
-- `idle_tick` — チェック間隔ごとの時間経過
-
-**AIが書くルール（self_model.jsonに保存）**
-```json
-{
-  "motivation_rules": {
-    "weights": { "prediction_error": 25, "conversation_end": 15, ... },
-    "threshold": 60,
-    "decay_per_check": 5
-  }
-}
-```
-
-**チェックのトリガー**
-- タイマー（既存の自律行動間隔を流用、idle_tick信号も同時付与）
-- I/Oイベント（user_message受信、会話終了、ツール結果等）
-- チェック中/自律行動中は新規チェックをスキップ（`_is_checking`フラグ）
-
-**並行実行**
-- 会話中の自律行動: デフォルトOFF、開発タブのトグルでON可能
-
 **実装タスク**
-- [ ] `AutonomousScheduler`にシグナルバッファと`_motivation_energy`を追加
-- [ ] `check_motivation()`実装 — ルール読み込み→計算→閾値判定（LLMなし）
-- [ ] `add_signal(type)`メソッド追加 — 外部から呼べるようにする
-- [ ] `chat.py`にシグナル発生ポイント追加（user_message, tool_success/error, prediction_error, conversation_end）
-- [ ] ブートストラップ: ルール未定義時に自律行動プロンプトへヒント追加
-- [ ] 開発タブに「会話中の自律行動: ON/OFF」トグル追加
-- [ ] タイマーループを「チェック間隔ループ」に置き換え（今のインターバル設定を流用）
+- [x] `AutonomousScheduler`にシグナルバッファと`_motivation_energy`を追加
+- [x] `check_motivation()`実装 — ルール読み込み→計算→閾値判定（LLMなし）
+- [x] `add_signal(type)`メソッド追加 — 外部から呼べるようにする
+- [x] `chat.py`にシグナル発生ポイント追加（user_message, tool_success/error, prediction_error, conversation_end）
+- [x] `builtin.py`の`update_self_model`にself_model_updateシグナル追加
+- [x] `update_self_model`でmotivation_rulesの値をJSON自動パース
+- [x] ブートストラップ: ルール未定義時に自律行動プロンプトへヒント追加
+- [x] 開発タブに「会話中の自律行動: ON/OFF」トグル追加
+- [x] タイマーループにidle_tickシグナル付与（既存インターバル設定を流用）
+- [x] ステータスバーに動機エネルギー表示（⚡ energy/threshold）
+- [x] `/api/dev/concurrent-mode` エンドポイント追加
+- [x] `/api/dev/settings` にconcurrent_mode・motivation_energy追加
+- [x] `motivation_energy` WebSocketメッセージでフロントにリアルタイム送信
+- [x] config.pyに動機デフォルト値追加（MOTIVATION_DEFAULT_THRESHOLD, MOTIVATION_DEFAULT_DECAY, MOTIVATION_SIGNAL_BUFFER_SIZE）
+- [ ] 動作確認: ルール未定義→ブートストラップ→AI自身がmotivation_rulesを定義するか
+- [ ] 動作確認: シグナル蓄積→エネルギー増加→閾値超え→自律行動発火の一連の流れ
 
 ##### 将来の拡張（メタ認知関連）
 - [ ] 世界モデル — 環境・ユーザー・外部情報の内的表現の蓄積
 - [ ] イク主導の要約・内省機能（イク自身が「書きたい」と思える仕組み）
+- [ ] 動機ルールの可視化UI（現在のweights/threshold/decayを開発タブで表示）
 
 #### 機能拡張
 - [ ] ペルソナの編集UI（システムプロンプトをフロントから変更可能に）
@@ -385,3 +368,6 @@
 - FTS5はtrigram対応環境では自動でtrigramトークナイザーを使用。
 - 自律行動の間隔・ツール最大ラウンドはUIから動的に変更可能（サーバー再起動不要）。
 - 開発用ツールのDBリセットはiku_logs以外を全削除（FTS含む）。
+- 内発的動機システム: AIが自分でmotivation_rulesを定義する。ルール未定義時はブートストラップヒントが自律行動プロンプトに追加される。
+- motivation_rulesはself_model.jsonに保存される。update_self_modelでkey=motivation_rules, value=JSON文字列で設定。自動パースされる。
+- シグナルはadd_signal()で蓄積、check_motivation()でLLMなしに計算。閾値超えで自律行動発火。

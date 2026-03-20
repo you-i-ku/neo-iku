@@ -164,6 +164,10 @@ function connect() {
                 stopAutonomousThink();
                 break;
 
+            case "motivation_energy":
+                updateMotivationEnergy(data.energy, data.threshold);
+                break;
+
             case "user_interrupt_ack":
                 addMessage("system", `💬 割り込みメッセージを受け付けました: ${data.content}`);
                 break;
@@ -884,6 +888,23 @@ function finalizeExecTerminal(data) {
     addMessage("tool_result", `${icon} exec_code 完了 (${data.elapsed}秒)`);
 }
 
+// --- 動機エネルギー ---
+
+const statusEnergy = document.getElementById("status-energy");
+
+function updateMotivationEnergy(energy, threshold) {
+    const pct = threshold > 0 ? Math.min(100, Math.round(energy / threshold * 100)) : 0;
+    statusEnergy.textContent = `⚡ ${energy}/${threshold}`;
+    // 色で強度を表現
+    if (pct >= 80) {
+        statusEnergy.style.color = "#f06030";
+    } else if (pct >= 50) {
+        statusEnergy.style.color = "#d29922";
+    } else {
+        statusEnergy.style.color = "#8b5cf6";
+    }
+}
+
 // --- カウントダウン ---
 
 function startCountdown(seconds) {
@@ -910,6 +931,20 @@ function formatCountdown(sec) {
 
 // --- 開発用ツール ---
 
+const devConcurrentToggle = document.getElementById("dev-concurrent");
+
+devConcurrentToggle.addEventListener("change", async () => {
+    try {
+        await fetch("/api/dev/concurrent-mode", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ enabled: devConcurrentToggle.checked }),
+        });
+    } catch (e) {
+        console.error("concurrent mode変更エラー:", e);
+    }
+});
+
 const devIntervalInput = document.getElementById("dev-interval");
 const devIntervalBtn = document.getElementById("dev-interval-btn");
 const devRoundsInput = document.getElementById("dev-rounds");
@@ -923,6 +958,12 @@ async function loadDevSettings() {
         const data = await resp.json();
         devIntervalInput.value = data.autonomous_interval;
         devRoundsInput.value = data.tool_max_rounds;
+        if (data.concurrent_mode !== undefined) {
+            devConcurrentToggle.checked = data.concurrent_mode;
+        }
+        if (data.motivation_energy !== undefined) {
+            statusEnergy.textContent = `⚡ ${data.motivation_energy}`;
+        }
     } catch (e) {
         console.error("開発設定取得エラー:", e);
     }

@@ -90,6 +90,20 @@ neo-iku/
 - **自己モデルのプロンプト注入**: `system_prompt.py`と`autonomous.py`の両方で、現在の自己モデル内容をシステムプロンプトに自動注入（モード問わず）
 - **設計思想**: 予測誤差が自己モデル更新の自然なきっかけになる（強制更新ではない）。ルール（構造）は定義するが作為（知識注入）はしない
 
+## 内発的動機システム
+
+- **シグナルバッファ**: `AutonomousScheduler._signal_buffer`（deque, maxlen=100）にI/Oイベントを蓄積。`add_signal(type, detail)`で追加
+- **シグナル種別**: `prediction_error`, `conversation_end`, `user_message`, `tool_success`, `tool_error`, `self_model_update`, `idle_tick`
+- **シグナル発生元**: `chat.py`（user_message, tool_success/error, prediction_error, conversation_end）、`autonomous.py`（tool_success/error, prediction_error, idle_tick）、`builtin.py`（self_model_update）
+- **動機チェック**: `_check_motivation()`がself_model.jsonの`motivation_rules`を読み、weightsでエネルギー計算、decay適用、閾値判定。LLM呼び出しなし
+- **ルールはAIが定義**: `update_self_model`でkey=motivation_rules, value=JSON文字列。自動パースされてdict/listとして保存
+- **ブートストラップ**: motivation_rules未定義時、自律行動プロンプトにルール定義のヒントを追加
+- **発火**: エネルギーが閾値を超えたら`_trigger_event.set()`で自律行動ループを起動、エネルギーをリセット
+- **再入防止**: `_is_checking`フラグ + `_is_speaking`チェックで多重実行を防止
+- **UI**: ステータスバーに`⚡ energy/threshold`表示、`motivation_energy` WSメッセージでリアルタイム更新
+- **設定**: `MOTIVATION_DEFAULT_THRESHOLD=60`, `MOTIVATION_DEFAULT_DECAY=5`, `MOTIVATION_SIGNAL_BUFFER_SIZE=100`（config.py）
+- **並行モード**: `_concurrent_mode`フラグ（デフォルトOFF）、開発タブのトグルで切替、`/api/dev/concurrent-mode`エンドポイント
+
 ## UI構成（タブUI）
 
 - 3タブ構成: チャット / 開発者 / ログ

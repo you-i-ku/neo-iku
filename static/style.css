@@ -36,6 +36,11 @@ body {
     font-variant-numeric: tabular-nums;
 }
 
+.status-bar-item.energy {
+    color: #8b5cf6;
+    font-variant-numeric: tabular-nums;
+}
+
 .status-bar-sep {
     color: #30363d;
 }
@@ -1039,6 +1044,22 @@ details[open] > .dev-tool-result-summary::before {
 
 .dev-row button:hover {
     background: #30363d;
+}
+
+.dev-toggle-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: #8b949e;
+    cursor: pointer;
+}
+
+.dev-toggle-label input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    accent-color: #8b5cf6;
+    cursor: pointer;
 }
 
 .dev-btn {

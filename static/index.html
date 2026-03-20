@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>イク — neo-iku</title>
-    <link rel="stylesheet" href="/static/style.css?v=27">
+    <link rel="stylesheet" href="/static/style.css?v=28">
 </head>
 <body>
     <!-- ステータスバー -->
@@ -15,6 +15,8 @@
         <span id="status-memories" class="status-bar-item">記憶: —</span>
         <span class="status-bar-sep">|</span>
         <span id="status-countdown" class="status-bar-item countdown">次の自律: —</span>
+        <span class="status-bar-sep">|</span>
+        <span id="status-energy" class="status-bar-item energy" title="内発的動機エネルギー">⚡ 0</span>
         <span class="status-bar-sep">|</span>
         <span id="status-mode" class="status-bar-item">モード: —</span>
         <div class="status-bar-right">
@@ -76,6 +78,12 @@
                                     <button id="dev-rounds-btn">設定</button>
                                 </div>
                             </div>
+                            <div class="dev-item">
+                                <label class="dev-toggle-label">
+                                    <input id="dev-concurrent" type="checkbox">
+                                    <span>会話中の自律行動</span>
+                                </label>
+                            </div>
                             <button id="dev-trigger-btn" class="dev-btn trigger">今すぐ自律行動</button>
                             <button id="dev-reset-btn" class="dev-btn danger">DBリセット（過去ログ以外）</button>
                         </div>
@@ -110,6 +118,6 @@
         <div id="log-content" class="log-content-full"></div>
     </div>
 
-    <script src="/static/app.js?v=27"></script>
+    <script src="/static/app.js?v=28"></script>
 </body>
 </html>
