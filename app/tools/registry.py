@@ -75,7 +75,11 @@ def build_tools_prompt() -> str:
 
 # テキストマーカーパターン
 # ブロック形式: [TOOL:name key=value]\n内容\n[/TOOL]
-_BLOCK_PATTERN = re.compile(r"\[TOOL:(\w+)(.*?)\]\s*\n(.*?)\[/TOOL\]", re.DOTALL)
+# ※contentグループは [TOOL: または [/TOOL] を跨がない（他ツール呼び出しを誤飲み込みしないため）
+_BLOCK_PATTERN = re.compile(
+    r"\[TOOL:(\w+)([^\n]*?)\]\s*\n((?:(?!\[(?:TOOL:|/TOOL\])).)*?)\[/TOOL\]",
+    re.DOTALL,
+)
 # 複数行対応: [TOOL:name key="複数行の値"] — content="..."が改行を含むケース
 _MULTILINE_PATTERN = re.compile(r'\[TOOL:(\w+)\s+(.*?")\s*\]', re.DOTALL)
 # 単一行 + マルチライン対応（DOTALL）ただし [TOOL: 境界を超えない

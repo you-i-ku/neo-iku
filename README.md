@@ -11,6 +11,7 @@
 
 - **モード切替** — ノーマルモード（素のLLM）とイクモード（ペルソナ+記憶）をワンクリックで切替
 - **長期記憶** — 過去の対話を覚えていて、関連する記憶を自動で参照しながら会話する（イクモード時）
+- **統一パイプライン** — チャットも自律行動も同じパイプライン（`pipeline.py`）を通る。入力が違うだけでツールループ・承認フロー・ストリーミングは共通
 - **自律行動** — 話しかけられなくても、自分で考えて発言したりツールを使って行動する
 - **タブUI** — チャット/開発者/ログの3タブ構成。チャットはoutputツール出力のみ、開発者タブで思考過程・ツール実行詳細を確認
 - **outputツール** — AI出力は全て`[TOOL:output]`経由でチャットに表示。発言するかしないかをAI自身が選択できる
@@ -44,8 +45,9 @@ neo-iku/
 │
 ├── app/
 │   ├── main.py                 # FastAPIアプリ、起動/終了処理
+│   ├── pipeline.py             # 統一パイプライン（キュー・ストリーミングLLM・ツールループ・承認フロー）
 │   ├── routes/
-│   │   ├── chat.py             # WebSocketチャット（ストリーミング応答、outputツール処理）
+│   │   ├── chat.py             # WebSocketルーティング（薄いハンドラ、pipelineに委譲）
 │   │   ├── dashboard.py        # 状態取得API（/api/status）+ 開発用API（/api/dev/*）
 │   │   └── memories.py         # 記憶一覧・検索API（/api/memories）
 │   ├── llm/
@@ -58,7 +60,7 @@ neo-iku/
 │   │   ├── store.py            # 記憶CRUD操作
 │   │   └── search.py           # FTS5全文検索（将来ベクトル検索に差し替え可能）
 │   ├── scheduler/
-│   │   └── autonomous.py       # 自律行動スケジューラ + 内発的動機システム（シグナル蓄積・エネルギー計算・閾値発火）
+│   │   └── autonomous.py       # タイマー + 内発的動機 + Phase1/2/3（戦略・候補・振り返り）→ pipelineにsubmit
 │   ├── importer/
 │   │   └── log_parser.py       # 過去ログパーサー+インポーター
 │   ├── persona/
@@ -243,7 +245,7 @@ llm_manager.register("my_provider", MyProvider())
 | `read_file` | プロジェクト内のファイルを読む（offset対応） | 不要 |
 | `search_files` | ファイル名で部分一致検索 | 不要 |
 | `create_file` | 新規ファイルを作成（既存ファイルにはエラー） | 不要 |
-| `overwrite_file` | 既存ファイルを上書き（承認UIが表示される） | 承認/拒否 |
+| `overwrite_file` | 既存ファイルを上書き（チャット/自律行動問わず承認UIが表示される） | 承認/拒否 |
 | `list_files` | ディレクトリ構成をツリー表示 | 不要 |
 | `search_memories` | 会話・過去ログ・日記を横断検索（過去ログはイクモード時のみ） | 不要 |
 | `write_diary` | 日記・内省メモを保存 | 不要 |

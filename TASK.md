@@ -245,6 +245,30 @@
 - [x] ツールプロンプトにブロック形式と`[/TOOL]`閉じタグの重要性を追記
 - [ ] UIテスト — 上記全機能の動作検証（スクロール・表示・セッション分離等）
 
+### Step 34: 統一パイプライン + 非LLMコアツールループ
+
+**パイプライン統合（chat.py + autonomous.py → pipeline.py）**
+- [x] `app/pipeline.py` 新規作成 — 統一パイプライン（キュー方式、ストリーミングLLM、ツールループ、承認フロー、コード実行）
+- [x] `app/routes/chat.py` を薄いWebSocketハンドラに縮小（559行→70行）— メッセージ振り分けのみ
+- [x] `app/scheduler/autonomous.py` をスリム化（765行→300行）— タイマー+動機+Phase1/2/3のみ、ツールループはpipelineに委譲
+- [x] `app/main.py` 更新 — pipeline.start()追加、旧コールバック(llm_chat/get_memories)削除
+- [x] `asyncio.Queue`でリクエストを逐次処理（chat/autonomous共通、レースコンディション解消）
+- [x] `asyncio.Future`で承認を待つ仕組み（どのクライアントからでも承認可能）
+
+**非LLMコアツールループ**
+- [x] 毎回フレッシュなstep_promptを構築（コンテキストサイズ一定、3000-5000字固定）
+- [x] `_build_step_prompt()` — action_goal + step_history + last_full_result + system_base
+- [x] `_summarize_result()` — ツール別の短い要約（非LLM）
+- [x] `import config as _config` で`TOOL_MAX_ROUNDS`を動的参照
+
+**承認フロー統一（ブロック廃止）**
+- [x] overwrite_file / exec_code / create_tool が自律行動中でも承認UIを表示（従来はブロック）
+- [x] 承認タイムアウト（5分）で自動reject
+
+**ストリーミング統一**
+- [x] chat/autonomous両方でストリーミングLLM（`stream_chat`）に統一
+- [x] think/stream分離してdev tabにブロードキャスト
+
 ## 残タスク
 
 ### 動作検証
@@ -346,7 +370,7 @@
 - [ ] ベクトル検索への移行（search.pyの中身差し替え。FTS5で不足した場合）
 - [ ] 複数LLMプロバイダ対応（Claude, GPT, Gemini等）
 - [x] ツールループの重複検出（同じツール+引数の再呼び出しを検知してLLMに示唆）→ Step 32で実装
-- [ ] コード実行のサンドボックス化（自律行動でのexec_code解禁時に必要）
+- [ ] コード実行のサンドボックス化（自律行動でもexec_codeが承認UI経由で実行可能になったが、サンドボックスがあるとより安全）
 - [ ] クラウドデプロイ
 - [ ] PC全体へのファイルアクセス拡張（現在はプロジェクト内のみ）
 

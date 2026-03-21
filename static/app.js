@@ -951,6 +951,7 @@ const devRoundsInput = document.getElementById("dev-rounds");
 const devRoundsBtn = document.getElementById("dev-rounds-btn");
 const devTriggerBtn = document.getElementById("dev-trigger-btn");
 const devResetBtn = document.getElementById("dev-reset-btn");
+const devClearSelfModelBtn = document.getElementById("dev-clear-selfmodel-btn");
 
 async function loadDevSettings() {
     try {
@@ -1027,6 +1028,20 @@ devResetBtn.addEventListener("click", async () => {
     } catch (e) {
         devResetBtn.textContent = "エラー";
         setTimeout(() => { devResetBtn.textContent = "DBリセット（過去ログ以外）"; devResetBtn.disabled = false; }, 2000);
+    }
+});
+
+devClearSelfModelBtn.addEventListener("click", async () => {
+    if (!confirm("自己モデル（self_model.json）の内容をすべて削除します。よろしいですか？")) return;
+    devClearSelfModelBtn.disabled = true;
+    devClearSelfModelBtn.textContent = "クリア中...";
+    try {
+        await fetch("/api/dev/clear-self-model", { method: "POST" });
+        devClearSelfModelBtn.textContent = "✓ 完了";
+        setTimeout(() => { devClearSelfModelBtn.textContent = "自己モデルクリア"; devClearSelfModelBtn.disabled = false; }, 2000);
+    } catch (e) {
+        devClearSelfModelBtn.textContent = "エラー";
+        setTimeout(() => { devClearSelfModelBtn.textContent = "自己モデルクリア"; devClearSelfModelBtn.disabled = false; }, 2000);
     }
 });
 

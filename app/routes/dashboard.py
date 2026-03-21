@@ -8,6 +8,7 @@ from app.memory.store import count_messages, count_conversations, count_iku_logs
 from app.persona.system_prompt import get_mode, set_mode
 
 from app.scheduler.autonomous import scheduler
+from app.pipeline import pipeline
 
 logger = logging.getLogger("iku.dashboard")
 router = APIRouter(prefix="/api")
@@ -30,7 +31,7 @@ async def get_status():
         "message_count": msg_count,
         "conversation_count": conv_count,
         "iku_log_count": log_count,
-        "connected_clients": scheduler.connected_count,
+        "connected_clients": pipeline.connected_count,
         "mode": get_mode(),
     }
 
@@ -123,6 +124,14 @@ async def reset_db():
             await session.execute(text(f"DELETE FROM {fts}"))
         await session.commit()
     return {"reset": True}
+
+
+@router.post("/dev/clear-self-model")
+async def clear_self_model():
+    """self_model.jsonの内容をクリア"""
+    from app.tools.builtin import SELF_MODEL_PATH
+    SELF_MODEL_PATH.write_text("{}", encoding="utf-8")
+    return {"cleared": True}
 
 
 class ConcurrentModeRequest(BaseModel):

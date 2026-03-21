@@ -34,3 +34,6 @@ EXEC_CODE_TIMEOUT = 30  # exec_codeのタイムアウト（秒）
 MOTIVATION_DEFAULT_THRESHOLD = 60  # エネルギーがこの値を超えたら自律行動発火
 MOTIVATION_DEFAULT_DECAY = 5  # チェックごとの減衰量
 MOTIVATION_SIGNAL_BUFFER_SIZE = 100  # シグナルバッファの最大サイズ
+
+# 構造化意思決定
+SCORING_ENABLED = True  # 候補生成→スコアリング→選択を有効にするか

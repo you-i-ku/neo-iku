@@ -43,17 +43,31 @@ neo-iku/
 ├── config.py               # 設定一箇所管理
 ├── requirements.txt
 ├── app/
-│   ├── main.py             # FastAPIアプリ
-│   ├── routes/             # chat.py, dashboard.py, memories.py
+│   ├── main.py             # FastAPIアプリ（pipeline + scheduler 起動）
+│   ├── pipeline.py         # 統一パイプライン（キュー・ストリーミングLLM・ツールループ・承認フロー）
+│   ├── routes/             # chat.py(WebSocketルーティングのみ), dashboard.py, memories.py
 │   ├── llm/                # base.py(抽象), lmstudio.py(実装), manager.py
 │   ├── memory/             # models.py, database.py, store.py, search.py
-│   ├── scheduler/          # autonomous.py（自律行動：発言・ツール実行・DB保存）
+│   ├── scheduler/          # autonomous.py（タイマー・動機・Phase1/2/3 → pipelineにsubmit）
 │   ├── importer/           # log_parser.py（過去ログ取り込み）
 │   ├── persona/            # system_prompt.py（イクの個性）
 │   └── tools/              # registry.py(登録・パース・実行), builtin.py(組み込みツール), code_analysis.py(構文+リスク), custom/(カスタムツール)
 ├── static/                 # index.html, style.css, app.js
 └── data/                   # SQLite DB + self_model.json（自動生成、過去ログ840件インポート済み）
 ```
+
+## 統一パイプライン（pipeline.py）
+
+- **アーキテクチャ**: チャットも自律行動も同じパイプラインを通る。入力が違うだけでツールループ・承認フロー・ストリーミングは共通
+- **キュー方式**: `asyncio.Queue`でリクエストを逐次処理。chat/autonomous共通、レースコンディション解消
+- **非LLMコアツールループ**: 毎回フレッシュなstep_promptを構築（コンテキストサイズ一定、3000-5000字固定）。messagesの蓄積なし
+- **ストリーミング統一**: chat/autonomous両方で`stream_chat()`を使用。think/stream分離してdev tabにブロードキャスト
+- **承認フロー統一**: overwrite_file/exec_code/create_toolはchat/autonomous問わず承認UIを全接続クライアントに表示。`asyncio.Future`で応答を待つ（タイムアウト5分）
+- **PipelineRequest**: `source`("chat"/"autonomous"), `goal`, `memory_context`, `signal_summary`, `bootstrap_hint`, `selected_action`
+- **PipelineResult**: `conv_id`, `step_history`, `last_full_result`, `had_output`, `last_response`（autonomous Phase 2で使用）
+- **step_prompt構造**: `今は{now}です。{system_base} 行動目標: {goal} これまでのステップ: {step_history} 直前のツール結果: {last_full_result} {tool_text}`
+- **_summarize_result()**: ツール別の短い要約を生成（read_file→「取得成功（40行）」、search_memories→「3件ヒット」等）
+- **シグナル発火**: pipeline内でツール実行時に`scheduler.add_signal()`を呼ぶ
 
 ## ツールフレームワーク
 
@@ -77,7 +91,8 @@ neo-iku/
 - `register_tool()` の `required_args` で必須引数を指定可能。引数なし→スキップ（会話中の言及）、パース失敗→エラーをLLMに返す
 - 引数パーサーはクォート内の `\n`→改行、`\t`→タブのエスケープシーケンス変換に対応
 - ツールループ中のユーザー割り込み: WebSocketをasyncio.Queueで管理し、次のLLM呼び出し前にユーザーメッセージをhistoryに挿入
-- 自律行動のツール表示: running→ラベル更新、success/error→メッセージ化。ブロックされたツール（overwrite_file等）はbroadcastスキップ
+- 自律行動のツール表示: running→ラベル更新、success/error→メッセージ化
+- 承認フロー統一: overwrite_file/exec_code/create_toolはchat/autonomous問わず承認UIを表示（自律行動中もブロックなし）
 - ツール結果表示: details/summaryで折りたたみ可能（プレビュー80文字）
 - outputツールアーキテクチャ: AI出力は全て`output`ツール経由。チャットタブにはoutput結果+ツール通知のみ表示。thinking/streamは開発者タブに表示
 - ツールループ安定化: 同一ツール+同一引数の重複呼び出しを検出→実行せずフィードバック。output連続呼び出しは2回目以降に気づきメッセージを添える（ブロックはしない）
@@ -87,14 +102,14 @@ neo-iku/
 - **予測の明示化**: 全ツールに`expect=...`引数を追加可能（任意）。実行前にargsからpopして`tool_actions.expected_result`に保存
 - **予測誤差の検知**: ツール結果返却時に「あなたの予測: XXX → 実際の結果: YYY」形式でLLMに提示。判定はLLMの次の応答に委ねる（追加LLM呼び出しなし）
 - **動的自己モデル**: `data/self_model.json`にAIの自己理解を保持。`read_self_model`/`update_self_model`ツールで読み書き。キーバリュー+自由テキスト(`__free_text__`)の両形式対応
-- **自己モデルのプロンプト注入**: `system_prompt.py`と`autonomous.py`の両方で、現在の自己モデル内容をシステムプロンプトに自動注入（モード問わず）
+- **自己モデルのプロンプト注入**: `pipeline.py`の`_build_system_base()`で、現在の自己モデル内容をシステムプロンプトに自動注入（モード問わず）
 - **設計思想**: 予測誤差が自己モデル更新の自然なきっかけになる（強制更新ではない）。ルール（構造）は定義するが作為（知識注入）はしない
 
 ## 内発的動機システム
 
 - **シグナルバッファ**: `AutonomousScheduler._signal_buffer`（deque, maxlen=100）にI/Oイベントを蓄積。`add_signal(type, detail)`で追加
 - **シグナル種別**: `prediction_error`, `conversation_end`, `user_message`, `tool_success`, `tool_error`, `self_model_update`, `idle_tick`
-- **シグナル発生元**: `chat.py`（user_message, tool_success/error, prediction_error, conversation_end）、`autonomous.py`（tool_success/error, prediction_error, idle_tick）、`builtin.py`（self_model_update）
+- **シグナル発生元**: `pipeline.py`（user_message, tool_success/error, prediction_error）、`chat.py`（conversation_end）、`autonomous.py`（idle_tick）、`builtin.py`（self_model_update）
 - **動機チェック**: `_check_motivation()`がself_model.jsonの`motivation_rules`を読み、weightsでエネルギー計算、decay適用、閾値判定。LLM呼び出しなし
 - **ルールはAIが定義**: `update_self_model`でkey=motivation_rules, value=JSON文字列。自動パースされてdict/listとして保存
 - **ブートストラップ**: motivation_rules未定義時、自律行動プロンプトにルール定義のヒントを追加

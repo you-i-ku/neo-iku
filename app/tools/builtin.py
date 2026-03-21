@@ -690,12 +690,12 @@ async def update_self_model(key: str = "", value: str = "", text: str = "") -> s
 
     if key and value:
         # motivation_rulesはJSON文字列を自動パース
-        if key == "motivation_rules":
+        if key in ("motivation_rules", "drives", "principles", "strategies"):
             try:
                 parsed = json.loads(value)
                 model[key] = parsed
             except json.JSONDecodeError:
-                return "エラー: motivation_rulesの値はJSON形式で指定してください。"
+                return f"エラー: {key}の値はJSON形式で指定してください。"
         else:
             model[key] = value
         _save_self_model(model)
