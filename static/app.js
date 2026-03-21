@@ -121,6 +121,7 @@ function connect() {
             case "dev_tool_result":
                 appendDevToolResult(data.name, data.content);
                 loadMemories(memorySearch.value.trim());
+                if (data.name === "update_self_model" || data.name === "read_self_model") loadSelfModel();
                 break;
 
             case "write_approval":
@@ -1038,12 +1039,34 @@ devClearSelfModelBtn.addEventListener("click", async () => {
     try {
         await fetch("/api/dev/clear-self-model", { method: "POST" });
         devClearSelfModelBtn.textContent = "✓ 完了";
+        loadSelfModel();
         setTimeout(() => { devClearSelfModelBtn.textContent = "自己モデルクリア"; devClearSelfModelBtn.disabled = false; }, 2000);
     } catch (e) {
         devClearSelfModelBtn.textContent = "エラー";
         setTimeout(() => { devClearSelfModelBtn.textContent = "自己モデルクリア"; devClearSelfModelBtn.disabled = false; }, 2000);
     }
 });
+
+// --- 自己モデル表示 ---
+
+const selfmodelDisplay = document.getElementById("selfmodel-display");
+const selfmodelRefreshBtn = document.getElementById("selfmodel-refresh-btn");
+
+async function loadSelfModel() {
+    try {
+        const resp = await fetch("/api/dev/self-model");
+        const data = await resp.json();
+        if (Object.keys(data).length === 0) {
+            selfmodelDisplay.textContent = "（空）";
+        } else {
+            selfmodelDisplay.textContent = JSON.stringify(data, null, 2);
+        }
+    } catch (e) {
+        selfmodelDisplay.textContent = "取得エラー";
+    }
+}
+
+selfmodelRefreshBtn.addEventListener("click", loadSelfModel);
 
 // --- 初期化 ---
 
@@ -1052,5 +1075,6 @@ updateStatus();
 loadModels();
 loadMemories();
 loadDevSettings();
+loadSelfModel();
 
 setInterval(updateStatus, 30000);

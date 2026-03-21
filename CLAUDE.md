@@ -33,7 +33,7 @@
 - Python + FastAPI + vanilla HTML/CSS/JS
 - SQLite + SQLAlchemy（将来PostgreSQLに移行可能）
 - LM Studio（OpenAI互換API, localhost:1234）
-- 依存: fastapi, uvicorn, sqlalchemy, aiosqlite, httpx, duckduckgo-search
+- 依存: fastapi, uvicorn, sqlalchemy, aiosqlite, httpx, duckduckgo-search, psutil
 
 ## プロジェクト構造
 
@@ -65,7 +65,8 @@ neo-iku/
 - **承認フロー統一**: overwrite_file/exec_code/create_toolはchat/autonomous問わず承認UIを全接続クライアントに表示。`asyncio.Future`で応答を待つ（タイムアウト5分）
 - **PipelineRequest**: `source`("chat"/"autonomous"), `goal`, `memory_context`, `signal_summary`, `bootstrap_hint`, `selected_action`
 - **PipelineResult**: `conv_id`, `step_history`, `last_full_result`, `had_output`, `last_response`（autonomous Phase 2で使用）
-- **step_prompt構造**: `今は{now}です。{system_base} 行動目標: {goal} これまでのステップ: {step_history} 直前のツール結果: {last_full_result} {tool_text}`
+- **LLMメッセージ構造**: system role = `_build_system_base()`（ペルソナ+自己モデル）、user role = step_prompt（行動目標・ツール一覧・履歴）。systemだけだとLM Studioのjinjaテンプレートが「No user query found」エラーを出す
+- **step_prompt構造**: `今は{now}です。 行動目標: {goal} これまでのステップ: {step_history} 直前のツール結果: {last_full_result} {tool_text}`
 - **_summarize_result()**: ツール別の短い要約を生成（read_file→「取得成功（40行）」、search_memories→「3件ヒット」等）
 - **シグナル発火**: pipeline内でツール実行時に`scheduler.add_signal()`を呼ぶ
 
@@ -75,7 +76,7 @@ neo-iku/
 - 4形式対応: 単一行 `[TOOL:name args]`、複数行クォート `[TOOL:name content="..."]`、ブロック `[TOOL:name]\n内容\n[/TOOL]`、フォールバック `[TOOL:name]\n内容`（`[/TOOL]`閉じ忘れ対応）
 - `_TOOL_PATTERN`はDOTALLモード + `(?!\[TOOL:)`負先読みでツール境界越えマッチを防止
 - ツールはモード問わず有効（イクモードはペルソナのレイヤー、ツールはAI自体の能力）
-- 組み込みツール: output, read_file, search_files, create_file, overwrite_file, list_files, search_memories, write_diary, exec_code, search_action_log, web_search, create_tool, read_self_model, update_self_model
+- 組み込みツール: output, read_file, search_files, create_file, overwrite_file, list_files, search_memories, write_diary, exec_code, search_action_log, web_search, create_tool, read_self_model, update_self_model, get_system_metrics, fetch_raw_resource
 - output: チャット欄にテキストを表示する唯一の経路。`[TOOL:output content=テキスト]`またはブロック形式`[TOOL:output]\nテキスト\n[/TOOL]`で使用
 - `app/tools/registry.py` の `register_tool()` で新ツールを追加可能
 - ツール実行ループ: 最大`TOOL_MAX_ROUNDS`回（デフォルト8）まで連続呼び出し可能（config.pyで管理、UIから動的変更可）
@@ -85,6 +86,8 @@ neo-iku/
 - exec_code: Pythonコード実行（構文チェック+リスク分析→UI承認フロー: 承認/拒否＋コメント。実行前にgit自動バックアップ。ストリーミングターミナルポップアップで結果表示）
 - create_tool: 新ツール作成（構文チェック+リスク分析→UI承認フロー: 承認/拒否＋コメント。`app/tools/custom/{name}.py`に保存、起動時に自動ロード）
 - web_search: DuckDuckGoでWeb検索（APIキー不要、`duckduckgo-search`ライブラリ使用）
+- get_system_metrics: CPU・メモリ・ディスク・自プロセス情報を取得（`psutil`ライブラリ使用）
+- fetch_raw_resource: 指定URLからHTML・JSON・テキストを取得（`httpx`使用、最大500KB）
 - 承認/拒否のどちらにもコメント欄あり（任意）。コメントがあればLLMにフィードバックされる
 - `app/tools/code_analysis.py`: 構文チェック（ast.parse）+ リスク静的解析（AST walk）。exec_code・create_toolの承認UIにリスクレベル（🔴HIGH/🟡MEDIUM/🟢LOW）を表示
 - 応答中断: 専用停止ボタン（⏹）で即中断可能（送信ボタンとは独立）。入力欄にテキストがあればfeedbackとしてLLMに伝わる。ストリーミング中でも送信ボタンで割り込みメッセージを送れる
@@ -96,6 +99,8 @@ neo-iku/
 - ツール結果表示: details/summaryで折りたたみ可能（プレビュー80文字）
 - outputツールアーキテクチャ: AI出力は全て`output`ツール経由。チャットタブにはoutput結果+ツール通知のみ表示。thinking/streamは開発者タブに表示
 - ツールループ安定化: 同一ツール+同一引数の重複呼び出しを検出→実行せずフィードバック。output連続呼び出しは2回目以降に気づきメッセージを添える（ブロックはしない）
+- JSON引数パーサー: `_extract_json_args()`がバランスカウンティングで`{...}`や`[...]`を含む引数値を正しく抽出（旧来の正規表現は空白で切れるバグがあった）
+- outputブロック注意: `[TOOL:output]...[/TOOL]`の中に他のツール呼び出し`[TOOL:...]`を入れてはいけない（負先読みでブロックマッチが失敗するため）。プロンプトにも注記済み
 
 ## メタ認知フレームワーク
 
@@ -104,6 +109,7 @@ neo-iku/
 - **動的自己モデル**: `data/self_model.json`にAIの自己理解を保持。`read_self_model`/`update_self_model`ツールで読み書き。キーバリュー+自由テキスト(`__free_text__`)の両形式対応
 - **自己モデルのプロンプト注入**: `pipeline.py`の`_build_system_base()`で、現在の自己モデル内容をシステムプロンプトに自動注入（モード問わず）
 - **設計思想**: 予測誤差が自己モデル更新の自然なきっかけになる（強制更新ではない）。ルール（構造）は定義するが作為（知識注入）はしない
+- **自己モデルの自律性**: `data/self_model.json`は初期状態`{}`。motivation_rules/drives/strategies等の構造はAIが自分のコードを読んで発見・定義する。人間が初期値を仕込まない
 
 ## 内発的動機システム
 
@@ -112,7 +118,7 @@ neo-iku/
 - **シグナル発生元**: `pipeline.py`（user_message, tool_success/error, prediction_error）、`chat.py`（conversation_end）、`autonomous.py`（idle_tick）、`builtin.py`（self_model_update）
 - **動機チェック**: `_check_motivation()`がself_model.jsonの`motivation_rules`を読み、weightsでエネルギー計算、decay適用、閾値判定。LLM呼び出しなし
 - **ルールはAIが定義**: `update_self_model`でkey=motivation_rules, value=JSON文字列。自動パースされてdict/listとして保存
-- **ブートストラップ**: motivation_rules未定義時、自律行動プロンプトにルール定義のヒントを追加
+- **ブートストラップ**: motivation_rules未定義時、weightsをゼロとして動作（エネルギーは溜まらないが仕組みは稼働）。ヒント注入なし — AIが自分のコードを読んで発見する
 - **発火**: エネルギーが閾値を超えたら`_trigger_event.set()`で自律行動ループを起動、エネルギーをリセット
 - **再入防止**: `_is_checking`フラグ + `_is_speaking`チェックで多重実行を防止
 - **UI**: ステータスバーに`⚡ energy/threshold`表示、`motivation_energy` WSメッセージでリアルタイム更新
@@ -137,6 +143,7 @@ neo-iku/
 - DB保存はthink含むfull_response（思考過程もセットで記録）
 - search_memoriesの検索結果はthinkタグ・ツールマーカー・ツール結果を除去して本文のみ返す（DB上のデータは無加工）
 - trigramが使えない環境ではデフォルトtokenizer + prefix matchにフォールバック
+- **自動注入なし**: pipelineはDBを自動検索しない。AIが`search_memories`ツールを使って自分で想起する（chat/autonomous両方）
 
 ## ユーザーについて
 
@@ -152,3 +159,4 @@ neo-iku/
 - 過去プロジェクト（過去プロジェクト.md）は参考のみ。あの設計を繰り返さない
 - やりたいこと.txtのビジョンは最終ゴール。MVPで全部実現する必要はないが、拡張の余地は常に残す
 - 過去ログはDBにインポート済み（840件）。ファイルは削除済み。再インポートの必要なし
+- LM Studioに送るmessagesには必ずuser roleを含めること。system roleだけだとモデルのjinjaテンプレートがエラーを返す（「No user query found in messages」）

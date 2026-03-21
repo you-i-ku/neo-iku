@@ -269,6 +269,36 @@
 - [x] chat/autonomous両方でストリーミングLLM（`stream_chat`）に統一
 - [x] think/stream分離してdev tabにブロードキャスト
 
+**LM Studio互換性修正**
+- [x] system+user roleでLLM呼び出し（systemのみだとjinjaテンプレートエラー「No user query found in messages」）
+- [x] system role = ペルソナ+自己モデル（`_build_system_base()`）、user role = ステッププロンプト（行動目標・ツール・履歴）
+- [x] `_process()` のcontext構築を`try:`内に移動（例外時も`processing_end`が送られるように）
+
+### Step 35: ツール改善・自律性設計・新ツール追加
+
+**ツールパーサー修正（JSON値対応）**
+- [x] `_extract_json_args()` ヘルパー追加 — `value={"key": val}` のようなスペース含むJSON値をバランスカウントで正確に抽出
+- [x] `_parse_args()` 修正 — クォートなしJSON値（`{...}`, `[...]`）をquoted/non-quotedの前に処理
+- [x] プロンプトに `[TOOL:output]...[/TOOL]` ブロック内に他ツールを入れない旨を追加
+
+**新ツール追加**
+- [x] `get_system_metrics` ツール — psutilでCPU・メモリ・ディスク・自プロセス情報を観測（「身体感覚」）
+- [x] `fetch_raw_resource` ツール — URLから生データ取得（HTML/JSON/テキスト、サイズ制限付き）。web_searchと組み合わせて「検索→ページ内容取得」が可能に
+- [x] `psutil` を requirements.txt に追加
+
+**開発者タブ: 自己モデル表示**
+- [x] 開発者タブ右パネルに自己モデル表示欄追加（`<pre id="selfmodel-display">`）
+- [x] ↻ボタンで手動更新
+- [x] `update_self_model` / `read_self_model` ツール実行時にWebSocket経由で自動更新
+- [x] `/api/dev/self-model` エンドポイント追加
+- [x] `自己モデルクリア`ボタン押下後に表示も即更新
+
+**自律性設計の見直し**
+- [x] `_build_bootstrap_hint()` を空実装に — 「定義してください」のヒントを全削除。AIが自分でコードを読んで発見する設計へ
+- [x] `_check_motivation()` 修正 — `motivation_rules`未定義でも`return`せずゼロweightで稼働。仕組み自体は常に動く
+- [x] パイプラインの自動メモリ検索を削除 — チャット/自律行動どちらも記憶は自動注入しない。AIが`search_memories`を自分で使う設計へ
+- [x] `self_model.json` を空 `{}` にリセット（パーサーバグで壊れたデータをクリア）
+
 ## 残タスク
 
 ### 動作検証
@@ -395,3 +425,4 @@
 - 内発的動機システム: AIが自分でmotivation_rulesを定義する。ルール未定義時はブートストラップヒントが自律行動プロンプトに追加される。
 - motivation_rulesはself_model.jsonに保存される。update_self_modelでkey=motivation_rules, value=JSON文字列で設定。自動パースされる。
 - シグナルはadd_signal()で蓄積、check_motivation()でLLMなしに計算。閾値超えで自律行動発火。
+- LM Studioへのリクエストにはuser roleが必須（systemだけだとjinjaテンプレートエラー）。pipeline.pyではsystem=ペルソナ、user=ステッププロンプトで送る。

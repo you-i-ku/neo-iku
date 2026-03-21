@@ -17,7 +17,7 @@
 - **outputツール** — AI出力は全て`[TOOL:output]`経由でチャットに表示。発言するかしないかをAI自身が選択できる
 - **過去の継承** — 12ファイルの過去対話ログを記憶としてインポートし、個性の土台とする
 - **LLM抽象化** — LM Studioを標準で使用。プロバイダを差し替えるだけで他のLLMにも対応可能
-- **記憶検索** — SQLite FTS5（trigram対応）による全文検索で、関連する過去の記憶をプロンプトに自動注入（検索結果はthinkタグ・ツールマーカーを除去して本文のみ表示）
+- **記憶検索** — SQLite FTS5（trigram対応）による全文検索。AIが`search_memories`ツールを使って自分で記憶を探す（自動注入ではなく、AIが必要と判断したときに検索）
 - **ツール実行** — ファイル読み書き・ディレクトリ探索・記憶検索・日記書き込みをAI自身が実行できる（1回の応答で複数ツール同時呼び出し可）
 - **自己改変** — 自分のコードを読んで書き換えられる（既存ファイルの上書きはユーザー承認が必要）
 - **コード実行** — Pythonコードを実行できる（承認UI + ストリーミングターミナルでリアルタイム監視、実行前にgit自動バックアップ）
@@ -32,7 +32,7 @@
 - **モデル選択** — LM Studioのロード済みモデルをダッシュボードから切替可能
 - **ユーザー割り込み** — ツール実行ループ中でもメッセージを送れる。次のLLM呼び出し前に割り込み挿入され、AIの方向を変えられる
 - **承認フィードバック** — ファイル上書き・コード実行の承認/拒否時にコメントを添えてLLMに理由を伝えられる
-- **開発用ツール** — 自律行動間隔変更・即時実行・ツールラウンド数変更・DBリセットをUIから操作
+- **開発用ツール** — 自律行動間隔変更・即時実行・ツールラウンド数変更・DBリセット・自己モデルのリアルタイム表示をUIから操作
 
 ## 構成
 
@@ -90,7 +90,7 @@ neo-iku/
 | DB | SQLite + SQLAlchemy（非同期） |
 | 全文検索 | SQLite FTS5 |
 | LLM | LM Studio（OpenAI互換API, localhost:1234） |
-| 依存 | fastapi, uvicorn, sqlalchemy, aiosqlite, httpx, duckduckgo-search |
+| 依存 | fastapi, uvicorn, sqlalchemy, aiosqlite, httpx, duckduckgo-search, psutil |
 
 ## セットアップ
 
@@ -151,8 +151,8 @@ python run.py
 ## 記憶の仕組み
 
 1. **保存**: 会話終了時（WebSocket切断時）にLLMで要約を自動生成 → `memory_summaries` テーブルに保存 → FTS5インデックス更新
-2. **検索**: ユーザーのメッセージからFTS5で関連記憶を検索 → 上位5件をシステムプロンプトに含める
-3. **参照**: イクはシステムプロンプト内の記憶を参照しながら応答する
+2. **検索**: イクが`search_memories`ツールを使って自分で必要なときに検索する（パイプラインによる自動注入なし）
+3. **蓄積**: 日記（`write_diary`）・原則・行動ログが時系列で積み重なり、自己の「厚み」を形成する
 
 ## 自律行動
 
@@ -196,6 +196,7 @@ python run.py
 | `/api/dev/tool-max-rounds` | POST | ツール最大ラウンド数変更（`{"rounds": 8}`） |
 | `/api/dev/concurrent-mode` | POST | 会話中の自律行動ON/OFF（`{"enabled": true}`) |
 | `/api/dev/reset-db` | POST | DBリセット（iku_logs以外を全クリア） |
+| `/api/dev/self-model` | GET | 現在の自己モデル（self_model.json）の内容を返す |
 
 ## LLMプロバイダの追加
 
@@ -226,7 +227,7 @@ llm_manager.register("my_provider", MyProvider())
 | 設定 | デフォルト値 | 説明 |
 |------|------------|------|
 | `LLM_BASE_URL` | `http://localhost:1234/v1` | LM StudioのAPIエンドポイント |
-| `LLM_TIMEOUT` | `120.0` | LLM応答のタイムアウト（秒） |
+| `LLM_TIMEOUT` | `300.0` | LLM応答のタイムアウト（秒） |
 | `LLM_MAX_TOKENS` | `8192` | LLM応答の最大トークン数 |
 | `PORT` | `8000` | サーバーポート |
 | `AUTONOMOUS_INTERVAL_MIN` | `1800` | 自発的発言の基本間隔（秒、30分） |
@@ -256,6 +257,8 @@ llm_manager.register("my_provider", MyProvider())
 | `read_self_model` | 現在の自己モデルを読み出す | 不要 |
 | `update_self_model` | 自己モデルを更新（key-value or 自由テキスト） | 不要 |
 | `create_tool` | 新しいツールを作成して永続化（`app/tools/custom/`に保存） | 承認/拒否 |
+| `get_system_metrics` | CPUやメモリ・ディスク・自プロセス情報を取得して環境を観測する | 不要 |
+| `fetch_raw_resource` | 指定URLからHTML・JSON・テキスト等を直接取得する | 不要 |
 
 どのツールでも `expect=...` を付けると実行前の予測を記録できます（任意）。結果と比較してメタ認知に活用されます。
 

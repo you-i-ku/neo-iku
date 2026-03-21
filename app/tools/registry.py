@@ -57,6 +57,7 @@ def build_tools_prompt() -> str:
     lines.append('今日はいい天気ですね。')
     lines.append('[/TOOL]')
     lines.append('※[/TOOL]を忘れるとツールが実行されません。必ず閉じてください。')
+    lines.append('※[TOOL:output]...[/TOOL]の中にはテキストのみ書いてください。他のツール呼び出し（[TOOL:...]）は外に出してください。')
     lines.append('例: [TOOL:read_file path=app/main.py expect=main関数やルーター設定が見えるはず]')
     lines.append('例: [TOOL:search_memories query=過去の会話 expect=skip]')
     lines.append('例: [TOOL:write_diary content=今日は自分のコードを読んで面白い発見があった expect=skip]')
@@ -92,6 +93,57 @@ _TOOL_PATTERN = re.compile(
 _UNCLOSED_BLOCK_PATTERN = re.compile(r"\[TOOL:(\w+)(.*?)\]\s*\n(.*)", re.DOTALL)
 
 
+def _extract_json_args(args_str: str) -> tuple[dict, str]:
+    """JSON形式の値（{...}や[...]）を持つキーを抽出する。
+    (json_args, remaining) を返す。remaining はJSON部分を除いた残りの文字列。"""
+    json_args = {}
+    remaining = args_str
+    json_key_pattern = re.compile(r'(\w+)=([{[])')
+
+    while True:
+        m = json_key_pattern.search(remaining)
+        if not m:
+            break
+
+        key = m.group(1)
+        opener = m.group(2)
+        closer = '}' if opener == '{' else ']'
+        start_pos = m.start(2)
+
+        depth = 0
+        in_str = False
+        esc = False
+        end_pos = -1
+
+        for i in range(start_pos, len(remaining)):
+            ch = remaining[i]
+            if esc:
+                esc = False
+                continue
+            if ch == '\\' and in_str:
+                esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if not in_str:
+                if ch == opener:
+                    depth += 1
+                elif ch == closer:
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = i + 1
+                        break
+
+        if end_pos == -1:
+            break  # 閉じ括弧が見つからない
+
+        json_args[key] = remaining[start_pos:end_pos]
+        remaining = remaining[:m.start()] + remaining[end_pos:]
+
+    return json_args, remaining
+
+
 def _parse_args(args_str: str) -> dict:
     """引数文字列をパースして辞書を返す。クォート付きとクォートなしの混在に対応。"""
     args = {}
@@ -114,21 +166,31 @@ def _parse_args(args_str: str) -> dict:
             if part.group(1) not in args:
                 args[part.group(1)] = part.group(2)
     else:
-        # クォートなし: まず複数引数パターン (key=value key=value) を試す
-        multi = list(re.finditer(r'(\w+)=([^\s]+)', args_str))
-        if len(multi) >= 2:
-            # 複数引数: それぞれ個別に取る
-            for part in multi:
-                args[part.group(1)] = part.group(2)
-        elif multi:
-            # 1つだけ: key= の後ろ全部を値として取る（スペース含むかもしれない）
-            single = re.match(r'(\w+)=(.*)', args_str, re.DOTALL)
-            if single:
-                args[single.group(1)] = single.group(2).strip()
+        # JSON値（{...}や[...]）を先に抽出
+        json_args, remaining = _extract_json_args(args_str)
+        if json_args:
+            args.update(json_args)
+            # 残りの非JSON引数を処理
+            for part in re.finditer(r'(\w+)=([^\s{[]+)', remaining):
+                k = part.group(1)
+                if k not in args:
+                    args[k] = part.group(2).strip()
         else:
-            # パターンにマッチしないが引数文字列は存在する → パース失敗マーカー
-            if args_str.strip():
-                args["__parse_failed__"] = args_str.strip()
+            # クォートなし: まず複数引数パターン (key=value key=value) を試す
+            multi = list(re.finditer(r'(\w+)=([^\s]+)', args_str))
+            if len(multi) >= 2:
+                # 複数引数: それぞれ個別に取る
+                for part in multi:
+                    args[part.group(1)] = part.group(2)
+            elif multi:
+                # 1つだけ: key= の後ろ全部を値として取る（スペース含むかもしれない）
+                single = re.match(r'(\w+)=(.*)', args_str, re.DOTALL)
+                if single:
+                    args[single.group(1)] = single.group(2).strip()
+            else:
+                # パターンにマッチしないが引数文字列は存在する → パース失敗マーカー
+                if args_str.strip():
+                    args["__parse_failed__"] = args_str.strip()
 
     return args
 

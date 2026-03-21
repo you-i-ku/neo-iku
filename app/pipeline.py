@@ -14,7 +14,6 @@ from app.memory.store import (
     create_conversation, add_message, end_conversation,
     record_tool_action,
 )
-from app.memory.search import search_messages, search_iku_logs
 from app.persona.system_prompt import get_mode, IKU_SYSTEM_PROMPT
 from app.tools.registry import parse_tool_calls, execute_tool, build_tools_prompt
 from app.tools.builtin import (
@@ -191,23 +190,7 @@ class Pipeline:
             system_base = self._build_system_base()
             logger.debug(f"system_base 構築完了: {len(system_base)} chars")
             memory_context = req.memory_context
-
-            # chat の場合、メモリ検索
-            if req.source == "chat" and not memory_context:
-                async with async_session() as session:
-                    chat_mems = await search_messages(session, req.goal)
-                    iku_mems = await search_iku_logs(session, req.goal) if get_mode() == "iku" else []
-                parts = []
-                if iku_mems:
-                    parts.append("【過去ログ記憶】\n" + "\n".join(
-                        f"{'ユーザー' if m['role']=='user' else 'イク'}: {m['content'][:200]}" for m in iku_mems
-                    ))
-                if chat_mems:
-                    parts.append("【会話記憶】\n" + "\n".join(
-                        f"{'ユーザー' if m['role']=='user' else 'イク'}: {m['content'][:200]}" for m in chat_mems
-                    ))
-                memory_context = "\n".join(parts)
-                logger.debug(f"メモリ検索完了: chat={len(chat_mems)} iku={len(iku_mems)}")
+            # 記憶検索はAIが自分でsearch_memoriesツールを使って行う（自動注入しない）
 
             # chat の場合、ユーザーメッセージをDB保存
             if req.source == "chat":

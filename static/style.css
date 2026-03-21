@@ -1096,6 +1096,34 @@ details[open] > .dev-tool-result-summary::before {
     cursor: not-allowed;
 }
 
+.dev-btn-sm {
+    background: none;
+    border: 1px solid #30363d;
+    color: #8b949e;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    margin-left: 6px;
+    vertical-align: middle;
+}
+.dev-btn-sm:hover { color: #c9d1d9; border-color: #58a6ff; }
+
+.selfmodel-display {
+    background: #0d1117;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    padding: 10px;
+    font-size: 11px;
+    color: #8b949e;
+    max-height: 300px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    font-family: 'Consolas', 'Monaco', monospace;
+    margin: 0;
+}
+
 .search-area {
     display: flex;
     gap: 8px;

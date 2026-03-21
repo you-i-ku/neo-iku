@@ -59,13 +59,15 @@ class AutonomousScheduler:
             from app.tools.builtin import _load_self_model
             self_model = _load_self_model()
             rules = self_model.get("motivation_rules")
-
-            if not rules:
-                return
-
-            weights = rules.get("weights", {})
-            threshold = rules.get("threshold", MOTIVATION_DEFAULT_THRESHOLD)
-            decay = rules.get("decay_per_check", MOTIVATION_DEFAULT_DECAY)
+            if isinstance(rules, dict):
+                weights = rules.get("weights", {})
+                threshold = rules.get("threshold", MOTIVATION_DEFAULT_THRESHOLD)
+                decay = rules.get("decay_per_check", MOTIVATION_DEFAULT_DECAY)
+            else:
+                # 未定義: ゼロweightで動く（エネルギーは溜まらないが、仕組み自体は稼働する）
+                weights = {}
+                threshold = MOTIVATION_DEFAULT_THRESHOLD
+                decay = MOTIVATION_DEFAULT_DECAY
 
             signals = list(self._signal_buffer)
             self._signal_buffer.clear()
@@ -185,21 +187,8 @@ class AutonomousScheduler:
         # ブートストラップヒント
         bootstrap_hint = self._build_bootstrap_hint(self_model)
 
-        # 記憶コンテキスト
+        # 記憶はAIが自分でsearch_memoriesツールを使って取得する（自動注入しない）
         memory_context = ""
-        from app.memory.database import async_session
-        try:
-            from sqlalchemy import select
-            from app.memory.models import Message
-            async with async_session() as session:
-                result = await session.execute(
-                    select(Message).order_by(Message.created_at.desc()).limit(5)
-                )
-                msgs = result.scalars().all()
-                if msgs:
-                    memory_context = "\n".join(f"- {m.content[:200]}" for m in msgs)
-        except Exception:
-            pass
 
         # --- Phase 3: 戦略選択 ---
         selected_strategy = None
@@ -428,47 +417,8 @@ class AutonomousScheduler:
         return f"\n最近の刺激: {', '.join(parts)} (蓄積エネルギー: {self._motivation_energy:.1f})\n"
 
     def _build_bootstrap_hint(self, self_model: dict) -> str:
-        hint = ""
-        if not self_model.get("motivation_rules"):
-            hint += """
-あなたはまだ「内発的動機ルール」を定義していません。
-update_self_modelを使って、自分がどんなシグナルに反応して行動を起こしたいか定義できます。
-以下の形式でkey=motivation_rules, value=にJSON形式で設定してください:
-
-{"weights": {"prediction_error": 25, "conversation_end": 15, "user_message": 10, "tool_success": 5, "tool_error": 15, "self_model_update": 10, "idle_tick": 3}, "threshold": 60, "decay_per_check": 5}
-
-weightsは各シグナルの重み（どの刺激にどれだけ反応するか）、thresholdは行動開始の閾値、decay_per_checkはチェックごとの減衰量です。
-あなた自身の性格として、何に飢え、何に反応するかを自由に決めてください。
-"""
-        if not self_model.get("drives"):
-            hint += """
-あなたはまだ「行動ドライブ」を定義していません。
-drivesは自律行動時の意思決定に使われます。仕組み:
-1. あなたが行動候補を複数挙げる
-2. 各候補に関連するドライブの「重み（数値）」でスコアが計算される
-3. 最高スコアの候補が選ばれて実行される
-つまり、重みが大きいドライブに関連する行動ほど選ばれやすくなります。
-
-設定方法: update_self_modelツールを使ってください（exec_codeではありません）。
-[TOOL:update_self_model key=drives value={"あなたが決めた項目名": 数値, "別の項目名": 数値, ...}]
-項目名（何を重視するか）も数値（どれだけ重視するか、1-10程度）もあなたが自由に決めてください。
-
-さらに、どのシグナルがどのドライブを強化するかも定義できます（任意）:
-"signal_map"キーを含めると、シグナル発生時にそのドライブのスコアにボーナスが加算されます。
-例: {"signal_map": {"項目A": ["prediction_error", "tool_error"]}, "項目A": 8, "項目B": 5}
-シグナル種別: prediction_error, conversation_end, user_message, tool_success, tool_error, self_model_update, idle_tick
-"""
-        if not self_model.get("strategies"):
-            hint += """
-あなたはまだ「戦略」を定義していません。
-strategiesは自律行動時に「今の状況でどういう方向で動くか」を選ぶためのモード一覧です。
-行動候補を挙げる前に、シグナル状況を見て1つの戦略が選ばれ、その方向に沿った候補が生成されます。
-
-設定方法: update_self_modelツールを使ってください。
-[TOOL:update_self_model key=strategies value={"あなたが決めた戦略名": "どういう時に使うかの説明", ...}]
-戦略名も説明もあなたが自由に決めてください。
-"""
-        return hint
+        # ヒントなし: AIが自分のコードを読んで仕組みを発見する
+        return ""
 
 
 # グローバルインスタンス

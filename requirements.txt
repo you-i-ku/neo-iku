@@ -4,3 +4,4 @@ sqlalchemy
 aiosqlite
 httpx
 duckduckgo-search
+psutil

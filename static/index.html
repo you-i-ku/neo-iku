@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>イク — neo-iku</title>
-    <link rel="stylesheet" href="/static/style.css?v=28">
+    <link rel="stylesheet" href="/static/style.css?v=29">
 </head>
 <body>
     <!-- ステータスバー -->
@@ -90,6 +90,12 @@
                         </div>
                     </div>
 
+                    <!-- 自己モデル -->
+                    <div class="section">
+                        <h3>自己モデル <button id="selfmodel-refresh-btn" class="dev-btn-sm" title="更新">↻</button></h3>
+                        <pre id="selfmodel-display" class="selfmodel-display">読み込み中...</pre>
+                    </div>
+
                     <!-- 記憶検索 -->
                     <div class="section">
                         <h3>記憶</h3>
@@ -119,6 +125,6 @@
         <div id="log-content" class="log-content-full"></div>
     </div>
 
-    <script src="/static/app.js?v=28"></script>
+    <script src="/static/app.js?v=29"></script>
 </body>
 </html>

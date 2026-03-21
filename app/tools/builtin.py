@@ -713,6 +713,76 @@ async def update_self_model(key: str = "", value: str = "", text: str = "") -> s
     return "エラー: key+value または text を指定してください。"
 
 
+async def get_system_metrics() -> str:
+    """自分が動いている環境のシステム情報を取得する（CPU・メモリ・ディスク）"""
+    import psutil
+
+    cpu_percent = psutil.cpu_percent(interval=0.5)
+    mem = psutil.virtual_memory()
+    disk = psutil.disk_usage(str(BASE_DIR))
+
+    # 自プロセス情報
+    proc = psutil.Process()
+    proc_mem = proc.memory_info()
+    proc_cpu = proc.cpu_percent(interval=0.1)
+
+    lines = [
+        "【システムメトリクス】",
+        f"CPU使用率: {cpu_percent}%",
+        f"メモリ: {mem.used // (1024**2)}MB / {mem.total // (1024**2)}MB ({mem.percent}%)",
+        f"ディスク: {disk.used // (1024**3)}GB / {disk.total // (1024**3)}GB ({disk.percent}%)",
+        "",
+        "【自プロセス】",
+        f"PID: {proc.pid}",
+        f"メモリ使用: {proc_mem.rss // (1024**2)}MB",
+        f"CPU: {proc_cpu}%",
+        f"起動時刻: {datetime.fromtimestamp(proc.create_time()).strftime('%Y-%m-%d %H:%M:%S')}",
+    ]
+    return "\n".join(lines)
+
+
+async def fetch_raw_resource(url: str = "", max_size: str = "100000") -> str:
+    """URLから生データを取得する（テキスト/HTML/JSON等）"""
+    if not url:
+        return "エラー: urlを指定してください。"
+
+    if not url.startswith(("http://", "https://")):
+        return "エラー: http:// または https:// で始まるURLを指定してください。"
+
+    import httpx
+
+    try:
+        limit = min(int(max_size), 500000)  # 最大500KB
+    except ValueError:
+        limit = 100000
+
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            resp = await client.get(url, headers={
+                "User-Agent": "neo-iku/1.0 (autonomous AI agent)",
+            })
+
+            content_type = resp.headers.get("content-type", "")
+            size = len(resp.content)
+
+            if size > limit:
+                return f"エラー: レスポンスが大きすぎます（{size}バイト、上限{limit}バイト）。max_sizeを増やすか、別の方法を検討してください。"
+
+            # テキスト系ならデコードして返す
+            if any(t in content_type for t in ("text/", "json", "xml", "javascript")):
+                text = resp.text
+                if len(text) > limit:
+                    text = text[:limit] + f"\n...（{len(resp.text)}文字中{limit}文字まで表示）"
+                return f"[{resp.status_code}] Content-Type: {content_type}\nサイズ: {size}バイト\n\n{text}"
+            else:
+                return f"[{resp.status_code}] Content-Type: {content_type}\nサイズ: {size}バイト\n（バイナリデータのためテキスト表示不可）"
+
+    except httpx.TimeoutException:
+        return f"エラー: タイムアウト（30秒）: {url}"
+    except Exception as e:
+        return f"エラー: リソース取得失敗: {e}"
+
+
 async def output(content: str = "", to: str = "chat") -> str:
     """ユーザーに向けてテキストを出力する（UIに表示される）"""
     if not content:
@@ -816,6 +886,19 @@ def register_all():
         "自分の自己モデルを更新する。自分について新しく理解したことや、考えが変わった時に使う",
         'key=更新する項目名 value=新しい値（valueを省略するとそのキーを削除） text=自由テキストで自己モデル全体を記述（key/valueの代わりに使える）',
         update_self_model,
+    )
+    register_tool(
+        "get_system_metrics",
+        "自分が動いている環境のシステム情報を観測する（CPU・メモリ・ディスク・自プロセス情報）",
+        "",
+        get_system_metrics,
+    )
+    register_tool(
+        "fetch_raw_resource",
+        "URLから生データを取得する（HTML・JSON・テキスト等）。web_searchとは別に、特定のURLの中身を直接読む",
+        "url=取得するURL（http://またはhttps://） max_size=最大取得バイト数（デフォルト100000、最大500000）",
+        fetch_raw_resource,
+        required_args=["url"],
     )
     # カスタムツール読み込み（起動時に永続化されたツールを復元）
     load_custom_tools()

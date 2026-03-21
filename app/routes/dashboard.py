@@ -154,3 +154,10 @@ async def get_dev_settings():
         "concurrent_mode": scheduler._concurrent_mode,
         "motivation_energy": round(scheduler._motivation_energy, 1),
     }
+
+
+@router.get("/dev/self-model")
+async def get_self_model():
+    """self_model.jsonの内容を返す"""
+    from app.tools.builtin import _load_self_model
+    return _load_self_model()
