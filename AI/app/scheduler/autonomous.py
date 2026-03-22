@@ -175,24 +175,18 @@ class AutonomousScheduler:
 
     async def _speak(self):
         from app.pipeline import pipeline, PipelineRequest
-        from app.tools.registry import build_tools_prompt
         from app.tools.builtin import _load_self_model
 
-        # 自己モデル読み込み
+        # === 外側ループ: メタ認知 ===
+
+        # 1. 観測 (Observe): 現在の状態を把握
         self_model = _load_self_model()
-
-        # シグナルコンテキスト
         signal_summary = self._build_signal_summary()
-
-        # ブートストラップヒント
         bootstrap_hint = self._build_bootstrap_hint(self_model)
+        memory_context = ""  # AIが自分でsearch_memoriesツールを使って取得する
 
-        # 記憶はAIが自分でsearch_memoriesツールを使って取得する（自動注入しない）
-        memory_context = ""
-
-        # --- Phase 3: 戦略選択 ---
+        # 2. 方向付け (Orient): 戦略選択
         selected_strategy = None
-        selected_action = None
         try:
             if SCORING_ENABLED and self_model.get("strategies"):
                 selected_strategy = await self._select_strategy(signal_summary, self_model)
@@ -201,8 +195,9 @@ class AutonomousScheduler:
         except Exception as e:
             logger.error(f"戦略選択フォールバック: {e}")
 
-        # --- Phase 1: 候補生成→スコアリング→選択 ---
+        # 3. 決定 (Decide): 候補生成→スコアリング→選択
         action_goal = "自律的に判断して行動する"
+        selected_action = None
         try:
             if SCORING_ENABLED and self_model.get("drives"):
                 candidate_response = await self._generate_candidates(self_model, selected_strategy, signal_summary, memory_context)
@@ -217,7 +212,7 @@ class AutonomousScheduler:
         except Exception as e:
             logger.error(f"候補生成フォールバック: {e}")
 
-        # --- パイプラインにsubmit ---
+        # 4. 行動 (Act): 内側ループ（pipeline）で実行
         request = PipelineRequest(
             source="autonomous",
             goal=action_goal,
@@ -228,21 +223,37 @@ class AutonomousScheduler:
         )
         result = await pipeline.submit(request)
 
-        # --- Phase 2: 振り返り＆原則蒸留 ---
+        # 5. 振り返り (Reflect): 経験からの学び + 自己モデル更新検討
+        await self._reflect(selected_action, result, self_model)
+
+    async def _reflect(self, selected_action: dict | None, result, self_model: dict):
+        """行動後の振り返り: 原則蒸留 + 予測誤差シグナル"""
         try:
-            if selected_action and result.step_history:
-                tool_results_text = "\n".join(
-                    f"{s['tool']}: {s['result_summary']}" for s in result.step_history
-                )
-                if result.last_full_result:
-                    tool_results_text += f"\n\n最後の結果:\n{result.last_full_result[:500]}"
-                if tool_results_text:
-                    principle = await self._reflect_on_action(
-                        selected_action["description"], tool_results_text, self_model
-                    )
-                    if principle:
-                        self._save_principle(principle, self_model)
-                        logger.info(f"原則蒸留: {principle}")
+            if not selected_action or not result.step_history:
+                return
+
+            tool_results_text = "\n".join(
+                f"{s['tool']}: {s['result_summary']}" for s in result.step_history
+            )
+            if result.last_full_result:
+                tool_results_text += f"\n\n最後の結果:\n{result.last_full_result[:500]}"
+            if not tool_results_text:
+                return
+
+            # 予測誤差があった場合、自己モデル更新を検討するシグナルを発火
+            has_prediction_error = any(
+                s.get("result_summary", "").startswith("エラー") for s in result.step_history
+            )
+            if has_prediction_error:
+                self.add_signal("prediction_error", f"action={selected_action['description'][:50]}")
+
+            # 原則蒸留
+            principle = await self._reflect_on_action(
+                selected_action["description"], tool_results_text, self_model
+            )
+            if principle:
+                self._save_principle(principle, self_model)
+                logger.info(f"原則蒸留: {principle}")
         except Exception as e:
             logger.error(f"振り返りフォールバック: {e}")
 

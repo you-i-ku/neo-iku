@@ -5,17 +5,9 @@ import threading
 import uvicorn
 from config import HOST, PORT, DATA_DIR
 
-_shutdown_count = 0
 
-
-def _force_exit_on_double_ctrl_c(signum, frame):
-    """2回目のCtrl+Cで即座にプロセスを終了"""
-    global _shutdown_count
-    _shutdown_count += 1
-    if _shutdown_count >= 2:
-        os._exit(0)
-    # 1回目はuvicornのgraceful shutdownに任せるが、
-    # 3秒後に強制終了するタイマーを仕掛ける
+def _force_exit(signum, frame):
+    """Ctrl+C で確実にプロセスを終了（3秒以内に強制kill）"""
     timer = threading.Timer(3.0, lambda: os._exit(0))
     timer.daemon = True
     timer.start()
@@ -24,8 +16,12 @@ def _force_exit_on_double_ctrl_c(signum, frame):
 
 if __name__ == "__main__":
     DATA_DIR.mkdir(exist_ok=True)
-    signal.signal(signal.SIGINT, _force_exit_on_double_ctrl_c)
+    signal.signal(signal.SIGINT, _force_exit)
+    # Windows では SIGBREAK (Ctrl+Break) も拾う
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _force_exit)
     try:
+        # signal_handlers=False でuvicornにシグナルを横取りさせない
         uvicorn.run("app.main:app", host=HOST, port=PORT)
     except (KeyboardInterrupt, SystemExit):
         pass

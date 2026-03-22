@@ -26,7 +26,8 @@ from app.tools.builtin import (
     PENDING_CREATE_TOOL_MARKER, get_pending_create_tool,
     execute_pending_create_tool, cancel_pending_create_tool,
 )
-from config import BASE_DIR, EXEC_CODE_TIMEOUT
+from app.memory.store import get_conversation_messages
+from config import BASE_DIR, EXEC_CODE_TIMEOUT, CONTEXT_KEEP_ROUNDS, CHAT_HISTORY_MESSAGES
 
 logger = logging.getLogger("iku.pipeline")
 
@@ -200,6 +201,33 @@ class Pipeline:
                 self._emit_signal("user_message", req.goal[:50])
                 logger.debug("ユーザーメッセージDB保存完了")
 
+            # --- マルチターンmessages構築 ---
+            messages = [
+                {"role": "system", "content": system_base or ""},
+            ]
+
+            # Phase 4: 会話継続 — 既存conv_idが渡された場合、過去のやり取りをロード
+            if req.conv_id is not None:
+                try:
+                    async with async_session() as session:
+                        prev_msgs = await get_conversation_messages(session, req.conv_id)
+                    for msg in prev_msgs[-CHAT_HISTORY_MESSAGES:]:
+                        if msg.role in ("user", "assistant"):
+                            clean_content = self._strip_think(msg.content) if msg.role == "assistant" else msg.content
+                            messages.append({"role": msg.role, "content": clean_content})
+                    logger.debug(f"会話履歴ロード: {len(prev_msgs)}件中{min(len(prev_msgs), CHAT_HISTORY_MESSAGES)}件")
+                except Exception as e:
+                    logger.warning(f"会話履歴ロード失敗: {e}")
+
+            # 初回プロンプト（ツール一覧・目標・コンテキスト）
+            initial_prompt = self._build_initial_prompt(
+                action_goal=action_goal,
+                tool_text=tool_text,
+                memory_context=memory_context,
+                signal_summary=req.signal_summary,
+                bootstrap_hint=req.bootstrap_hint,
+            )
+            messages.append({"role": "user", "content": initial_prompt})
 
             for _ in range(_config.TOOL_MAX_ROUNDS + 2):
                 # ユーザー割り込みチェック
@@ -213,7 +241,7 @@ class Pipeline:
                         "args_summary": msg[:80],
                         "result_summary": "ユーザーメッセージ",
                     })
-                    last_full_result = f"ユーザーからの追加メッセージ: {msg}"
+                    messages.append({"role": "user", "content": f"ユーザーからの追加メッセージ: {msg}"})
                     async with async_session() as session:
                         await add_message(session, conv_id, "user", msg)
                         await session.commit()
@@ -222,24 +250,12 @@ class Pipeline:
                         "content": msg,
                     }))
 
-                # 毎回フレッシュなプロンプト
-                step_prompt = self._build_step_prompt(
-                    action_goal=action_goal,
-                    step_history=step_history,
-                    last_full_result=last_full_result,
-                    tool_text=tool_text,
-                    memory_context=memory_context if tool_round == 0 else "",
-                    signal_summary=req.signal_summary if tool_round == 0 else "",
-                    bootstrap_hint=req.bootstrap_hint if tool_round == 0 else "",
-                )
-                messages = [
-                    {"role": "system", "content": system_base or ""},
-                    {"role": "user", "content": step_prompt},
-                ]
+                # コンテキストウィンドウ管理
+                trimmed = self._trim_messages(messages)
 
                 # ストリーミングLLM
-                logger.info(f"LLM呼び出し: round={tool_round} prompt_len={len(step_prompt)}")
-                response = await self._call_llm_streaming(messages, req.source, tool_round)
+                logger.info(f"LLM呼び出し: round={tool_round} messages={len(trimmed)}")
+                response = await self._call_llm_streaming(trimmed, req.source, tool_round)
                 logger.info(f"LLM応答: round={tool_round} response_len={len(response)}")
                 if not response:
                     logger.warning(f"LLM応答が空: round={tool_round} — LM Studioが応答しているか確認してください")
@@ -261,6 +277,9 @@ class Pipeline:
 
                 clean = self._strip_think(response)
 
+                # assistantメッセージをmessagesに追加（thinkタグ除去）
+                messages.append({"role": "assistant", "content": clean})
+
                 # ツール上限チェック
                 tool_calls = []
                 if tool_round < _config.TOOL_MAX_ROUNDS:
@@ -271,13 +290,14 @@ class Pipeline:
                         await add_message(session, conv_id, "assistant", response)
                         await add_message(session, conv_id, "tool", limit_msg)
                         await session.commit()
+                    messages.append({"role": "user", "content": limit_msg})
                     last_full_result = limit_msg
                     step_history.append({"tool": "(上限到達)", "args_summary": "", "result_summary": f"上限{_config.TOOL_MAX_ROUNDS}回到達"})
                     tool_round += 1
                     continue
 
                 if not tool_calls:
-                    # ツールなし → 最終応答
+                    # ツールなし → 最終応答（AIが自律的にループを終了した）
                     if clean:
                         async with async_session() as session:
                             await add_message(session, conv_id, "assistant", response)
@@ -297,7 +317,7 @@ class Pipeline:
                     call_key = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
                     if call_key in seen_tool_calls:
                         logger.info(f"重複ツール呼び出しスキップ: {tool_name}")
-                        all_results.append(f"[ツール結果: {tool_name}]\n同じツールを同じ引数で再度呼び出しました。既に結果は返しています。目的を達成したならoutputで報告してください。")
+                        all_results.append(f"[ツール結果: {tool_name}]\n同じツールを同じ引数で再度呼び出しました。既に結果は返しています。目的を達成したならツールを呼ばずに応答を完了してください。")
                         step_history.append({"tool": tool_name, "args_summary": "", "result_summary": "重複スキップ"})
                         continue
                     seen_tool_calls.add(call_key)
@@ -352,7 +372,7 @@ class Pipeline:
                         await self._broadcast(json.dumps({
                             "type": "output", "content": result, "source": req.source,
                         }))
-                        output_feedback = f"出力完了（{len(result)}文字）"
+                        output_feedback = f"出力完了（{len(result)}文字）。追加の行動がなければツールを呼ばずに応答を完了してください。"
                         if output_count >= 2:
                             output_feedback += f"\n※あなたはこのセッションでoutputツールを{output_count}回呼び出しています。伝えたいことは既に出力済みではありませんか？"
                         all_results.append(f"[ツール結果: {tool_name}]\n{output_feedback}")
@@ -385,6 +405,9 @@ class Pipeline:
 
                 combined_results = "\n\n".join(all_results)
                 last_full_result = combined_results
+
+                # ツール結果をuserロールでmessagesに追加
+                messages.append({"role": "user", "content": combined_results})
 
                 # DB保存（中間）
                 async with async_session() as session:
@@ -680,42 +703,47 @@ class Pipeline:
             return f"{IKU_SYSTEM_PROMPT}\n{sm_text}"
         return sm_text
 
-    def _build_step_prompt(
-        self, action_goal: str, step_history: list[dict],
-        last_full_result: str, tool_text: str,
+    def _build_initial_prompt(
+        self, action_goal: str, tool_text: str,
         memory_context: str = "", signal_summary: str = "",
         bootstrap_hint: str = "",
     ) -> str:
+        """初回ラウンド用のプロンプト構築（マルチターンの起点）"""
         now = datetime.now().strftime('%Y年%m月%d日 %H:%M')
 
-        steps_text = ""
-        if step_history:
-            lines = []
-            for i, s in enumerate(step_history, 1):
-                line = f"{i}. {s['tool']}({s['args_summary']}) → {s['result_summary']}"
-                lines.append(line[:100])
-            steps_text = "\n\nこれまでのステップ:\n" + "\n".join(lines)
-
-        last_result_text = ""
-        if last_full_result:
-            last_result_text = f"\n\n直前のツール結果:\n{last_full_result[:1500]}"
-
-        first_round_ctx = ""
+        ctx_parts = []
         if memory_context:
-            first_round_ctx += f"\n最近の記憶:\n{memory_context[:500]}"
+            ctx_parts.append(f"最近の記憶:\n{memory_context[:500]}")
         if signal_summary:
-            first_round_ctx += f"\n{signal_summary}"
+            ctx_parts.append(signal_summary)
         if bootstrap_hint:
-            first_round_ctx += bootstrap_hint
+            ctx_parts.append(bootstrap_hint)
+        ctx_text = "\n".join(ctx_parts)
 
         return f"""今は{now}です。
 
 行動目標: {action_goal}
-{steps_text}{last_result_text}{first_round_ctx}
+{f'{chr(10)}{ctx_text}' if ctx_text else ''}
 
-{tool_text}
+{tool_text}"""
 
-次のステップを実行するか、outputで結果を報告してください。"""
+    def _trim_messages(self, messages: list[dict]) -> list[dict]:
+        """コンテキストウィンドウ管理: system + 初回promptは常に保持、中間を圧縮"""
+        # messages[0] = system, messages[1] = 初回prompt（ツール一覧含む）
+        # 以降はassistant/userのペアが続く
+        if len(messages) <= 2 + CONTEXT_KEEP_ROUNDS * 2:
+            return messages  # 圧縮不要
+
+        head = messages[:2]  # system + 初回prompt
+        tail_count = CONTEXT_KEEP_ROUNDS * 2  # assistant + user のペア数
+        tail = messages[-tail_count:]
+        middle_count = len(messages) - 2 - tail_count
+        skipped_rounds = middle_count // 2
+
+        if skipped_rounds > 0:
+            summary = {"role": "user", "content": f"[以前のやり取り: {skipped_rounds}ステップ省略]"}
+            return head + [summary] + tail
+        return messages
 
     # --- ユーティリティ ---
 

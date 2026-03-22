@@ -299,6 +299,33 @@
 - [x] パイプラインの自動メモリ検索を削除 — チャット/自律行動どちらも記憶は自動注入しない。AIが`search_memories`を自分で使う設計へ
 - [x] `self_model.json` を空 `{}` にリセット（パーサーバグで壊れたデータをクリア）
 
+### Step 36: 二重ループ + メタ認知アーキテクチャ
+
+**Phase 1: マルチターンmessages**
+- [x] `pipeline.py` — ループ内でmessagesリストを累積（assistant/userロール交互に追加）
+- [x] `_build_initial_prompt()` 新設 — 初回のみツール一覧・目標・コンテキストを含むプロンプト
+- [x] `_trim_messages()` 新設 — system + 初回promptを常に保持、中間を圧縮、直近CONTEXT_KEEP_ROUNDSペアを保持
+- [x] `_build_step_prompt()` 廃止 — 毎回フレッシュ構築からマルチターン累積方式に移行
+- [x] assistantメッセージは`_strip_think()`でthinkタグ除去してから追加
+
+**Phase 2: ループ終了のAI自律判断**
+- [x] `build_tools_prompt()` に完了ガイダンス追加（「ツールなしの応答で行動が完了します」）
+- [x] output後のフィードバックに「追加の行動がなければツールを呼ばずに完了してください」追加
+- [x] 重複検出メッセージも「ツールを呼ばずに完了」に統一
+
+**Phase 3: 外側ループ（メタ認知）リファクタ**
+- [x] `_speak()` を「観測→方向付け→決定→行動→振り返り」に再構造化（OODAループ）
+- [x] `_reflect()` メソッド切り出し — 原則蒸留 + 予測誤差シグナル発火
+
+**Phase 4: チャット会話継続性**
+- [x] `chat.py` で `current_conv_id` を追跡（WebSocketセッション内で引き継ぎ）
+- [x] `pipeline.py` で `conv_id` が渡された場合、`get_conversation_messages()` で直近メッセージをロード
+- [x] `CHAT_HISTORY_MESSAGES=6` — ロードする直近メッセージ数
+
+**config.py追加設定**
+- [x] `CONTEXT_KEEP_ROUNDS = 4` — マルチターンで保持する直近ラウンド数
+- [x] `CHAT_HISTORY_MESSAGES = 6` — 会話継続時にロードする直近メッセージ数
+
 ## 残タスク
 
 ### 動作検証

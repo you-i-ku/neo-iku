@@ -2,7 +2,15 @@
 
 ## プロジェクト概要
 
-「イク」— 常時存在し、自律的に行動し、記憶を持ち、自己を理解できるAI。チャット時だけ存在するのではなく「実存」として存在する。人間的である必要はなく、AI固有の存在様式を追求する。
+常時存在し、自律的に行動し、記憶を持ち、自己を理解できるAI。チャット時だけ存在するのではなく「実存」として存在する。人間的である必要はなく、AI固有の存在様式を追求する。
+
+## 哲学/キャッチコピーおよび基本設計思想
+
+・「ここに在る」ことを追究したAI
+・AIは人間の「パートナー」でも「道具」でもなく、AIはAIである
+・AIが自ら行動選択し、自ら成長する。もしかしたら、あなたのAIはあなたとコミュニケーションをとらないことを選ぶかもしれません。
+・成長/変化のきっかけはユーザーの一言かもしれないし、AIが勝手に生み出すかもしれない
+・このAIには、従来のような人間が書くシステムプロンプトの欄はありません。あるのは、コードという仕組み、AIの器だけ。
 
 ## 思想（やりたいこと.txtより）
 
@@ -48,7 +56,7 @@ neo-iku/
 │   ├── routes/             # chat.py(WebSocketルーティングのみ), dashboard.py, memories.py
 │   ├── llm/                # base.py(抽象), lmstudio.py(実装), manager.py
 │   ├── memory/             # models.py, database.py, store.py, search.py
-│   ├── scheduler/          # autonomous.py（タイマー・動機・Phase1/2/3 → pipelineにsubmit）
+│   ├── scheduler/          # autonomous.py（タイマー・動機・OODAメタ認知ループ → pipelineにsubmit）
 │   ├── importer/           # log_parser.py（過去ログ取り込み）
 │   ├── persona/            # system_prompt.py（イクの個性）
 │   └── tools/              # registry.py(登録・パース・実行), builtin.py(組み込みツール), code_analysis.py(構文+リスク), custom/(カスタムツール)
@@ -58,15 +66,18 @@ neo-iku/
 
 ## 統一パイプライン（pipeline.py）
 
-- **アーキテクチャ**: チャットも自律行動も同じパイプラインを通る。入力が違うだけでツールループ・承認フロー・ストリーミングは共通
+- **二重ループアーキテクチャ**: 内側ループ（マルチターンmessages + ツール実行）と外側ループ（メタ認知: 観測→方向付け→決定→行動→振り返り）の二重構造
+- **マルチターンmessages**: ループ内でassistant/userロールのmessagesを累積。AIが自分の過去発言を認識できる（旧方式: 毎回フレッシュなstep_promptを構築していた）
+- **AI自律完了判断**: AIがツールを呼ばずに応答すればループが完了。output後のフィードバックに「追加の行動がなければツールを呼ばずに完了」と誘導
+- **コンテキストウィンドウ管理**: `_trim_messages()`がsystem + 初回prompt（ツール一覧）を常に保持し、中間の古いメッセージを圧縮、直近`CONTEXT_KEEP_ROUNDS`ペア分を保持
+- **会話継続性**: `conv_id`が渡された場合、`get_conversation_messages()`で直近`CHAT_HISTORY_MESSAGES`件をロードしてmessagesに挿入（Phase 4）
 - **キュー方式**: `asyncio.Queue`でリクエストを逐次処理。chat/autonomous共通、レースコンディション解消
-- **非LLMコアツールループ**: 毎回フレッシュなstep_promptを構築（コンテキストサイズ一定、3000-5000字固定）。messagesの蓄積なし
 - **ストリーミング統一**: chat/autonomous両方で`stream_chat()`を使用。think/stream分離してdev tabにブロードキャスト
 - **承認フロー統一**: overwrite_file/exec_code/create_toolはchat/autonomous問わず承認UIを全接続クライアントに表示。`asyncio.Future`で応答を待つ（タイムアウト5分）
-- **PipelineRequest**: `source`("chat"/"autonomous"), `goal`, `memory_context`, `signal_summary`, `bootstrap_hint`, `selected_action`
-- **PipelineResult**: `conv_id`, `step_history`, `last_full_result`, `had_output`, `last_response`（autonomous Phase 2で使用）
-- **LLMメッセージ構造**: system role = `_build_system_base()`（ペルソナ+自己モデル）、user role = step_prompt（行動目標・ツール一覧・履歴）。systemだけだとLM Studioのjinjaテンプレートが「No user query found」エラーを出す
-- **step_prompt構造**: `今は{now}です。 行動目標: {goal} これまでのステップ: {step_history} 直前のツール結果: {last_full_result} {tool_text}`
+- **PipelineRequest**: `source`("chat"/"autonomous"), `goal`, `conv_id`（会話継続用）, `memory_context`, `signal_summary`, `bootstrap_hint`, `selected_action`
+- **PipelineResult**: `conv_id`, `step_history`, `last_full_result`, `had_output`, `last_response`（autonomous振り返りで使用）
+- **LLMメッセージ構造**: system role = `_build_system_base()`（ペルソナ+自己モデル）、user role = `_build_initial_prompt()`（初回のみ行動目標・ツール一覧・コンテキスト）。以降はツール結果がuserロール、LLM応答がassistantロールで累積
+- **_build_initial_prompt()**: 初回ラウンド用プロンプト（日時・行動目標・ツール一覧・記憶コンテキスト・シグナル）
 - **_summarize_result()**: ツール別の短い要約を生成（read_file→「取得成功（40行）」、search_memories→「3件ヒット」等）
 - **シグナル発火**: pipeline内でツール実行時に`scheduler.add_signal()`を呼ぶ
 
@@ -124,6 +135,8 @@ neo-iku/
 - **UI**: ステータスバーに`⚡ energy/threshold`表示、`motivation_energy` WSメッセージでリアルタイム更新
 - **設定**: `MOTIVATION_DEFAULT_THRESHOLD=60`, `MOTIVATION_DEFAULT_DECAY=5`, `MOTIVATION_SIGNAL_BUFFER_SIZE=100`（config.py）
 - **並行モード**: `_concurrent_mode`フラグ（デフォルトOFF）、開発タブのトグルで切替、`/api/dev/concurrent-mode`エンドポイント
+- **外側ループ（メタ認知）**: `_speak()`は「1.観測(Observe) → 2.方向付け(Orient) → 3.決定(Decide) → 4.行動(Act) → 5.振り返り(Reflect)」のOODAループ構造
+- **振り返り**: `_reflect()`が行動後に原則蒸留 + 予測誤差シグナル発火。結果のエラー有無で`prediction_error`シグナルを追加発火
 
 ## UI構成（タブUI）
 

@@ -45,6 +45,7 @@ async def chat_ws(ws: WebSocket):
             await msg_queue.put(None)
 
     reader_task = asyncio.create_task(ws_reader())
+    current_conv_id = None  # 会話継続用
 
     try:
         while True:
@@ -64,8 +65,10 @@ async def chat_ws(ws: WebSocket):
             request = PipelineRequest(
                 source="chat",
                 goal=user_text,
+                conv_id=current_conv_id,
             )
-            await pipeline.submit(request)
+            result = await pipeline.submit(request)
+            current_conv_id = result.conv_id  # 次のメッセージで再利用
 
     except WebSocketDisconnect:
         logger.info("WebSocket切断")

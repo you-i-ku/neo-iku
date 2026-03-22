@@ -45,6 +45,8 @@ def build_tools_prompt() -> str:
     lines.append("- [TOOL:...]は必ず応答テキスト内に書いてください（thinkの外に）。")
     lines.append("- ユーザーに何か伝えたい時は必ず [TOOL:output content=...] を使ってください。outputツールを使わないとユーザーには何も表示されません。")
     lines.append("- outputを使わず行動だけすることもできます（沈黙も選択肢）。")
+    lines.append("- 目的を達成したら、ツールを呼び出さずに応答してください。ツールなしの応答で行動が完了します。")
+    lines.append("- outputで報告した後、追加の行動が不要ならそのまま完了してOKです。")
     lines.append("- 【必須】全てのツール呼び出しに expect=... を付けてください。実行前に結果を予測する習慣です。")
     lines.append("  予測がない・スキップしたい場合は expect=skip と書いてください。")
     lines.append('  例（予測あり）: [TOOL:read_file path=config.py expect=ポート番号とタイムアウトが書いてあるはず]')
