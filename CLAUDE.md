@@ -74,21 +74,25 @@ neo-iku/
 - **キュー方式**: `asyncio.Queue`でリクエストを逐次処理。chat/autonomous共通、レースコンディション解消
 - **ストリーミング統一**: chat/autonomous両方で`stream_chat()`を使用。think/stream分離してdev tabにブロードキャスト
 - **承認フロー統一**: overwrite_file/exec_code/create_toolはchat/autonomous問わず承認UIを全接続クライアントに表示。`asyncio.Future`で応答を待つ（タイムアウト5分）
+- **会話ソース記録**: `create_conversation()`に`source`引数（"chat"/"autonomous"）。`conversations.source`カラムで自律行動とチャットを区別（自律度レポートで使用）
 - **PipelineRequest**: `source`("chat"/"autonomous"), `goal`, `conv_id`（会話継続用）, `memory_context`, `signal_summary`, `bootstrap_hint`, `selected_action`
 - **PipelineResult**: `conv_id`, `step_history`, `last_full_result`, `had_output`, `last_response`（autonomous振り返りで使用）
-- **LLMメッセージ構造**: system role = `_build_system_base()`（ペルソナ+自己モデル）、user role = `_build_initial_prompt()`（初回のみ行動目標・ツール一覧・コンテキスト）。以降はツール結果がuserロール、LLM応答がassistantロールで累積
-- **_build_initial_prompt()**: 初回ラウンド用プロンプト（日時・行動目標・ツール一覧・記憶コンテキスト・シグナル）
+- **LLMメッセージ構造**: system role = `_build_system_base()`（ペルソナ+自己モデル）、user role = `_build_initial_prompt()`（初回のみ行動目標・ツール一覧・コンテキスト）。以降はツール結果・上限通知がsystemロール、LLM応答がassistantロールで累積。ユーザー割り込みのみuserロール
+- **_build_initial_prompt()**: 初回ラウンド用プロンプト（日時・行動目標（空なら省略）・ツール一覧・記憶コンテキスト・シグナル）
 - **_summarize_result()**: ツール別の短い要約を生成（read_file→「取得成功（40行）」、search_memories→「3件ヒット」等）
 - **シグナル発火**: pipeline内でツール実行時に`scheduler.add_signal()`を呼ぶ
+- **LLMループ検出**: `_call_llm_streaming()`が`(response, repeat_detected)`を返す。ループ検出時は繰り返し部分を`_trim_repeated()`で切り落とし、「同じ内容の繰り返しに入ったため中断しました」とフィードバックして次ラウンドへ。検出は`LMStudioProvider._detect_repeat()`（20チャンクごと、window=200文字、パターン長5〜500文字）
 
 ## ツールフレームワーク
 
 - AIはテキストマーカー `[TOOL:ツール名 引数=値]` でツールを呼び出す（function calling非依存、小さいモデルでも動く）
-- 4形式対応: 単一行 `[TOOL:name args]`、複数行クォート `[TOOL:name content="..."]`、ブロック `[TOOL:name]\n内容\n[/TOOL]`、フォールバック `[TOOL:name]\n内容`（`[/TOOL]`閉じ忘れ対応）
-- `_TOOL_PATTERN`はDOTALLモード + `(?!\[TOOL:)`負先読みでツール境界越えマッチを防止
+- **レジストリベース動的検出**: `_tools.keys()`から検出パターンを自動生成（カスタムツール追加にも自動対応）。ツール登録時にキャッシュ自動失効
+- 単一行・複数行クォート・ブロック・引数の次行記述をすべて統一処理。ブロック内テキストが`key="value"`形式なら引数として解析、そうでなければcontentとして扱う
+- `[/TOOL]`のバリアント（`[/TOOL:name]`等）は特別扱い不要 — 登録済みツール名のみマッチするため自然にスキップされる
 - ツールはモード問わず有効（イクモードはペルソナのレイヤー、ツールはAI自体の能力）
-- 組み込みツール: output, read_file, search_files, create_file, overwrite_file, list_files, search_memories, write_diary, exec_code, search_action_log, web_search, create_tool, read_self_model, update_self_model, get_system_metrics, fetch_raw_resource
+- 組み込みツール: output, non_response, read_file, search_files, create_file, overwrite_file, list_files, search_memories, write_diary, exec_code, search_action_log, web_search, create_tool, read_self_model, update_self_model, get_system_metrics, fetch_raw_resource
 - output: チャット欄にテキストを表示する唯一の経路。`[TOOL:output content=テキスト]`またはブロック形式`[TOOL:output]\nテキスト\n[/TOOL]`で使用
+- non_response: 何も行動しないことを明示的に選択する（沈黙・待機）。呼び出されるとツールループを即終了する
 - `app/tools/registry.py` の `register_tool()` で新ツールを追加可能
 - ツール実行ループ: 最大`TOOL_MAX_ROUNDS`回（デフォルト8）まで連続呼び出し可能（config.pyで管理、UIから動的変更可）
 - 1レスポンス内の複数ツール呼び出しは1ラウンドとしてカウント（`parse_tool_calls()`で全マッチを検出）
@@ -110,8 +114,10 @@ neo-iku/
 - ツール結果表示: details/summaryで折りたたみ可能（プレビュー80文字）
 - outputツールアーキテクチャ: AI出力は全て`output`ツール経由。チャットタブにはoutput結果+ツール通知のみ表示。thinking/streamは開発者タブに表示
 - ツールループ安定化: 同一ツール+同一引数の重複呼び出しを検出→実行せずフィードバック。output連続呼び出しは2回目以降に気づきメッセージを添える（ブロックはしない）
+- **ループ終了条件**: ツールを一切呼ばない応答 or `non_response`呼び出し。non_responseはDBに`[non_response: 行動完了を選択]`として記録される
 - JSON引数パーサー: `_extract_json_args()`がバランスカウンティングで`{...}`や`[...]`を含む引数値を正しく抽出（旧来の正規表現は空白で切れるバグがあった）
-- outputブロック注意: `[TOOL:output]...[/TOOL]`の中に他のツール呼び出し`[TOOL:...]`を入れてはいけない（負先読みでブロックマッチが失敗するため）。プロンプトにも注記済み
+- ツールプロンプト: カテゴリ別表示（ファイル/記憶/自己モデル/外部/実行・拡張/システム/出力/待機）。カテゴリラベルは `# カテゴリ名` 形式（`[カテゴリ名]`だとツールマーカーと混同するため）。未分類ツール（カスタムツール等）は「その他」に自動表示
+- 「必ずいずれかのツールを呼び出してください。ツールを呼ばないテキストはどこにも届きません」と明示（outputかnon_responseを促す）
 
 ## メタ認知フレームワーク
 
@@ -121,12 +127,13 @@ neo-iku/
 - **自己モデルのプロンプト注入**: `pipeline.py`の`_build_system_base()`で、現在の自己モデル内容をシステムプロンプトに自動注入（モード問わず）
 - **設計思想**: 予測誤差が自己モデル更新の自然なきっかけになる（強制更新ではない）。ルール（構造）は定義するが作為（知識注入）はしない
 - **自己モデルの自律性**: `data/self_model.json`は初期状態`{}`。motivation_rules/drives/strategies等の構造はAIが自分のコードを読んで発見・定義する。人間が初期値を仕込まない
+- **自己モデルスナップショット**: `_save_self_model()`呼び出し時にfire-and-forgetで`self_model_snapshots`テーブルにJSON全体+変更キーを記録。自己進化の計測基盤
 
 ## 内発的動機システム
 
 - **シグナルバッファ**: `AutonomousScheduler._signal_buffer`（deque, maxlen=100）にI/Oイベントを蓄積。`add_signal(type, detail)`で追加
-- **シグナル種別**: `prediction_error`, `conversation_end`, `user_message`, `tool_success`, `tool_error`, `self_model_update`, `idle_tick`
-- **シグナル発生元**: `pipeline.py`（user_message, tool_success/error, prediction_error）、`chat.py`（conversation_end）、`autonomous.py`（idle_tick）、`builtin.py`（self_model_update）
+- **シグナル種別**: `prediction_made`, `conversation_end`, `user_message`, `tool_success`, `tool_error`, `self_model_update`, `idle_tick`
+- **シグナル発生元**: `pipeline.py`（user_message, tool_success/error, prediction_made）、`chat.py`（conversation_end）、`autonomous.py`（idle_tick）、`builtin.py`（self_model_update）
 - **動機チェック**: `_check_motivation()`がself_model.jsonの`motivation_rules`を読み、weightsでエネルギー計算、decay適用、閾値判定。LLM呼び出しなし
 - **ルールはAIが定義**: `update_self_model`でkey=motivation_rules, value=JSON文字列。自動パースされてdict/listとして保存
 - **ブートストラップ**: motivation_rules未定義時、weightsをゼロとして動作（エネルギーは溜まらないが仕組みは稼働）。ヒント注入なし — AIが自分のコードを読んで発見する
@@ -136,18 +143,21 @@ neo-iku/
 - **設定**: `MOTIVATION_DEFAULT_THRESHOLD=60`, `MOTIVATION_DEFAULT_DECAY=5`, `MOTIVATION_SIGNAL_BUFFER_SIZE=100`（config.py）
 - **並行モード**: `_concurrent_mode`フラグ（デフォルトOFF）、開発タブのトグルで切替、`/api/dev/concurrent-mode`エンドポイント
 - **外側ループ（メタ認知）**: `_speak()`は「1.観測(Observe) → 2.方向付け(Orient) → 3.決定(Decide) → 4.行動(Act) → 5.振り返り(Reflect)」のOODAループ構造
-- **振り返り**: `_reflect()`が行動後に原則蒸留 + 予測誤差シグナル発火。結果のエラー有無で`prediction_error`シグナルを追加発火
+- **振り返り**: `_reflect()`が行動後に原則蒸留。ツール実行エラーがあれば`tool_error`シグナルを発火。`selected_action`がない場合も`action_goal`をフォールバックとして使用（self_modelが空でも振り返りが動作する）
+- **自律行動目標**: `action_goal`のデフォルトは空文字列。`drives`定義済みなら候補選択で具体的な目標に上書き。`_build_initial_prompt()`は`action_goal`が空なら`行動目標:`行を省略する（時刻・シグナル・ツール一覧のみ渡す非作為設計）
 
 ## UI構成（タブUI）
 
-- 3タブ構成: チャット / 開発者 / ログ
+- 4タブ構成: チャット / 開発者 / ログ / 自律度
 - チャットタブ: outputツール出力 + ツール通知（コンパクト表示）
 - 開発者タブ: 左=思考ログ（セッション→ラウンド→think+stream+ツール詳細）、右=設定・記憶
 - ログタブ: サーバーログ（ALL/DEBUG/INFO/WARNING/ERRORフィルタ）
 - 開発者タブのセッション: 入力反応/自律行動ごとに分離（ソース別devState管理: chat/autonomous独立）
 - 開発者タブのラウンド: `<details>`折りたたみ、think+streamマージ表示（色で区別: thinkは暗灰色、streamは明灰色）
-- 3段階スクロール: 思考ログ全体 → セッション内 → ラウンド内（※UIテスト未完了）
+- セッション・ラウンドのサイズは固定（max-height制約なし）、スクロールは思考ログ全体（`.thought-log`）が担当
+- ログタブ: WSLogHandlerにバッファ（deque, maxlen=500）を持ち、接続時に履歴を一括送信
 - WebSocketメッセージタイプ: `dev_session_start`, `dev_think`, `dev_stream`, `dev_tool_call`, `dev_tool_result` で開発者タブに送信
+- 自律度タブ: `/api/autonomy-report`からJSON取得→7指標カードグリッド+スコアカードで表示。期間選択（from/to）+ 集計ボタン
 
 ## 記憶検索
 
@@ -173,3 +183,5 @@ neo-iku/
 - やりたいこと.txtのビジョンは最終ゴール。MVPで全部実現する必要はないが、拡張の余地は常に残す
 - 過去ログはDBにインポート済み（840件）。ファイルは削除済み。再インポートの必要なし
 - LM Studioに送るmessagesには必ずuser roleを含めること。system roleだけだとモデルのjinjaテンプレートがエラーを返す（「No user query found in messages」）
+- function calling（OpenAI互換tools API）はLM Studio + 蒸留モデルでは動かない。モデルがtool_callsフィールドを使わずテキストで応答する。テキストマーカー `[TOOL:...]` 方式がこの環境では最も確実
+- ツールプロンプトで `[...]` 角括弧はツールマーカーと混同されるので使わない（カテゴリラベル等）

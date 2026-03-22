@@ -1068,6 +1068,137 @@ async function loadSelfModel() {
 
 selfmodelRefreshBtn.addEventListener("click", loadSelfModel);
 
+// --- 自律度レポートタブ ---
+
+const reportContent = document.getElementById("report-content");
+const reportLoadBtn = document.getElementById("report-load-btn");
+const reportFrom = document.getElementById("report-from");
+const reportTo = document.getElementById("report-to");
+
+reportLoadBtn.addEventListener("click", loadReport);
+
+async function loadReport() {
+    reportLoadBtn.disabled = true;
+    reportLoadBtn.textContent = "集計中...";
+    reportContent.innerHTML = '<div class="report-loading">集計中...</div>';
+    try {
+        const f = reportFrom.value || "2020-01-01";
+        const t = reportTo.value || "2030-01-01";
+        const resp = await fetch(`/api/autonomy-report?from=${f}&to=${t}`);
+        const data = await resp.json();
+        renderReport(data);
+    } catch (e) {
+        reportContent.innerHTML = `<div class="report-error">取得エラー: ${escapeHtml(e.message)}</div>`;
+    } finally {
+        reportLoadBtn.textContent = "集計";
+        reportLoadBtn.disabled = false;
+    }
+}
+
+function renderReport(data) {
+    const s = data.summary;
+    const m = data.metrics;
+
+    const levelColors = {
+        operator: "#6e7681", collaborator: "#8b949e", consultant: "#d29922",
+        approver: "#3fb950", observer: "#58a6ff",
+    };
+    const levelLabels = {
+        operator: "Operator（人間主導）", collaborator: "Collaborator（協働）",
+        consultant: "Consultant（AI提案）", approver: "Approver（AI主導）",
+        observer: "Observer（完全自律）",
+    };
+
+    const scoreColor = s.autonomy_score >= 0.6 ? "#3fb950" : s.autonomy_score >= 0.3 ? "#d29922" : "#8b949e";
+    const barWidth = Math.round(s.autonomy_score * 100);
+
+    let html = `
+        <div class="report-summary">
+            <div class="report-score-card">
+                <div class="report-score" style="color:${scoreColor}">${s.autonomy_score.toFixed(3)}</div>
+                <div class="report-level" style="color:${levelColors[s.autonomy_level] || '#8b949e'}">
+                    ${levelLabels[s.autonomy_level] || s.autonomy_level}
+                </div>
+                <div class="report-score-bar"><div class="report-score-fill" style="width:${barWidth}%;background:${scoreColor}"></div></div>
+                <div class="report-total">総行動数: ${s.total_actions}</div>
+            </div>
+        </div>
+        <div class="report-grid">
+    `;
+
+    // 1. Autonomy Ratio
+    const ar = m.autonomy_ratio;
+    const arPct = ar.ratio > 0 ? Math.round(ar.ratio * 100) : 0;
+    html += renderMetricCard("自律性比率", `${arPct}%`, `
+        <div class="report-bar-pair">
+            <div class="report-bar-row"><span>自律</span><div class="report-bar"><div class="report-bar-fill auto" style="width:${ar.autonomous + ar.chat > 0 ? Math.round(ar.autonomous / (ar.autonomous + ar.chat) * 100) : 0}%"></div></div><span>${ar.autonomous}</span></div>
+            <div class="report-bar-row"><span>チャット</span><div class="report-bar"><div class="report-bar-fill chat" style="width:${ar.autonomous + ar.chat > 0 ? Math.round(ar.chat / (ar.autonomous + ar.chat) * 100) : 0}%"></div></div><span>${ar.chat}</span></div>
+        </div>
+    `);
+
+    // 2. Tool Diversity
+    const td = m.tool_diversity;
+    const normEnt = td.max_entropy > 0 ? (td.entropy / td.max_entropy * 100).toFixed(0) : 0;
+    const topTools = Object.entries(td.distribution).sort((a, b) => b[1] - a[1]).slice(0, 8);
+    const maxCount = topTools.length > 0 ? topTools[0][1] : 1;
+    let toolBars = topTools.map(([name, count]) =>
+        `<div class="report-tool-row"><span class="report-tool-name">${escapeHtml(name)}</span><div class="report-bar"><div class="report-bar-fill tool" style="width:${Math.round(count / maxCount * 100)}%"></div></div><span>${count}</span></div>`
+    ).join("");
+    html += renderMetricCard("ツール多様性", `H=${td.entropy.toFixed(2)} (${normEnt}%)`, toolBars);
+
+    // 3. Self-Evolution
+    const se = m.self_evolution;
+    let evoBars = Object.entries(se.changes_by_key).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([key, count]) =>
+        `<div class="report-tool-row"><span class="report-tool-name">${escapeHtml(key)}</span><span>${count}</span></div>`
+    ).join("");
+    html += renderMetricCard("自己進化", `${se.total_changes}回 / ${se.unique_keys}キー`, evoBars || '<div class="report-metric-empty">データなし</div>');
+
+    // 4. Error Recovery
+    const er = m.error_recovery;
+    const rrPct = Math.round(er.recovery_rate * 100);
+    html += renderMetricCard("エラー回復", `${rrPct}%`, `
+        <div class="report-stat-row"><span>総エラー</span><span>${er.total_errors}</span></div>
+        <div class="report-stat-row"><span>回復</span><span>${er.recovered}</span></div>
+    `);
+
+    // 5. Metacognitive Accuracy
+    const mc = m.metacognitive_accuracy;
+    const mcPct = Math.round(mc.success_rate * 100);
+    html += renderMetricCard("メタ認知精度", `${mcPct}%`, `
+        <div class="report-stat-row"><span>予測回数</span><span>${mc.predictions_made}</span></div>
+        <div class="report-stat-row"><span>成功率</span><span>${mcPct}%</span></div>
+    `);
+
+    // 6. Memory Utilization
+    const mu = m.memory_utilization;
+    html += renderMetricCard("記憶活用", `${mu.search_count + mu.write_count}回`, `
+        <div class="report-stat-row"><span>検索</span><span>${mu.search_count}</span></div>
+        <div class="report-stat-row"><span>日記</span><span>${mu.write_count}</span></div>
+    `);
+
+    // 7. Principle Accumulation
+    const pa = m.principle_accumulation;
+    html += renderMetricCard("原則蒸留", `${pa.current_principles}個`, `
+        <div class="report-stat-row"><span>蒸留回数</span><span>${pa.distillation_count}</span></div>
+        <div class="report-stat-row"><span>現在の原則数</span><span>${pa.current_principles}</span></div>
+    `);
+
+    html += `</div>`;
+    reportContent.innerHTML = html;
+}
+
+function renderMetricCard(title, value, bodyHtml) {
+    return `
+        <div class="report-card">
+            <div class="report-card-header">
+                <span class="report-card-title">${title}</span>
+                <span class="report-card-value">${value}</span>
+            </div>
+            <div class="report-card-body">${bodyHtml}</div>
+        </div>
+    `;
+}
+
 // --- 初期化 ---
 
 connect();

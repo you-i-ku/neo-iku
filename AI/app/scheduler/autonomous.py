@@ -180,8 +180,10 @@ class AutonomousScheduler:
         # === 外側ループ: メタ認知 ===
 
         # 1. 観測 (Observe): 現在の状態を把握
+        # シグナルバッファのスナップショットを取る（_check_motivationがクリアしても影響されない）
+        signal_snapshot = list(self._signal_buffer)
         self_model = _load_self_model()
-        signal_summary = self._build_signal_summary()
+        signal_summary = self._build_signal_summary(signal_snapshot)
         bootstrap_hint = self._build_bootstrap_hint(self_model)
         memory_context = ""  # AIが自分でsearch_memoriesツールを使って取得する
 
@@ -196,7 +198,7 @@ class AutonomousScheduler:
             logger.error(f"戦略選択フォールバック: {e}")
 
         # 3. 決定 (Decide): 候補生成→スコアリング→選択
-        action_goal = "自律的に判断して行動する"
+        action_goal = ""
         selected_action = None
         try:
             if SCORING_ENABLED and self_model.get("drives"):
@@ -204,7 +206,7 @@ class AutonomousScheduler:
                 if candidate_response:
                     candidates = self._parse_candidates(candidate_response, self_model.get("drives", {}))
                     if candidates:
-                        best = self._score_candidates(candidates, self_model)
+                        best = self._score_candidates(candidates, self_model, signal_snapshot)
                         if best:
                             selected_action = best
                             action_goal = best["description"]
@@ -224,32 +226,40 @@ class AutonomousScheduler:
         result = await pipeline.submit(request)
 
         # 5. 振り返り (Reflect): 経験からの学び + 自己モデル更新検討
-        await self._reflect(selected_action, result, self_model)
+        await self._reflect(selected_action, result, self_model, action_goal)
 
-    async def _reflect(self, selected_action: dict | None, result, self_model: dict):
+    async def _reflect(self, selected_action: dict | None, result, self_model: dict, action_goal: str = ""):
         """行動後の振り返り: 原則蒸留 + 予測誤差シグナル"""
         try:
-            if not selected_action or not result.step_history:
+            if not result.step_history:
                 return
 
-            tool_results_text = "\n".join(
-                f"{s['tool']}: {s['result_summary']}" for s in result.step_history
-            )
+            action_description = selected_action["description"] if selected_action else action_goal
+            if not action_description:
+                return
+
+            lines = []
+            for s in result.step_history:
+                line = f"{s['tool']}: {s['result_summary']}"
+                if s.get('expected'):
+                    line += f"\n  予測: {s['expected']}"
+                lines.append(line)
+            tool_results_text = "\n".join(lines)
             if result.last_full_result:
                 tool_results_text += f"\n\n最後の結果:\n{result.last_full_result[:500]}"
             if not tool_results_text:
                 return
 
-            # 予測誤差があった場合、自己モデル更新を検討するシグナルを発火
-            has_prediction_error = any(
+            # ツール実行エラーがあった場合のシグナル
+            has_error = any(
                 s.get("result_summary", "").startswith("エラー") for s in result.step_history
             )
-            if has_prediction_error:
-                self.add_signal("prediction_error", f"action={selected_action['description'][:50]}")
+            if has_error:
+                self.add_signal("tool_error", f"action={action_description[:50]}")
 
             # 原則蒸留
             principle = await self._reflect_on_action(
-                selected_action["description"], tool_results_text, self_model
+                action_description, tool_results_text, self_model
             )
             if principle:
                 self._save_principle(principle, self_model)
@@ -286,7 +296,10 @@ class AutonomousScheduler:
         try:
             from app.llm.manager import llm_manager
             llm = llm_manager.get()
-            return await llm.chat([{"role": "system", "content": prompt}])
+            return await llm.chat([
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": "上の指示に従って候補を出力してください。"},
+            ])
         except Exception as e:
             logger.error(f"候補生成エラー: {e}")
             return None
@@ -300,12 +313,12 @@ class AutonomousScheduler:
         candidates = [{"description": d.strip(), "drive": dr.strip()} for d, dr in matches]
         return candidates if candidates else None
 
-    def _score_candidates(self, candidates: list[dict], self_model: dict) -> dict | None:
+    def _score_candidates(self, candidates: list[dict], self_model: dict, signals: list[dict] | None = None) -> dict | None:
         drives = self_model.get("drives", {})
         signal_map = drives.get("signal_map", {})
 
         sig_counts: dict[str, int] = {}
-        for sig in self._signal_buffer:
+        for sig in (signals or self._signal_buffer):
             t = sig["type"]
             sig_counts[t] = sig_counts.get(t, 0) + 1
 
@@ -355,7 +368,10 @@ class AutonomousScheduler:
         try:
             from app.llm.manager import llm_manager
             llm = llm_manager.get()
-            response = await llm.chat([{"role": "system", "content": reflect_prompt}])
+            response = await llm.chat([
+                {"role": "system", "content": reflect_prompt},
+                {"role": "user", "content": "上の内容を踏まえて原則を蒸留してください。"},
+            ])
             if not response:
                 return None
 
@@ -370,15 +386,17 @@ class AutonomousScheduler:
             return None
 
     def _save_principle(self, principle: str, self_model: dict):
-        from app.tools.builtin import _save_self_model
-        principles = self_model.get("principles", [])
+        from app.tools.builtin import _load_self_model, _save_self_model
+        # 最新のself_modelを再読み込み（アクション中にAIが更新した可能性があるため）
+        fresh_model = _load_self_model()
+        principles = fresh_model.get("principles", [])
         if not isinstance(principles, list):
             principles = []
         principles.append({"text": principle, "created": datetime.now().isoformat()})
         if len(principles) > 20:
             principles = principles[-20:]
-        self_model["principles"] = principles
-        _save_self_model(self_model)
+        fresh_model["principles"] = principles
+        _save_self_model(fresh_model, changed_key="principles")
 
     # --- Phase 3: 戦略選択 ---
 
@@ -400,7 +418,10 @@ class AutonomousScheduler:
         try:
             from app.llm.manager import llm_manager
             llm = llm_manager.get()
-            response = await llm.chat([{"role": "system", "content": strategy_prompt}])
+            response = await llm.chat([
+                {"role": "system", "content": strategy_prompt},
+                {"role": "user", "content": "戦略名を1つだけ答えてください。"},
+            ])
             if not response:
                 return None
 
@@ -417,11 +438,12 @@ class AutonomousScheduler:
 
     # --- ユーティリティ ---
 
-    def _build_signal_summary(self) -> str:
-        if not self._signal_buffer:
+    def _build_signal_summary(self, signals: list[dict] | None = None) -> str:
+        source = signals if signals is not None else list(self._signal_buffer)
+        if not source:
             return ""
         counts: dict[str, int] = {}
-        for sig in self._signal_buffer:
+        for sig in source:
             t = sig["type"]
             counts[t] = counts.get(t, 0) + 1
         parts = [f"{t}×{c}" for t, c in counts.items()]

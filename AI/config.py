@@ -14,13 +14,17 @@ LLM_BASE_URL = "http://localhost:1234/v1"
 LLM_MODEL = "default"  # LM Studioはモデル名不要の場合が多い
 LLM_TIMEOUT = 300.0  # 5分（ツール結果含むとコンテキストが大きくなるため）
 LLM_MAX_TOKENS = 8192  # 応答の最大トークン数（think+ツール呼び出し含む）
+LLM_FREQUENCY_PENALTY = 0.5  # 繰り返しペナルティ（0.0〜2.0、高いほど同じトークンを避ける）
+LLM_PRESENCE_PENALTY = 0.3   # 存在ペナルティ（0.0〜2.0、高いほど新しい話題を促す）
+LLM_REPEAT_DETECTION_WINDOW = 200  # ループ検出ウィンドウ（文字数）
+LLM_REPEAT_DETECTION_THRESHOLD = 3  # 同じパターンが何回繰り返されたら停止するか
 
 # サーバー
 HOST = "0.0.0.0"
 PORT = 8000
 
 # 自発的発言
-AUTONOMOUS_INTERVAL_MIN = 99999  # 一時停止中（テスト用）※本番は300
+AUTONOMOUS_INTERVAL_MIN = 300  # 
 AUTONOMOUS_INTERVAL_JITTER = 0   # 一時停止中
 
 # 記憶検索

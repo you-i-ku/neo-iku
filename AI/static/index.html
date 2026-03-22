@@ -29,6 +29,7 @@
         <button class="tab-btn active" data-tab="chat">チャット</button>
         <button class="tab-btn" data-tab="dev">開発者</button>
         <button class="tab-btn" data-tab="log">ログ</button>
+        <button class="tab-btn" data-tab="report">自律度</button>
     </div>
 
     <!-- チャットタブ -->
@@ -125,6 +126,21 @@
         <div id="log-content" class="log-content-full"></div>
     </div>
 
-    <script src="/static/app.js?v=29"></script>
+    <!-- 自律度レポートタブ -->
+    <div id="tab-report" class="tab-content">
+        <div class="report-header">
+            <div class="report-period">
+                <label>期間: <input id="report-from" type="date" value="2020-01-01"></label>
+                <span>〜</span>
+                <label><input id="report-to" type="date" value="2030-01-01"></label>
+                <button id="report-load-btn" class="report-load-btn">集計</button>
+            </div>
+        </div>
+        <div id="report-content" class="report-content">
+            <div class="report-empty">「集計」を押すとレポートが表示されます</div>
+        </div>
+    </div>
+
+    <script src="/static/app.js?v=30"></script>
 </body>
 </html>

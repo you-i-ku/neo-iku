@@ -75,6 +75,14 @@ class Pipeline:
 
     async def register_ws(self, ws):
         self._websockets.add(ws)
+        # 接続時に現在のカウントダウン状態を送信
+        from app.scheduler.autonomous import scheduler
+        remaining = max(0, int(scheduler._next_action_at - __import__('time').time()))
+        if remaining > 0:
+            await ws.send_text(json.dumps({
+                "type": "autonomous_countdown",
+                "seconds": remaining,
+            }))
 
     def unregister_ws(self, ws):
         self._websockets.discard(ws)
@@ -159,7 +167,7 @@ class Pipeline:
         conv_id = req.conv_id
         if conv_id is None:
             async with async_session() as session:
-                conv = await create_conversation(session)
+                conv = await create_conversation(session, source=req.source)
                 conv_id = conv.id
                 await session.commit()
 
@@ -255,11 +263,25 @@ class Pipeline:
 
                 # ストリーミングLLM
                 logger.info(f"LLM呼び出し: round={tool_round} messages={len(trimmed)}")
-                response = await self._call_llm_streaming(trimmed, req.source, tool_round)
-                logger.info(f"LLM応答: round={tool_round} response_len={len(response)}")
+                response, repeat_detected = await self._call_llm_streaming(trimmed, req.source, tool_round)
+                logger.info(f"LLM応答: round={tool_round} response_len={len(response)} repeat={repeat_detected}")
                 if not response:
                     logger.warning(f"LLM応答が空: round={tool_round} — LM Studioが応答しているか確認してください")
                     break
+
+                # ループ検出 → 繰り返し部分を切り落とし、フィードバックして次ラウンドへ
+                if repeat_detected:
+                    response = self._trim_repeated(response)
+                    repeat_msg = "あなたの出力が同じ内容の繰り返しに入ったため中断しました。"
+                    messages.append({"role": "assistant", "content": self._strip_think(response)})
+                    messages.append({"role": "system", "content": repeat_msg})
+                    await self._broadcast(json.dumps({
+                        "type": "dev_tool_result",
+                        "name": "(system)",
+                        "content": repeat_msg,
+                    }))
+                    tool_round += 1
+                    continue
 
                 # 中断チェック
                 if self._stop_event.is_set():
@@ -285,30 +307,36 @@ class Pipeline:
                 if tool_round < _config.TOOL_MAX_ROUNDS:
                     tool_calls = parse_tool_calls(clean) or parse_tool_calls(response)
                 elif parse_tool_calls(clean) or parse_tool_calls(response):
-                    limit_msg = f"[ツール実行上限（{_config.TOOL_MAX_ROUNDS}回）に達しました。ツールなしで応答を完了してください。]"
+                    limit_msg = f"ツール実行上限（{_config.TOOL_MAX_ROUNDS}回）に達しました。ツールなしで応答を完了してください。"
                     async with async_session() as session:
                         await add_message(session, conv_id, "assistant", response)
                         await add_message(session, conv_id, "tool", limit_msg)
                         await session.commit()
-                    messages.append({"role": "user", "content": limit_msg})
+                    messages.append({"role": "system", "content": limit_msg})
                     last_full_result = limit_msg
                     step_history.append({"tool": "(上限到達)", "args_summary": "", "result_summary": f"上限{_config.TOOL_MAX_ROUNDS}回到達"})
                     tool_round += 1
                     continue
 
                 if not tool_calls:
-                    # ツールなし → 最終応答（AIが自律的にループを終了した）
-                    if clean:
-                        async with async_session() as session:
-                            await add_message(session, conv_id, "assistant", response)
-                            await session.commit()
-                    break
+                    # ツールなし → フィードバックしてリトライさせる（終了はnon_responseで明示的に）
+                    no_tool_msg = "ツールの呼び出しが確認できませんでした。outputツールで出力するか、non_responseで完了してください。"
+                    messages.append({"role": "system", "content": no_tool_msg})
+                    tool_round += 1
+                    continue
 
                 # --- ツール実行 ---
                 tool_round += 1
                 all_results = []
+                loop_complete = False
 
                 for tool_name, tool_args in tool_calls:
+                    # non_response → 明示的な「行動完了」シグナル
+                    if tool_name == "non_response":
+                        loop_complete = True
+                        logger.info("non_response: ループ終了")
+                        continue
+
                     expected = tool_args.pop("expect", None)
                     if expected is not None and expected.strip().lower() in ("skip", "", "-", "なし", "none"):
                         expected = None
@@ -354,8 +382,8 @@ class Pipeline:
                         "tool_error" if action_status == "error" else "tool_success",
                         tool_name,
                     )
-                    if expected and action_status == "success":
-                        self._emit_signal("prediction_error", f"{tool_name}: expected={expected}")
+                    if expected:
+                        self._emit_signal("prediction_made", f"{tool_name}: {expected[:50]}")
 
                     # dev tab結果
                     await self._broadcast(json.dumps({
@@ -383,7 +411,7 @@ class Pipeline:
                                 "args": args_str, "status": action_status,
                             }))
                         if expected:
-                            all_results.append(f"[ツール結果: {tool_name}]\nあなたの予測: {expected}\n実際の結果: {result}\n（予測と結果にズレがあれば、自分の理解の何が違ったか振り返り、必要ならupdate_self_modelで自己モデルを更新できます）")
+                            all_results.append(f"[ツール結果: {tool_name}]\nあなたの予測: {expected}\n実際の結果: {result}")
                         else:
                             all_results.append(f"[ツール結果: {tool_name}]\n{result}")
 
@@ -401,13 +429,23 @@ class Pipeline:
                         "tool": tool_name,
                         "args_summary": args_str[:80],
                         "result_summary": self._summarize_result(tool_name, result, action_status),
+                        "expected": expected,
                     })
 
                 combined_results = "\n\n".join(all_results)
                 last_full_result = combined_results
 
-                # ツール結果をuserロールでmessagesに追加
-                messages.append({"role": "user", "content": combined_results})
+                if loop_complete:
+                    # non_response呼び出し → ループ終了、DBに記録
+                    save_results = combined_results or "[non_response: 行動完了を選択]"
+                    async with async_session() as session:
+                        await add_message(session, conv_id, "assistant", response)
+                        await add_message(session, conv_id, "tool", save_results)
+                        await session.commit()
+                    break
+
+                # ツール結果をsystemロールでmessagesに追加
+                messages.append({"role": "system", "content": combined_results})
 
                 # DB保存（中間）
                 async with async_session() as session:
@@ -442,7 +480,7 @@ class Pipeline:
 
     # --- ストリーミングLLM ---
 
-    async def _call_llm_streaming(self, messages: list[dict], source: str, round_num: int) -> str:
+    async def _call_llm_streaming(self, messages: list[dict], source: str, round_num: int) -> tuple[str, bool]:
         llm = llm_manager.get()
         full_response = ""
         in_think = False
@@ -498,10 +536,11 @@ class Pipeline:
                 "type": "error",
                 "content": f"（LLMエラー: {e}）",
             }))
-            return ""
+            return ("", False)
 
-        logger.info(f"stream_chat 完了: total_chars={len(full_response)}")
-        return full_response
+        repeat_detected = getattr(llm, "last_repeat_detected", False)
+        logger.info(f"stream_chat 完了: total_chars={len(full_response)} repeat={repeat_detected}")
+        return (full_response, repeat_detected)
 
     # --- 承認フロー ---
 
@@ -721,8 +760,7 @@ class Pipeline:
         ctx_text = "\n".join(ctx_parts)
 
         return f"""今は{now}です。
-
-行動目標: {action_goal}
+{f'{chr(10)}行動目標: {action_goal}' if action_goal else ''}
 {f'{chr(10)}{ctx_text}' if ctx_text else ''}
 
 {tool_text}"""
@@ -755,6 +793,16 @@ class Pipeline:
         if "<think>" in clean:
             clean = clean.split("<think>")[0].strip()
         return clean
+
+    @staticmethod
+    def _trim_repeated(text: str) -> str:
+        """ループ検出された応答から繰り返し部分を切り落とす（1回分だけ残す）"""
+        llm = llm_manager.get()
+        if hasattr(llm, "_find_repeat_start"):
+            cut_pos = llm._find_repeat_start(text)
+            if cut_pos > 0:
+                return text[:cut_pos]
+        return text
 
     @staticmethod
     def _summarize_result(tool_name: str, result: str, status: str) -> str:

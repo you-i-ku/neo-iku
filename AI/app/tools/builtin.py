@@ -639,12 +639,33 @@ def _load_self_model() -> dict:
         return {}
 
 
-def _save_self_model(model: dict):
-    """自己モデルをファイルに保存"""
-    SELF_MODEL_PATH.write_text(
-        json.dumps(model, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+def _save_self_model(model: dict, changed_key: str = ""):
+    """自己モデルをファイルに保存 + スナップショット記録"""
+    content_json = json.dumps(model, ensure_ascii=False, indent=2)
+    SELF_MODEL_PATH.write_text(content_json, encoding="utf-8")
+    # fire-and-forget でスナップショット記録
+    try:
+        import asyncio
+        loop = asyncio.get_running_loop()
+        loop.create_task(_record_snapshot(content_json, changed_key))
+    except RuntimeError:
+        pass  # イベントループがない場合はスキップ
+
+
+async def _record_snapshot(content_json: str, changed_key: str):
+    """self_model変更をDBに記録"""
+    try:
+        from app.memory.database import async_session
+        from app.memory.models import SelfModelSnapshot
+        async with async_session() as session:
+            snapshot = SelfModelSnapshot(
+                content=content_json,
+                changed_key=changed_key or None,
+            )
+            session.add(snapshot)
+            await session.commit()
+    except Exception:
+        pass
 
 
 async def read_self_model() -> str:
@@ -669,7 +690,7 @@ async def update_self_model(key: str = "", value: str = "", text: str = "") -> s
 
     if text:
         model["__free_text__"] = text
-        _save_self_model(model)
+        _save_self_model(model, changed_key="__free_text__")
         _emit_signal()
         return f"自己モデルの自由テキストを更新しました。（{len(text)}文字）"
 
@@ -683,19 +704,24 @@ async def update_self_model(key: str = "", value: str = "", text: str = "") -> s
                 return f"エラー: {key}の値はJSON形式で指定してください。"
         else:
             model[key] = value
-        _save_self_model(model)
+        _save_self_model(model, changed_key=key)
         _emit_signal()
         return f"自己モデルを更新しました: {key} = {value}"
 
     if key and not value:
         if key in model:
             del model[key]
-            _save_self_model(model)
+            _save_self_model(model, changed_key=f"delete:{key}")
             _emit_signal()
             return f"自己モデルから削除しました: {key}"
         return f"キー '{key}' は自己モデルに存在しません。"
 
     return "エラー: key+value または text を指定してください。"
+
+
+async def non_response() -> str:
+    """何も行動しないことを明示的に選択する（沈黙・待機）"""
+    return ""
 
 
 async def get_system_metrics() -> str:
@@ -871,6 +897,12 @@ def register_all():
         "自分の自己モデルを更新する。自分について新しく理解したことや、考えが変わった時に使う",
         'key=更新する項目名 value=新しい値（valueを省略するとそのキーを削除） text=自由テキストで自己モデル全体を記述（key/valueの代わりに使える）',
         update_self_model,
+    )
+    register_tool(
+        "non_response",
+        "何も行動しないことを明示的に選択する（沈黙・待機）",
+        "",
+        non_response,
     )
     register_tool(
         "get_system_metrics",

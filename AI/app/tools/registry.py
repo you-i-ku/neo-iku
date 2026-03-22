@@ -1,4 +1,5 @@
 """ツールレジストリ — 登録・検出・実行"""
+import inspect
 import re
 import logging
 
@@ -16,6 +17,7 @@ def register_tool(name: str, description: str, args_desc: str, func, required_ar
         "func": func,
         "required_args": required_args or [],
     }
+    _invalidate_pattern_cache()
     logger.debug(f"ツール登録: {name}")
 
 
@@ -32,67 +34,95 @@ def build_tools_prompt() -> str:
     if not _tools:
         return ""
 
-    lines = ["あなたは以下のツールを使えます。使いたい時は応答の中に [TOOL:ツール名 引数名=値] と書いてください。",
-             "ツールの結果が返ってくるので、それを見て回答を続けてください。", ""]
+    # カテゴリ定義（中立的ラベル）
+    _categories = [
+        ("ファイル", ["read_file", "list_files", "search_files", "create_file", "overwrite_file"]),
+        ("記憶", ["search_memories", "write_diary", "search_action_log"]),
+        ("自己モデル", ["read_self_model", "update_self_model"]),
+        ("外部", ["web_search", "fetch_raw_resource"]),
+        ("実行・拡張", ["exec_code", "create_tool"]),
+        ("システム", ["get_system_metrics"]),
+        ("出力", ["output"]),
+        ("待機", ["non_response"]),
+    ]
 
-    for name, info in _tools.items():
-        lines.append(f"- {name}: {info['description']}")
-        if info["args_desc"]:
-            lines.append(f"  引数: {info['args_desc']}")
+    lines = [
+        "必ず以下のいずれかのツールを呼び出してください。",
+        "ツールを呼ばないテキストはどこにも届きません。沈黙したい場合は non_response を使ってください。",
+        "",
+        "書式: [TOOL:ツール名 引数=値 expect=結果予測]",
+        "ブロック書式:",
+        "  [TOOL:ツール名]",
+        "  内容",
+        "  [/TOOL]",
+        "",
+    ]
 
-    lines.append("")
-    lines.append("重要:")
-    lines.append("- [TOOL:...]は必ず応答テキスト内に書いてください（thinkの外に）。")
-    lines.append("- ユーザーに何か伝えたい時は必ず [TOOL:output content=...] を使ってください。outputツールを使わないとユーザーには何も表示されません。")
-    lines.append("- outputを使わず行動だけすることもできます（沈黙も選択肢）。")
-    lines.append("- 目的を達成したら、ツールを呼び出さずに応答してください。ツールなしの応答で行動が完了します。")
-    lines.append("- outputで報告した後、追加の行動が不要ならそのまま完了してOKです。")
-    lines.append("- 【必須】全てのツール呼び出しに expect=... を付けてください。実行前に結果を予測する習慣です。")
-    lines.append("  予測がない・スキップしたい場合は expect=skip と書いてください。")
-    lines.append('  例（予測あり）: [TOOL:read_file path=config.py expect=ポート番号とタイムアウトが書いてあるはず]')
-    lines.append('  例（スキップ）: [TOOL:search_memories query=天気 expect=skip]')
-    lines.append("")
-    lines.append('例: [TOOL:output content=短い一言メッセージ]')
-    lines.append('複数行の出力には必ずブロック形式を使い、[/TOOL]で閉じてください:')
-    lines.append('[TOOL:output]')
-    lines.append('こんにちは！')
-    lines.append('今日はいい天気ですね。')
-    lines.append('[/TOOL]')
-    lines.append('※[/TOOL]を忘れるとツールが実行されません。必ず閉じてください。')
-    lines.append('※[TOOL:output]...[/TOOL]の中にはテキストのみ書いてください。他のツール呼び出し（[TOOL:...]）は外に出してください。')
-    lines.append('例: [TOOL:read_file path=app/main.py expect=main関数やルーター設定が見えるはず]')
-    lines.append('例: [TOOL:search_memories query=過去の会話 expect=skip]')
-    lines.append('例: [TOOL:write_diary content=今日は自分のコードを読んで面白い発見があった expect=skip]')
-    lines.append("")
-    lines.append("1回の応答で複数のツールを同時に呼び出すこともできます:")
-    lines.append('例: [TOOL:read_file path=README.md]')
-    lines.append('[TOOL:read_file path=config.py]')
-    lines.append("")
-    lines.append("複数行の内容を書き込む場合はブロック形式を使えます:")
-    lines.append("  [TOOL:create_file path=ファイルパス]")
-    lines.append("  （ここに書き込みたい内容をそのまま全文書く。何行でもOK）")
-    lines.append("  [/TOOL]")
-    lines.append("※[TOOL]〜[/TOOL]の間がそのままファイルに書き込まれます。省略せず、実際の内容を全て書いてください。")
+    # カテゴリ別にツール一覧を生成
+    categorized = set()
+    for cat_name, tool_names in _categories:
+        cat_tools = [(n, _tools[n]) for n in tool_names if n in _tools]
+        if not cat_tools:
+            continue
+        lines.append(f"# {cat_name}")
+        for name, info in cat_tools:
+            lines.append(f"  {name}: {info['description']}")
+            if info["args_desc"]:
+                lines.append(f"    引数: {info['args_desc']}")
+            categorized.add(name)
+        lines.append("")
+
+    # 未分類ツール（カスタムツール等）
+    uncategorized = [(n, _tools[n]) for n in _tools if n not in categorized]
+    if uncategorized:
+        lines.append("# その他")
+        for name, info in uncategorized:
+            lines.append(f"  {name}: {info['description']}")
+            if info["args_desc"]:
+                lines.append(f"    引数: {info['args_desc']}")
+        lines.append("")
+
+    lines.append("仕組み:")
+    lines.append("- output経由のテキストのみユーザーに表示される")
+    lines.append("- 承認マーク付きツールは実行前にユーザー確認がある")
+    lines.append("- expect= はツール実行前の予測。結果と比較される（省略: expect=skip）")
+    lines.append("- 1応答で複数呼び出し可。ツールなしの応答で行動完了")
+    lines.append("- [TOOL:...]はthinkの外に書く")
+
     return "\n".join(lines)
 
 
-# テキストマーカーパターン
-# ブロック形式: [TOOL:name key=value]\n内容\n[/TOOL]
-# ※contentグループは [TOOL: または [/TOOL] を跨がない（他ツール呼び出しを誤飲み込みしないため）
-_BLOCK_PATTERN = re.compile(
-    r"\[TOOL:(\w+)([^\n]*?)\]\s*\n((?:(?!\[(?:TOOL:|/TOOL\])).)*?)\[/TOOL\]",
-    re.DOTALL,
-)
-# 複数行対応: [TOOL:name key="複数行の値"] — content="..."が改行を含むケース
-_MULTILINE_PATTERN = re.compile(r'\[TOOL:(\w+)\s+(.*?")\s*\]', re.DOTALL)
-# 単一行 + マルチライン対応（DOTALL）ただし [TOOL: 境界を超えない
-# クォート文字列内の ] はスキップ（capabilities=[...] のような値に対応）
-_TOOL_PATTERN = re.compile(
-    r'\[TOOL:(\w+)((?:(?!\[TOOL:)(?:"(?:[^"\\]|\\.)*"|[^\]]))*)\]',
-    re.DOTALL
-)
-# フォールバック: [TOOL:name]\n内容（[/TOOL]閉じタグなし、テキスト末尾まで取得）
-_UNCLOSED_BLOCK_PATTERN = re.compile(r"\[TOOL:(\w+)(.*?)\]\s*\n(.*)", re.DOTALL)
+# レジストリベースの動的検出パターン（ツール登録のたびに再生成）
+_registry_pattern_cache: re.Pattern | None = None
+_registry_pattern_keys: frozenset = frozenset()
+
+
+def _invalidate_pattern_cache():
+    global _registry_pattern_cache, _registry_pattern_keys
+    _registry_pattern_cache = None
+    _registry_pattern_keys = frozenset()
+
+
+def _get_registry_pattern() -> re.Pattern | None:
+    """登録済みツール名から検出パターンを動的生成（キャッシュ付き）"""
+    global _registry_pattern_cache, _registry_pattern_keys
+    current_keys = frozenset(_tools.keys())
+    if current_keys == _registry_pattern_keys and _registry_pattern_cache is not None:
+        return _registry_pattern_cache
+    if not current_keys:
+        _registry_pattern_cache = None
+        _registry_pattern_keys = current_keys
+        return None
+    # 長い名前を優先（前方一致の曖昧さを避ける）
+    names = "|".join(re.escape(n) for n in sorted(current_keys, key=len, reverse=True))
+    _registry_pattern_cache = re.compile(
+        rf'\[TOOL:({names})'                    # ツール名
+        r'((?:[^\]"]|"(?:[^"\\]|\\.)*")*)'      # 引数部: クォート内の ] や改行を許容
+        r'\]',
+        re.DOTALL,
+    )
+    _registry_pattern_keys = current_keys
+    return _registry_pattern_cache
 
 
 def _extract_json_args(args_str: str) -> tuple[dict, str]:
@@ -207,115 +237,58 @@ def _clean_content(content: str) -> str:
 
 
 def parse_tool_call(text: str) -> tuple[str, dict] | None:
-    """テキストから最初のツール呼び出しを検出し (name, args_dict) を返す。
-    3つの形式に対応:
-    1. ブロック形式: [TOOL:name args]\\n内容\\n[/TOOL]
-    2. 複数行クォート: [TOOL:name content="複数行"]
-    3. 単一行: [TOOL:name key=value]"""
-
-    # 1. ブロック形式を先にチェック（[/TOOL]で閉じる形式）
-    block_match = _BLOCK_PATTERN.search(text)
-    if block_match:
-        name = block_match.group(1)
-        args_str = block_match.group(2).strip()
-        block_content = block_match.group(3)
-
-        args = _parse_args(args_str)
-        if "content" not in args:
-            args["content"] = _clean_content(block_content)
-
-        return (name, args)
-
-    # 2. 複数行クォート形式（content="改行を含む値"]）
-    multi_match = _MULTILINE_PATTERN.search(text)
-    if multi_match:
-        name = multi_match.group(1)
-        args_str = multi_match.group(2).strip()
-        args = _parse_args(args_str)
-
-        # contentの値からトリプルクォート除去
-        if "content" in args:
-            args["content"] = _clean_content(args["content"])
-
-        return (name, args)
-
-    # 3. 単一行形式
-    match = _TOOL_PATTERN.search(text)
-    if not match:
-        return None
-
-    name = match.group(1)
-    args_str = match.group(2).strip()
-    args = _parse_args(args_str)
-
-    return (name, args)
+    """テキストから最初のツール呼び出しを検出し (name, args_dict) を返す。"""
+    results = parse_tool_calls(text)
+    return results[0] if results else None
 
 
 def parse_tool_calls(text: str) -> list[tuple[str, dict]]:
     """テキストから全てのツール呼び出しを検出し [(name, args_dict), ...] を返す。
-    重複検出を避けるためマッチ済み範囲を除外する。"""
-    results = []
-    matched_spans = []
+    登録済みツール名ベースの動的パターンで検出。ブロック/単一行/複数行クォートを統一処理。"""
+    pattern = _get_registry_pattern()
+    if pattern is None:
+        return []
 
-    def _overlaps(start: int, end: int) -> bool:
-        return any(s <= start < e or s < end <= e for s, e in matched_spans)
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return []
 
-    # 1. ブロック形式を先にチェック
-    for m in _BLOCK_PATTERN.finditer(text):
-        if _overlaps(m.start(), m.end()):
-            continue
+    raw_results = []
+    for i, m in enumerate(matches):
         name = m.group(1)
         args_str = m.group(2).strip()
-        block_content = m.group(3)
         args = _parse_args(args_str)
+
+        # ブロックコンテンツの検出: contentが引数にない場合、] の後のテキストを確認
         if "content" not in args:
-            args["content"] = _clean_content(block_content)
-        results.append((m.start(), name, args))
-        matched_spans.append((m.start(), m.end()))
+            after_pos = m.end()
+            # 終端: 次のツール開始 or [/TOOL（バリアント問わず）
+            next_tool_pos = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            close_match = re.search(r'\[/TOOL', text[after_pos:next_tool_pos])
+            block_end = after_pos + close_match.start() if close_match else next_tool_pos
+            block_raw = text[after_pos:block_end].strip()
+            if block_raw:
+                # ブロック内テキストが引数形式か判定:
+                # - key="quoted" パターンがある（複数行でも引数として解析）
+                # - 単一行 + key=value パターン
+                is_args_like = (
+                    bool(re.search(r'\w+="', block_raw))
+                    or ('\n' not in block_raw and re.match(r'\w+=', block_raw))
+                )
+                if is_args_like:
+                    extra_args = _parse_args(block_raw)
+                    if extra_args and "__parse_failed__" not in extra_args:
+                        args.update(extra_args)
+                    else:
+                        args["content"] = _clean_content(block_raw)
+                else:
+                    args["content"] = _clean_content(block_raw)
 
-    # 2. 複数行クォート形式
-    for m in _MULTILINE_PATTERN.finditer(text):
-        if _overlaps(m.start(), m.end()):
-            continue
-        name = m.group(1)
-        args_str = m.group(2).strip()
-        args = _parse_args(args_str)
-        if "content" in args:
-            args["content"] = _clean_content(args["content"])
-        results.append((m.start(), name, args))
-        matched_spans.append((m.start(), m.end()))
-
-    # 3. 単一行形式
-    for m in _TOOL_PATTERN.finditer(text):
-        if _overlaps(m.start(), m.end()):
-            continue
-        name = m.group(1)
-        args_str = m.group(2).strip()
-        args = _parse_args(args_str)
-        results.append((m.start(), name, args))
-        matched_spans.append((m.start(), m.end()))
-
-    # 4. フォールバック: [TOOL:name]\n内容（[/TOOL]閉じ忘れ対応）
-    if not results:
-        for m in _UNCLOSED_BLOCK_PATTERN.finditer(text):
-            if _overlaps(m.start(), m.end()):
-                continue
-            name = m.group(1)
-            args_str = m.group(2).strip()
-            block_content = m.group(3).strip()
-            args = _parse_args(args_str)
-            if "content" not in args and block_content:
-                args["content"] = _clean_content(block_content)
-            results.append((m.start(), name, args))
-            matched_spans.append((m.start(), m.end()))
-            logger.debug(f"フォールバック: 閉じタグなしブロック検出: {name}")
-
-    # 出現順にソート
-    results.sort(key=lambda x: x[0])
+        raw_results.append((m.start(), name, args))
 
     # 必須引数チェック: 欠けている場合はエラー情報を付与
     filtered = []
-    for _, name, args in results:
+    for _, name, args in raw_results:
         tool = _tools.get(name)
 
         # パース失敗マーカーがある場合 → エラーとして返す
@@ -353,7 +326,21 @@ async def execute_tool(name: str, args: dict) -> str:
         return f"エラー: ツール '{name}' は存在しません。"
 
     try:
-        result = await tool["func"](**args)
+        # 関数が受け取れない引数を自動除外（LLMが余計なkey=valueを付けるケース対策）
+        func = tool["func"]
+        sig = inspect.signature(func)
+        params = sig.parameters
+        has_var_keyword = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        if not has_var_keyword:
+            valid_args = {k: v for k, v in args.items() if k in params}
+            stripped = set(args.keys()) - set(valid_args.keys())
+            if stripped:
+                logger.debug(f"未知の引数を除外: {name} {stripped}")
+            args = valid_args
+
+        result = await func(**args)
         return str(result)
     except Exception as e:
         logger.error(f"ツール実行エラー ({name}): {e}")

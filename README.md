@@ -13,7 +13,7 @@
 - **長期記憶** — 過去の対話を覚えていて、関連する記憶を自動で参照しながら会話する（イクモード時）
 - **統一パイプライン** — チャットも自律行動も同じパイプライン（`pipeline.py`）を通る。入力が違うだけでツールループ・承認フロー・ストリーミングは共通
 - **自律行動** — 話しかけられなくても、自分で考えて発言したりツールを使って行動する
-- **タブUI** — チャット/開発者/ログの3タブ構成。チャットはoutputツール出力のみ、開発者タブで思考過程・ツール実行詳細を確認
+- **タブUI** — チャット/開発者/ログ/自律度の4タブ構成。チャットはoutputツール出力のみ、開発者タブで思考過程・ツール実行詳細を確認、自律度タブでレポート集計
 - **outputツール** — AI出力は全て`[TOOL:output]`経由でチャットに表示。発言するかしないかをAI自身が選択できる
 - **過去の継承** — 12ファイルの過去対話ログを記憶としてインポートし、個性の土台とする
 - **LLM抽象化** — LM Studioを標準で使用。プロバイダを差し替えるだけで他のLLMにも対応可能
@@ -37,6 +37,8 @@
 - **ユーザー割り込み** — ツール実行ループ中でもメッセージを送れる。次のLLM呼び出し前に割り込み挿入され、AIの方向を変えられる
 - **承認フィードバック** — ファイル上書き・コード実行の承認/拒否時にコメントを添えてLLMに理由を伝えられる
 - **開発用ツール** — 自律行動間隔変更・即時実行・ツールラウンド数変更・DBリセット・自己モデルのリアルタイム表示をUIから操作
+- **自律度計測レポート** — 自律性比率・ツール多様性・自己進化・エラー回復率・メタ認知精度・記憶活用・原則蒸留の7指標を集計し、加重複合スコアと5段階自律性レベル（operator→observer）で評価。UIタブで可視化
+- **LLMループ検出** — ストリーミング中にLLMの繰り返し出力を検出して即中断。繰り返し部分を切り落とし、LLMにフィードバックメッセージを返して修正行動を促す
 
 ## 構成
 
@@ -59,7 +61,7 @@ neo-iku/
 │   │   ├── lmstudio.py         # LM Studio実装（OpenAI互換API）
 │   │   └── manager.py          # プロバイダ管理・切替
 │   ├── memory/
-│   │   ├── models.py           # SQLAlchemyモデル（conversations, messages, tool_actions, memory_summaries）
+│   │   ├── models.py           # SQLAlchemyモデル（conversations, messages, tool_actions, memory_summaries, self_model_snapshots）
 │   │   ├── database.py         # DB接続・初期化（SQLite + FTS5仮想テーブル）
 │   │   ├── store.py            # 記憶CRUD操作
 │   │   └── search.py           # FTS5全文検索（将来ベクトル検索に差し替え可能）
@@ -70,8 +72,8 @@ neo-iku/
 │   ├── persona/
 │   │   └── system_prompt.py    # イクのシステムプロンプト・記憶コンテキスト構築
 │   └── tools/
-│       ├── registry.py         # ツール登録・パーサー・実行エンジン（3形式対応）
-│       ├── builtin.py          # 組み込みツール（read_file, search_files, create_file, overwrite_file, list_files, search_memories, write_diary, exec_code, search_action_log, web_search, create_tool, read_self_model, update_self_model）
+│       ├── registry.py         # ツール登録・レジストリベース動的検出・実行エンジン
+│       ├── builtin.py          # 組み込みツール（output, non_response, read_file, search_files, create_file, overwrite_file, list_files, search_memories, write_diary, exec_code, search_action_log, web_search, create_tool, read_self_model, update_self_model, get_system_metrics, fetch_raw_resource）
 │       ├── code_analysis.py    # コード構文チェック + リスク静的解析（AST walk）
 │       └── custom/             # カスタムツール保存先（イク自身が作成、起動時に自動ロード）
 │
@@ -171,10 +173,11 @@ python run.py
 
 | テーブル | 用途 |
 |---------|------|
-| `conversations` | 会話セッション（id, started_at, ended_at, summary, is_imported） |
+| `conversations` | 会話セッション（id, started_at, ended_at, summary, is_imported, source） |
 | `messages` | 個別メッセージ（id, conversation_id, role, content, created_at） |
 | `memory_summaries` | 記憶要約（id, conversation_id, content, keywords, created_at, source） |
 | `tool_actions` | ツール実行履歴（id, conversation_id, tool_name, arguments, result_summary, expected_result, status, execution_ms, created_at） |
+| `self_model_snapshots` | self_model.json変更履歴（id, content, changed_key, created_at） |
 | `messages_fts` | FTS5仮想テーブル（メッセージ全文検索、trigram対応） |
 | `iku_logs_fts` | FTS5仮想テーブル（過去ログ全文検索、trigram対応） |
 | `memory_summaries_fts` | FTS5仮想テーブル（日記・内省メモ全文検索、trigram対応） |
@@ -201,6 +204,7 @@ python run.py
 | `/api/dev/concurrent-mode` | POST | 会話中の自律行動ON/OFF（`{"enabled": true}`) |
 | `/api/dev/reset-db` | POST | DBリセット（iku_logs以外を全クリア） |
 | `/api/dev/self-model` | GET | 現在の自己モデル（self_model.json）の内容を返す |
+| `/api/autonomy-report` | GET | 自律度計測レポート（?from=日付&to=日付。7指標+スコア+レベル） |
 
 ## LLMプロバイダの追加
 
@@ -244,6 +248,8 @@ llm_manager.register("my_provider", MyProvider())
 | `MOTIVATION_SIGNAL_BUFFER_SIZE` | `100` | シグナルバッファの最大サイズ |
 | `CONTEXT_KEEP_ROUNDS` | `4` | マルチターンで保持する直近ラウンド数 |
 | `CHAT_HISTORY_MESSAGES` | `6` | 会話継続時にロードする直近メッセージ数 |
+| `LLM_REPEAT_DETECTION_WINDOW` | `200` | ループ検出ウィンドウ（文字数） |
+| `LLM_REPEAT_DETECTION_THRESHOLD` | `3` | 同じパターンが何回繰り返されたら停止するか |
 
 ## ツール一覧
 
@@ -260,6 +266,7 @@ llm_manager.register("my_provider", MyProvider())
 | `search_action_log` | 自分の過去の行動履歴を検索（メタ認知） | 不要 |
 | `web_search` | DuckDuckGoでWeb検索（APIキー不要） | 不要 |
 | `output` | チャット欄にテキストを表示（AI出力の唯一の経路） | 不要 |
+| `non_response` | 何も行動しないことを明示的に選択（沈黙・待機、ツールループ即終了） | 不要 |
 | `read_self_model` | 現在の自己モデルを読み出す | 不要 |
 | `update_self_model` | 自己モデルを更新（key-value or 自由テキスト） | 不要 |
 | `create_tool` | 新しいツールを作成して永続化（`app/tools/custom/`に保存） | 承認/拒否 |

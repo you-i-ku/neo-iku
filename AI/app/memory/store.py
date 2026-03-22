@@ -6,8 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.memory.models import Conversation, Message, IkuLog, ToolAction
 
 
-async def create_conversation(session: AsyncSession, is_imported: bool = False) -> Conversation:
-    conv = Conversation(is_imported=is_imported)
+async def create_conversation(session: AsyncSession, is_imported: bool = False, source: str = "chat") -> Conversation:
+    conv = Conversation(is_imported=is_imported, source=source)
     session.add(conv)
     await session.flush()
     return conv

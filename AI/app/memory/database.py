@@ -34,6 +34,12 @@ async def init_db():
         except Exception:
             await conn.execute(text("ALTER TABLE tool_actions ADD COLUMN expected_result TEXT"))
 
+        # conversationsにsourceカラム追加（既存DBマイグレーション）
+        try:
+            await conn.execute(text("SELECT source FROM conversations LIMIT 1"))
+        except Exception:
+            await conn.execute(text("ALTER TABLE conversations ADD COLUMN source TEXT DEFAULT 'chat'"))
+
         # trigram tokenizer対応チェック（日本語検索に必須）
         use_trigram = False
         try:

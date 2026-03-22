@@ -326,6 +326,92 @@
 - [x] `CONTEXT_KEEP_ROUNDS = 4` — マルチターンで保持する直近ラウンド数
 - [x] `CHAT_HISTORY_MESSAGES = 6` — 会話継続時にロードする直近メッセージ数
 
+### Step 37: ツールパーサー刷新 + non_response + UI修正
+
+**レジストリベース動的検出（parse_tool_calls置換）**
+- [x] 4つの静的パターン（_BLOCK_PATTERN, _MULTILINE_PATTERN, _TOOL_PATTERN, _UNCLOSED_BLOCK_PATTERN）を削除
+- [x] `_get_registry_pattern()` — `_tools.keys()`から検出パターンを動的生成（キャッシュ付き、ツール登録時に自動失効）
+- [x] 長いツール名を優先マッチ（前方一致の曖昧さ回避）
+- [x] ブロック内テキストの引数/content判定 — `key="value"`形式 or 単一行`key=value` → 引数として解析、それ以外 → content
+- [x] `parse_tool_call()` を `parse_tool_calls()` のラッパーに統一（ロジック重複解消）
+- [x] カスタムツール（create_tool）追加時にもパターンが自動対応
+
+**non_responseツール + ループ終了**
+- [x] `non_response` ツール追加 — 何も行動しないことを明示的に選択（沈黙・待機）
+- [x] pipeline.pyでnon_response呼び出し時にツールループを即終了（`loop_complete`フラグ）
+- [x] DBに`[non_response: 行動完了を選択]`として記録（全ての選択を保存）
+
+**ツールプロンプト改善**
+- [x] カテゴリ別表示（ファイル/記憶/自己モデル/外部/実行・拡張/システム/出力/待機）
+- [x] 「必ずいずれかのツールを呼び出してください」明示（ツールなし応答が無に帰す問題の対策）
+- [x] 作為的な指示を排除（中立的ラベル、使い方の強制なし）
+
+**メタ認知・シグナル修正**
+- [x] predict誤差シグナル名を `prediction_error` → `prediction_made`（中立的な名前に）
+- [x] expect結果フィードバックから self_model更新への短絡的誘導を削除（振り返りフローに委ねる）
+- [x] `_reflect()` ゲート修正 — self_model空でも`action_goal`フォールバックで振り返りが動作
+- [x] `_reflect()` のエラーシグナルを `prediction_error` → `tool_error` に修正
+
+**UI修正**
+- [x] ログタブ: WSLogHandlerにバッファ（deque, maxlen=500）追加、接続時に履歴送信
+- [x] 開発者タブ: セッションの`max-height: 60vh`削除（セッション増加で圧迫される問題修正）
+- [x] 開発者タブ: ラウンド内容の`max-height: 400px`削除（長い出力が切れる問題修正）
+- [x] 接続時カウントダウン送信（UI起動時に「-」表示になる問題修正）
+
+### Step 38: LLMメッセージロール設計 + 自律行動目標の非作為化
+
+**systemロール導入**
+- [x] ツール結果を `role: "user"` → `role: "system"` に変更（pipeline.py L435）
+- [x] ツール上限通知を `role: "user"` → `role: "system"` に変更（pipeline.py L301）
+- [x] `[システム通知]` テキストプレフィックスを削除（ロール自体で区別するため不要）
+- ユーザー割り込みメッセージは引き続き `role: "user"` のまま
+
+**自律行動目標の非作為化**
+- [x] `action_goal` のデフォルト値を `"自律的に判断して行動する"` → 空文字列 `""` に変更（autonomous.py）
+- [x] `_build_initial_prompt()` で `action_goal` が空の場合は `行動目標:` 行を丸ごと省略（pipeline.py）
+- drives未定義時: 時刻・シグナル・ツール一覧のみが渡される（目標の押し付けなし）
+- drives定義済み時: 候補選択で生成された具体的な description が action_goal になる（従来通り）
+
+**ツールプロンプト修正**
+- [x] カテゴリラベルを `[待機]` → `# 待機` に変更（角括弧がツールマーカー `[TOOL:...]` と混同される問題の修正）
+
+**function calling試行→revert**
+- [x] OpenAI互換function callingを実装（registry.py, lmstudio.py, pipeline.py, config.py）
+- [x] 試行→モデル（qwen3.5-9b蒸留版）がtool_callsを使わずテキストマーカーで応答→全revert
+- 教訓: LM Studio + 蒸留モデルではfunction callingが期待通りに動かない。vanilla Qwen3.5 + vLLM + `--tool-call-parser qwen3_coder` が必要
+
+**環境修正**
+- [x] `duckduckgo-search` パッケージをインストール（web_searchツールが動くように）
+
+### Step 39: 自律度計測レポートシステム + LLMループ検出強化
+
+**自律度計測API + UIタブ**
+- [x] `conversations.source`カラム追加（"chat"/"autonomous"区別、既存DBマイグレーション付き）
+- [x] `self_model_snapshots`テーブル新設（self_model.jsonの変更履歴を自動記録）
+- [x] `_save_self_model()`にスナップショット記録をfire-and-forgetで追加（changed_key付き）
+- [x] `create_conversation()`にsource引数追加、pipeline.pyから`req.source`を渡す
+- [x] `/api/autonomy-report`エンドポイント（7指標 + 加重複合スコア + 5段階自律性分類）
+  - Autonomy Ratio（自律/チャット比率）
+  - Tool Diversity（シャノンエントロピー）
+  - Self-Evolution（self_model変更回数・分布）
+  - Error Recovery（エラー→回復率）
+  - Metacognitive Accuracy（予測成功率）
+  - Memory Utilization（記憶検索・日記の活用度）
+  - Principle Accumulation（原則蒸留の蓄積）
+- [x] 自律度タブUI新設（4タブ構成: チャット/開発者/ログ/自律度）
+  - 期間選択（from/to日付）+ 集計ボタン
+  - スコアカード（スコア値 + 5段階レベル + プログレスバー）
+  - 7指標をカードグリッドで表示（バーチャート・統計値付き）
+
+**LLMループ検出強化**
+- [x] 検出ウィンドウ: 80文字 → 200文字（長い文章のリピートを検出可能に）
+- [x] パターン長上限: 40文字 → 500文字（段落まるごとリピートに対応）
+- [x] チェック頻度: 50チャンク → 20チャンクごと（早期検出）
+- [x] ループ検出時にLLMへフィードバックメッセージを返す（繰り返し部分を切り落とし、次ラウンドで修正指示）
+- [x] `_call_llm_streaming()`の戻り値を`(response, repeat_detected)`タプルに変更
+- [x] `_trim_repeated()`ヘルパー追加（ループ部分を切って1回分だけ残す）
+- [x] `LMStudioProvider`に`last_repeat_detected`フラグ + `_find_repeat_start()`メソッド追加
+
 ## 残タスク
 
 ### 動作検証
@@ -370,7 +456,7 @@
 **柱2: 予測誤差の検知（フェーズA部分実装済み + フェーズB未着手）**
 - [x] ツール結果返却時に「あなたの予測: XXX → 実際の結果: YYY」形式で提示
 - [x] 判定はLLMの次の通常応答に委ねる（追加LLM呼び出しなし）
-- [ ] 予測が大きく外れた場合に自己モデル更新を示唆するヒント文をプロンプトに追加
+- [x] 予測誤差のフィードバックはLLMに提示するが、self_model更新への短絡的誘導は削除（振り返りフローに委ねる設計に変更）
 
 **柱3: 動的自己モデル（フェーズA箱 実装・動作確認済み）**
 - [x] `data/self_model.json`作成（初期値: 空）

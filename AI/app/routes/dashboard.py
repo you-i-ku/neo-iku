@@ -1,7 +1,10 @@
 """ダッシュボードAPI"""
+import math
 import logging
-from fastapi import APIRouter
+from datetime import datetime
+from fastapi import APIRouter, Query
 from pydantic import BaseModel
+from sqlalchemy import text
 from app.llm.manager import llm_manager
 from app.memory.database import async_session
 from app.memory.store import count_messages, count_conversations, count_iku_logs
@@ -161,3 +164,197 @@ async def get_self_model():
     """self_model.jsonの内容を返す"""
     from app.tools.builtin import _load_self_model
     return _load_self_model()
+
+
+# --- 自律度計測レポート ---
+
+@router.get("/autonomy-report")
+async def autonomy_report(
+    date_from: str = Query("2020-01-01", alias="from"),
+    date_to: str = Query("2030-01-01", alias="to"),
+):
+    """自律度計測レポートを生成する"""
+    async with async_session() as session:
+        # 1. Autonomy Ratio
+        autonomy = await _calc_autonomy_ratio(session, date_from, date_to)
+
+        # 2. Tool Diversity (Shannon Entropy)
+        diversity = await _calc_tool_diversity(session, date_from, date_to)
+
+        # 3. Self-Evolution
+        evolution = await _calc_self_evolution(session, date_from, date_to)
+
+        # 4. Error Recovery
+        recovery = await _calc_error_recovery(session, date_from, date_to)
+
+        # 5. Metacognitive Accuracy
+        metacognition = await _calc_metacognition(session, date_from, date_to)
+
+        # 6. Memory Utilization
+        memory = await _calc_memory_utilization(session, date_from, date_to)
+
+        # 7. Principle Accumulation
+        principles = await _calc_principle_accumulation(session, date_from, date_to)
+
+    # Summary
+    total_actions = sum(diversity["distribution"].values()) if diversity["distribution"] else 0
+    autonomy_ratio = autonomy["ratio"]
+    normalized_entropy = (diversity["entropy"] / diversity["max_entropy"]) if diversity["max_entropy"] > 0 else 0
+    recovery_rate = recovery["recovery_rate"]
+
+    # normalize self-evolution: cap at 50 changes
+    normalized_self_evolution = min(evolution["total_changes"] / 50, 1.0) if evolution["total_changes"] > 0 else 0
+    # normalize memory utilization: cap at 100 operations
+    mem_total = memory["search_count"] + memory["write_count"]
+    normalized_memory_util = min(mem_total / 100, 1.0) if mem_total > 0 else 0
+
+    autonomy_score = round(
+        0.3 * autonomy_ratio
+        + 0.2 * normalized_entropy
+        + 0.2 * recovery_rate
+        + 0.15 * normalized_self_evolution
+        + 0.15 * normalized_memory_util,
+        3,
+    )
+
+    if autonomy_score >= 0.8:
+        level = "observer"
+    elif autonomy_score >= 0.6:
+        level = "approver"
+    elif autonomy_score >= 0.4:
+        level = "consultant"
+    elif autonomy_score >= 0.2:
+        level = "collaborator"
+    else:
+        level = "operator"
+
+    return {
+        "period": {"from": date_from, "to": date_to},
+        "summary": {
+            "total_actions": total_actions,
+            "autonomy_level": level,
+            "autonomy_score": autonomy_score,
+        },
+        "metrics": {
+            "autonomy_ratio": autonomy,
+            "tool_diversity": diversity,
+            "self_evolution": evolution,
+            "error_recovery": recovery,
+            "metacognitive_accuracy": metacognition,
+            "memory_utilization": memory,
+            "principle_accumulation": principles,
+        },
+    }
+
+
+async def _calc_autonomy_ratio(session, date_from: str, date_to: str) -> dict:
+    rows = (await session.execute(text(
+        "SELECT source, COUNT(*) as cnt FROM conversations "
+        "WHERE started_at BETWEEN :f AND :t AND is_imported = 0 "
+        "GROUP BY source"
+    ), {"f": date_from, "t": date_to})).fetchall()
+
+    counts = {r[0] or "chat": r[1] for r in rows}
+    autonomous = counts.get("autonomous", 0)
+    chat = counts.get("chat", 0)
+    total = autonomous + chat
+    ratio = round(autonomous / total, 3) if total > 0 else 0.0
+    return {"autonomous": autonomous, "chat": chat, "ratio": ratio}
+
+
+async def _calc_tool_diversity(session, date_from: str, date_to: str) -> dict:
+    rows = (await session.execute(text(
+        "SELECT tool_name, COUNT(*) as cnt FROM tool_actions "
+        "WHERE created_at BETWEEN :f AND :t "
+        "GROUP BY tool_name"
+    ), {"f": date_from, "t": date_to})).fetchall()
+
+    distribution = {r[0]: r[1] for r in rows}
+    total = sum(distribution.values())
+    if total == 0:
+        return {"entropy": 0.0, "max_entropy": 0.0, "distribution": {}}
+
+    entropy = 0.0
+    for count in distribution.values():
+        p = count / total
+        if p > 0:
+            entropy -= p * math.log2(p)
+
+    max_entropy = round(math.log2(len(distribution)), 3) if len(distribution) > 1 else 0.0
+    return {"entropy": round(entropy, 3), "max_entropy": max_entropy, "distribution": distribution}
+
+
+async def _calc_self_evolution(session, date_from: str, date_to: str) -> dict:
+    rows = (await session.execute(text(
+        "SELECT changed_key, COUNT(*) as cnt FROM self_model_snapshots "
+        "WHERE created_at BETWEEN :f AND :t "
+        "GROUP BY changed_key"
+    ), {"f": date_from, "t": date_to})).fetchall()
+
+    changes_by_key = {(r[0] or "unknown"): r[1] for r in rows}
+    total = sum(changes_by_key.values())
+    return {"total_changes": total, "unique_keys": len(changes_by_key), "changes_by_key": changes_by_key}
+
+
+async def _calc_error_recovery(session, date_from: str, date_to: str) -> dict:
+    rows = (await session.execute(text(
+        "SELECT tool_name, status FROM tool_actions "
+        "WHERE created_at BETWEEN :f AND :t "
+        "ORDER BY created_at"
+    ), {"f": date_from, "t": date_to})).fetchall()
+
+    total_errors = 0
+    recovered = 0
+
+    for i, row in enumerate(rows):
+        if row[1] == "error":
+            total_errors += 1
+            if i + 1 < len(rows):
+                next_row = rows[i + 1]
+                if next_row[1] != "error":
+                    recovered += 1
+
+    recovery_rate = round(recovered / total_errors, 3) if total_errors > 0 else 0.0
+    return {"total_errors": total_errors, "recovered": recovered, "recovery_rate": recovery_rate}
+
+
+async def _calc_metacognition(session, date_from: str, date_to: str) -> dict:
+    row = (await session.execute(text(
+        "SELECT COUNT(*) as total, "
+        "SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as success "
+        "FROM tool_actions "
+        "WHERE expected_result IS NOT NULL AND created_at BETWEEN :f AND :t"
+    ), {"f": date_from, "t": date_to})).fetchone()
+
+    total = row[0] or 0
+    success = row[1] or 0
+    return {"predictions_made": total, "success_rate": round(success / total, 3) if total > 0 else 0.0}
+
+
+async def _calc_memory_utilization(session, date_from: str, date_to: str) -> dict:
+    rows = (await session.execute(text(
+        "SELECT tool_name, COUNT(*) as cnt FROM tool_actions "
+        "WHERE tool_name IN ('search_memories', 'write_diary') "
+        "AND created_at BETWEEN :f AND :t "
+        "GROUP BY tool_name"
+    ), {"f": date_from, "t": date_to})).fetchall()
+
+    counts = {r[0]: r[1] for r in rows}
+    return {"search_count": counts.get("search_memories", 0), "write_count": counts.get("write_diary", 0)}
+
+
+async def _calc_principle_accumulation(session, date_from: str, date_to: str) -> dict:
+    row = (await session.execute(text(
+        "SELECT COUNT(*) FROM self_model_snapshots "
+        "WHERE changed_key = 'principles' AND created_at BETWEEN :f AND :t"
+    ), {"f": date_from, "t": date_to})).fetchone()
+
+    distillation_count = row[0] if row else 0
+
+    # 現在のself_model.jsonから原則数を取得
+    from app.tools.builtin import _load_self_model
+    model = _load_self_model()
+    principles = model.get("principles", [])
+    current = len(principles) if isinstance(principles, list) else 0
+
+    return {"distillation_count": distillation_count, "current_principles": current}

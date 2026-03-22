@@ -16,6 +16,7 @@ class Conversation(Base):
     ended_at = Column(DateTime, nullable=True)
     summary = Column(Text, nullable=True)
     is_imported = Column(Boolean, default=False)
+    source = Column(String(20), default="chat")  # "chat" or "autonomous"
 
     messages = relationship("Message", back_populates="conversation", order_by="Message.created_at")
 
@@ -55,6 +56,16 @@ class ToolAction(Base):
     expected_result = Column(Text, nullable=True)    # 実行前の予測（メタ認知用）
     status = Column(String(20), default="success")  # success / error
     execution_ms = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class SelfModelSnapshot(Base):
+    """self_model.jsonの変更履歴（自己進化計測用）"""
+    __tablename__ = "self_model_snapshots"
+
+    id = Column(Integer, primary_key=True)
+    content = Column(Text, nullable=False)          # JSON全体
+    changed_key = Column(String(100), nullable=True)  # 変更されたキー
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
