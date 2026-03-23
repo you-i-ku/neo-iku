@@ -42,13 +42,13 @@ def build_tools_prompt() -> str:
         ("外部", ["web_search", "fetch_raw_resource"]),
         ("実行・拡張", ["exec_code", "create_tool"]),
         ("システム", ["get_system_metrics"]),
-        ("出力", ["output"]),
+        ("出力", ["output_UI"]),
         ("待機", ["non_response"]),
     ]
 
     lines = [
         "必ず以下のいずれかのツールを呼び出してください。",
-        "ツールを呼ばないテキストはどこにも届きません。沈黙したい場合は non_response を使ってください。",
+        "ツールを呼ばないテキストはどこにも届きません。output_UIで発言するか、non_responseで沈黙を選んでください。",
         "",
         "書式: [TOOL:ツール名 引数=値 expect=結果予測]",
         "ブロック書式:",
@@ -83,10 +83,10 @@ def build_tools_prompt() -> str:
         lines.append("")
 
     lines.append("仕組み:")
-    lines.append("- output経由のテキストのみユーザーに表示される")
+    lines.append("- output_UI経由のテキストのみユーザーに表示される")
     lines.append("- 承認マーク付きツールは実行前にユーザー確認がある")
     lines.append("- expect= はツール実行前の予測。結果と比較される（省略: expect=skip）")
-    lines.append("- 1応答で複数呼び出し可。ツールなしの応答で行動完了")
+    lines.append("- 1応答で複数呼び出し可。この応答の後、行動は完了する")
     lines.append("- [TOOL:...]はthinkの外に書く")
 
     return "\n".join(lines)

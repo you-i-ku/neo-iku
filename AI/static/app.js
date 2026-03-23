@@ -18,6 +18,18 @@ let countdownInterval = null;
 let countdownRemaining = 0;
 let processingIndicator = null; // チャット欄のthinking表示
 
+// 思考ログの自動スクロール制御（ユーザーが上を見てる時はスクロールしない）
+let devUserScrolledUp = false;
+thoughtLog.addEventListener("scroll", () => {
+    const threshold = 80;
+    devUserScrolledUp = thoughtLog.scrollHeight - thoughtLog.scrollTop - thoughtLog.clientHeight > threshold;
+});
+function devScrollToBottom() {
+    if (!devUserScrolledUp) {
+        devScrollToBottom();
+    }
+}
+
 // --- タブ切り替え ---
 
 const tabBtns = document.querySelectorAll(".tab-btn");
@@ -209,7 +221,7 @@ function addDevSession(source, preview) {
     devState[key].sessionEl = el.querySelector(".dev-session-rounds");
     devState[key].roundEl = null;
     devState[key].contentEl = null;
-    thoughtLog.scrollTop = thoughtLog.scrollHeight;
+    devScrollToBottom();
 }
 
 function addDevRound(round, source) {
@@ -225,7 +237,7 @@ function addDevRound(round, source) {
     parent.appendChild(el);
     s.roundEl = el.querySelector(".dev-round-content");
     s.contentEl = null;
-    thoughtLog.scrollTop = thoughtLog.scrollHeight;
+    devScrollToBottom();
 }
 
 // think + stream 統合表示
@@ -241,7 +253,7 @@ function appendDevContent(content, isThink) {
     span.className = isThink ? "dev-text-think" : "dev-text-stream";
     span.textContent = content;
     s.contentEl.appendChild(span);
-    thoughtLog.scrollTop = thoughtLog.scrollHeight;
+    devScrollToBottom();
 }
 
 // --- 開発者タブ: ツール呼び出し/結果 ---
@@ -254,7 +266,7 @@ function appendDevToolCall(content) {
     el.className = "dev-tool-call";
     el.textContent = "⚙ " + content;
     s.roundEl.appendChild(el);
-    thoughtLog.scrollTop = thoughtLog.scrollHeight;
+    devScrollToBottom();
 }
 
 function appendDevToolResult(name, content) {
@@ -269,7 +281,7 @@ function appendDevToolResult(name, content) {
         el.textContent = content;
     }
     s.roundEl.appendChild(el);
-    thoughtLog.scrollTop = thoughtLog.scrollHeight;
+    devScrollToBottom();
 }
 
 // --- チャット: 処理中インジケーター ---
@@ -948,8 +960,6 @@ devConcurrentToggle.addEventListener("change", async () => {
 
 const devIntervalInput = document.getElementById("dev-interval");
 const devIntervalBtn = document.getElementById("dev-interval-btn");
-const devRoundsInput = document.getElementById("dev-rounds");
-const devRoundsBtn = document.getElementById("dev-rounds-btn");
 const devTriggerBtn = document.getElementById("dev-trigger-btn");
 const devResetBtn = document.getElementById("dev-reset-btn");
 const devClearSelfModelBtn = document.getElementById("dev-clear-selfmodel-btn");
@@ -959,7 +969,6 @@ async function loadDevSettings() {
         const resp = await fetch("/api/dev/settings");
         const data = await resp.json();
         devIntervalInput.value = data.autonomous_interval;
-        devRoundsInput.value = data.tool_max_rounds;
         if (data.concurrent_mode !== undefined) {
             devConcurrentToggle.checked = data.concurrent_mode;
         }
@@ -988,22 +997,7 @@ devIntervalBtn.addEventListener("click", async () => {
     }
 });
 
-devRoundsBtn.addEventListener("click", async () => {
-    const rounds = parseInt(devRoundsInput.value);
-    if (isNaN(rounds) || rounds < 1) return;
-    devRoundsBtn.disabled = true;
-    try {
-        await fetch("/api/dev/tool-max-rounds", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ rounds }),
-        });
-        devRoundsBtn.textContent = "✓";
-        setTimeout(() => { devRoundsBtn.textContent = "設定"; devRoundsBtn.disabled = false; }, 1000);
-    } catch (e) {
-        devRoundsBtn.disabled = false;
-    }
-});
+
 
 devTriggerBtn.addEventListener("click", async () => {
     devTriggerBtn.disabled = true;

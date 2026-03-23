@@ -15,7 +15,7 @@ from app.memory.store import (
     record_tool_action,
 )
 from app.persona.system_prompt import get_mode, IKU_SYSTEM_PROMPT
-from app.tools.registry import parse_tool_calls, execute_tool, build_tools_prompt
+from app.tools.registry import parse_tool_calls, execute_tool, build_tools_prompt, get_all_tools
 from app.tools.builtin import (
     _load_self_model,
     PENDING_MARKER, get_pending_overwrite,
@@ -27,7 +27,7 @@ from app.tools.builtin import (
     execute_pending_create_tool, cancel_pending_create_tool,
 )
 from app.memory.store import get_conversation_messages
-from config import BASE_DIR, EXEC_CODE_TIMEOUT, CONTEXT_KEEP_ROUNDS, CHAT_HISTORY_MESSAGES
+from config import BASE_DIR, EXEC_CODE_TIMEOUT, CONTEXT_KEEP_ROUNDS, CHAT_HISTORY_MESSAGES, TOOL_MAX_CALLS_PER_RESPONSE, TOOL_SAME_NAME_LIMIT
 
 logger = logging.getLogger("iku.pipeline")
 
@@ -129,6 +129,7 @@ class Pipeline:
 
     def add_interrupt(self, message: str):
         self._interrupt_queue.put_nowait(message)
+        self._emit_signal("user_message", message[:50])
 
     @property
     def is_processing(self) -> bool:
@@ -186,9 +187,7 @@ class Pipeline:
         action_goal = req.goal
         step_history: list[dict] = []
         last_full_result = ""
-        tool_round = 0
         seen_tool_calls: set[str] = set()
-        output_count = 0
         had_output = False
         response = ""
 
@@ -199,7 +198,6 @@ class Pipeline:
             system_base = self._build_system_base()
             logger.debug(f"system_base 構築完了: {len(system_base)} chars")
             memory_context = req.memory_context
-            # 記憶検索はAIが自分でsearch_memoriesツールを使って行う（自動注入しない）
 
             # chat の場合、ユーザーメッセージをDB保存
             if req.source == "chat":
@@ -209,12 +207,12 @@ class Pipeline:
                 self._emit_signal("user_message", req.goal[:50])
                 logger.debug("ユーザーメッセージDB保存完了")
 
-            # --- マルチターンmessages構築 ---
+            # --- messages構築 ---
             messages = [
                 {"role": "system", "content": system_base or ""},
             ]
 
-            # Phase 4: 会話継続 — 既存conv_idが渡された場合、過去のやり取りをロード
+            # 会話継続 — 既存conv_idが渡された場合、過去のやり取りをロード
             if req.conv_id is not None:
                 try:
                     async with async_session() as session:
@@ -237,104 +235,59 @@ class Pipeline:
             )
             messages.append({"role": "user", "content": initial_prompt})
 
-            for _ in range(_config.TOOL_MAX_ROUNDS + 2):
-                # ユーザー割り込みチェック
-                while not self._interrupt_queue.empty():
-                    try:
-                        msg = self._interrupt_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                    step_history.append({
-                        "tool": "(ユーザー割り込み)",
-                        "args_summary": msg[:80],
-                        "result_summary": "ユーザーメッセージ",
-                    })
-                    messages.append({"role": "user", "content": f"ユーザーからの追加メッセージ: {msg}"})
-                    async with async_session() as session:
-                        await add_message(session, conv_id, "user", msg)
-                        await session.commit()
-                    await self._broadcast(json.dumps({
-                        "type": "user_interrupt_ack",
-                        "content": msg,
-                    }))
-
-                # コンテキストウィンドウ管理
-                trimmed = self._trim_messages(messages)
-
-                # ストリーミングLLM
-                logger.info(f"LLM呼び出し: round={tool_round} messages={len(trimmed)}")
-                response, repeat_detected = await self._call_llm_streaming(trimmed, req.source, tool_round)
-                logger.info(f"LLM応答: round={tool_round} response_len={len(response)} repeat={repeat_detected}")
-                if not response:
-                    logger.warning(f"LLM応答が空: round={tool_round} — LM Studioが応答しているか確認してください")
+            # ユーザー割り込みチェック（LLM呼び出し前に1回）
+            while not self._interrupt_queue.empty():
+                try:
+                    msg = self._interrupt_queue.get_nowait()
+                except asyncio.QueueEmpty:
                     break
+                messages.append({"role": "user", "content": f"ユーザーからの追加メッセージ: {msg}"})
+                async with async_session() as session:
+                    await add_message(session, conv_id, "user", msg)
+                    await session.commit()
+                await self._broadcast(json.dumps({
+                    "type": "user_interrupt_ack",
+                    "content": msg,
+                }))
 
-                # ループ検出 → 繰り返し部分を切り落とし、フィードバックして次ラウンドへ
-                if repeat_detected:
-                    response = self._trim_repeated(response)
-                    repeat_msg = "あなたの出力が同じ内容の繰り返しに入ったため中断しました。"
-                    messages.append({"role": "assistant", "content": self._strip_think(response)})
-                    messages.append({"role": "system", "content": repeat_msg})
-                    await self._broadcast(json.dumps({
-                        "type": "dev_tool_result",
-                        "name": "(system)",
-                        "content": repeat_msg,
-                    }))
-                    tool_round += 1
-                    continue
+            # コンテキストウィンドウ管理
+            trimmed = self._trim_messages(messages)
 
+            # --- 1回のLLM呼び出し ---
+            logger.info(f"LLM呼び出し: messages={len(trimmed)}")
+            response, repeat_detected, stream_had_tool_markers = await self._call_llm_streaming(trimmed, req.source, 0)
+            logger.info(f"LLM応答: response_len={len(response)} repeat={repeat_detected} markers={stream_had_tool_markers}")
+
+            if not response:
+                logger.warning("LLM応答が空 — LM Studioが応答しているか確認してください")
+            elif self._stop_event.is_set():
                 # 中断チェック
-                if self._stop_event.is_set():
-                    self._stop_event.clear()
-                    stop_note = "ユーザーにより出力を中断されました。"
-                    if self._stop_feedback:
-                        stop_note += f"\n理由: {self._stop_feedback}"
-                    if response.strip():
-                        async with async_session() as session:
-                            await add_message(session, conv_id, "assistant", response)
-                            await add_message(session, conv_id, "user", stop_note)
-                            await session.commit()
-                    await self._broadcast(json.dumps({"type": "stopped"}))
-                    break
-
-                clean = self._strip_think(response)
-
-                # assistantメッセージをmessagesに追加（thinkタグ除去）
-                messages.append({"role": "assistant", "content": clean})
-
-                # ツール上限チェック
-                tool_calls = []
-                if tool_round < _config.TOOL_MAX_ROUNDS:
-                    tool_calls = parse_tool_calls(clean) or parse_tool_calls(response)
-                elif parse_tool_calls(clean) or parse_tool_calls(response):
-                    limit_msg = f"ツール実行上限（{_config.TOOL_MAX_ROUNDS}回）に達しました。ツールなしで応答を完了してください。"
+                self._stop_event.clear()
+                stop_note = "ユーザーにより出力を中断されました。"
+                if self._stop_feedback:
+                    stop_note += f"\n理由: {self._stop_feedback}"
+                if response.strip():
                     async with async_session() as session:
                         await add_message(session, conv_id, "assistant", response)
-                        await add_message(session, conv_id, "tool", limit_msg)
+                        await add_message(session, conv_id, "user", stop_note)
                         await session.commit()
-                    messages.append({"role": "system", "content": limit_msg})
-                    last_full_result = limit_msg
-                    step_history.append({"tool": "(上限到達)", "args_summary": "", "result_summary": f"上限{_config.TOOL_MAX_ROUNDS}回到達"})
-                    tool_round += 1
-                    continue
+                await self._broadcast(json.dumps({"type": "stopped"}))
+            else:
+                # ループ検出時は繰り返し部分を切り落とす
+                if repeat_detected:
+                    response = self._trim_repeated(response)
 
-                if not tool_calls:
-                    # ツールなし → フィードバックしてリトライさせる（終了はnon_responseで明示的に）
-                    no_tool_msg = "ツールの呼び出しが確認できませんでした。outputツールで出力するか、non_responseで完了してください。"
-                    messages.append({"role": "system", "content": no_tool_msg})
-                    tool_round += 1
-                    continue
+                clean = self._strip_think(response)
+                tool_calls = parse_tool_calls(clean) or parse_tool_calls(response)
 
-                # --- ツール実行 ---
-                tool_round += 1
+                # --- ツール実行（1応答内の全ツールを実行） ---
                 all_results = []
-                loop_complete = False
-
-                for tool_name, tool_args in tool_calls:
-                    # non_response → 明示的な「行動完了」シグナル
+                for tool_name, tool_args in (tool_calls or []):
+                    # non_response → 沈黙を選択した記録
                     if tool_name == "non_response":
-                        loop_complete = True
-                        logger.info("non_response: ループ終了")
+                        logger.info("non_response: 沈黙を選択")
+                        all_results.append("[non_response: 沈黙を選択]")
+                        step_history.append({"tool": "non_response", "args_summary": "", "result_summary": "沈黙を選択"})
                         continue
 
                     expected = tool_args.pop("expect", None)
@@ -345,14 +298,13 @@ class Pipeline:
                     call_key = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
                     if call_key in seen_tool_calls:
                         logger.info(f"重複ツール呼び出しスキップ: {tool_name}")
-                        all_results.append(f"[ツール結果: {tool_name}]\n同じツールを同じ引数で再度呼び出しました。既に結果は返しています。目的を達成したならツールを呼ばずに応答を完了してください。")
                         step_history.append({"tool": tool_name, "args_summary": "", "result_summary": "重複スキップ"})
                         continue
                     seen_tool_calls.add(call_key)
 
                     logger.info(f"ツール: {tool_name} {tool_args}")
                     args_str = " ".join(f"{k}={v}" for k, v in tool_args.items()) if tool_args else ""
-                    is_output = tool_name == "output"
+                    is_output = tool_name == "output_UI"
 
                     # dev tab通知
                     await self._broadcast(json.dumps({
@@ -392,28 +344,23 @@ class Pipeline:
                         "content": result[:2000] if len(result) > 2000 else result,
                     }))
 
-                    # output処理
+                    # output_UI処理
                     if is_output and action_status == "success":
-                        output_count += 1
                         had_output = True
-                        await self._broadcast(json.dumps({"type": "tool_call", "content": "output"}))
+                        await self._broadcast(json.dumps({"type": "tool_call", "content": "output_UI"}))
                         await self._broadcast(json.dumps({
                             "type": "output", "content": result, "source": req.source,
                         }))
-                        output_feedback = f"出力完了（{len(result)}文字）。追加の行動がなければツールを呼ばずに応答を完了してください。"
-                        if output_count >= 2:
-                            output_feedback += f"\n※あなたはこのセッションでoutputツールを{output_count}回呼び出しています。伝えたいことは既に出力済みではありませんか？"
-                        all_results.append(f"[ツール結果: {tool_name}]\n{output_feedback}")
+                    elif not is_output:
+                        await self._broadcast(json.dumps({
+                            "type": "autonomous_tool", "name": tool_name,
+                            "args": args_str, "status": action_status,
+                        }))
+
+                    if expected:
+                        all_results.append(f"[ツール結果: {tool_name}]\nあなたの予測: {expected}\n実際の結果: {result}")
                     else:
-                        if not is_output:
-                            await self._broadcast(json.dumps({
-                                "type": "autonomous_tool", "name": tool_name,
-                                "args": args_str, "status": action_status,
-                            }))
-                        if expected:
-                            all_results.append(f"[ツール結果: {tool_name}]\nあなたの予測: {expected}\n実際の結果: {result}")
-                        else:
-                            all_results.append(f"[ツール結果: {tool_name}]\n{result}")
+                        all_results.append(f"[ツール結果: {tool_name}]\n{result}")
 
                     # DB記録
                     async with async_session() as session:
@@ -432,26 +379,30 @@ class Pipeline:
                         "expected": expected,
                     })
 
+                # ツール未実行検出
+                executed_tools = [s["tool"] for s in step_history if s.get("tool")]
+                if not executed_tools:
+                    if stream_had_tool_markers:
+                        # ストリーミングで[TOOLを検出したがパース/実行に至らなかった
+                        fail_msg = "ツールマーカーを検出しましたが、正しい形式で実行されませんでした。"
+                    else:
+                        fail_msg = "ツールが実行されませんでした。"
+                    all_results.append(fail_msg)
+                    step_history.append({"tool": "(tool_fail)", "args_summary": "", "result_summary": fail_msg})
+                    self._emit_signal("tool_fail", fail_msg)
+                    logger.info(f"tool_fail: {fail_msg}")
+
+                # DB保存
                 combined_results = "\n\n".join(all_results)
                 last_full_result = combined_results
-
-                if loop_complete:
-                    # non_response呼び出し → ループ終了、DBに記録
-                    save_results = combined_results or "[non_response: 行動完了を選択]"
-                    async with async_session() as session:
-                        await add_message(session, conv_id, "assistant", response)
-                        await add_message(session, conv_id, "tool", save_results)
-                        await session.commit()
-                    break
-
-                # ツール結果をsystemロールでmessagesに追加
-                messages.append({"role": "system", "content": combined_results})
-
-                # DB保存（中間）
                 async with async_session() as session:
                     await add_message(session, conv_id, "assistant", response)
-                    await add_message(session, conv_id, "tool", combined_results)
+                    if combined_results:
+                        await add_message(session, conv_id, "tool", combined_results)
                     await session.commit()
+
+            # action_completeシグナル発火
+            self._emit_signal("action_complete", action_goal[:50] if action_goal else req.source)
 
         except Exception as e:
             import traceback
@@ -484,6 +435,8 @@ class Pipeline:
         llm = llm_manager.get()
         full_response = ""
         in_think = False
+        stream_text = ""  # think外テキスト（ツール検出用）
+        tool_overflow = False
 
         logger.info(f"_call_llm_streaming 開始: round={round_num} model={getattr(llm, 'model', '?')} base_url={getattr(llm, 'base_url', '?')}")
 
@@ -519,12 +472,41 @@ class Pipeline:
                         if start_idx != -1:
                             if buf[:start_idx]:
                                 await self._broadcast(json.dumps({"type": "dev_stream", "content": buf[:start_idx]}))
+                                stream_text += buf[:start_idx]
                             await self._broadcast(json.dumps({"type": "dev_think_start"}))
                             buf = buf[start_idx + 7:]
                             in_think = True
                         else:
                             await self._broadcast(json.dumps({"type": "dev_stream", "content": buf}))
+                            stream_text += buf
                             buf = ""
+
+                # ストリーミング中ツール呼び出し検出（think外テキストのみ）
+                # [TOOL 付近（前後30文字）に登録済みツール名があればカウント
+                if not in_think and not tool_overflow:
+                    tool_names = list(get_all_tools().keys())
+                    hits: list[str] = []
+                    for m in re.finditer(r'\[TOOL', stream_text):
+                        vicinity = stream_text[m.start():m.start() + 30]
+                        for tn in tool_names:
+                            if tn in vicinity:
+                                hits.append(tn)
+                    if hits:
+                        if len(hits) > TOOL_MAX_CALLS_PER_RESPONSE:
+                            logger.warning(f"ストリーミング中ツール総数超過: {len(hits)}個検出、中断")
+                            tool_overflow = True
+                        else:
+                            counts: dict[str, int] = {}
+                            for n in hits:
+                                counts[n] = counts.get(n, 0) + 1
+                            for n, c in counts.items():
+                                if c > TOOL_SAME_NAME_LIMIT:
+                                    logger.warning(f"ストリーミング中同一ツール超過: {n}={c}回、中断")
+                                    tool_overflow = True
+                                    break
+
+                if tool_overflow:
+                    break
 
             if in_think:
                 await self._broadcast(json.dumps({"type": "dev_think_end"}))
@@ -536,11 +518,13 @@ class Pipeline:
                 "type": "error",
                 "content": f"（LLMエラー: {e}）",
             }))
-            return ("", False)
+            return ("", False, False)
 
         repeat_detected = getattr(llm, "last_repeat_detected", False)
-        logger.info(f"stream_chat 完了: total_chars={len(full_response)} repeat={repeat_detected}")
-        return (full_response, repeat_detected)
+        # ストリーミング中に[TOOLマーカーを検出したか
+        stream_had_tool_markers = bool(re.search(r'\[TOOL', stream_text))
+        logger.info(f"stream_chat 完了: total_chars={len(full_response)} repeat={repeat_detected} tool_markers={stream_had_tool_markers}")
+        return (full_response, repeat_detected, stream_had_tool_markers)
 
     # --- 承認フロー ---
 
@@ -809,7 +793,7 @@ class Pipeline:
         if status == "error":
             return f"エラー: {result[:60]}"
         match tool_name:
-            case "output":
+            case "output_UI":
                 return f"出力完了（{len(result)}文字）"
             case "read_file":
                 return f"取得成功（{result.count(chr(10)) + 1}行）"

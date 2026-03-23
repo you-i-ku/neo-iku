@@ -30,6 +30,7 @@ class AutonomousScheduler:
         self._is_checking = False
         self._concurrent_mode = False
         self._is_speaking = False
+        self._last_conv_id: int | None = None  # セッション継続用
 
     # --- シグナル ---
 
@@ -162,6 +163,7 @@ class AutonomousScheduler:
                 logger.warning("前回の自律行動がまだ実行中。スキップ。")
                 continue
 
+            self._last_conv_id = None  # タイマー起因は新規セッション
             self.add_signal("idle_tick")
 
             try:
@@ -214,16 +216,26 @@ class AutonomousScheduler:
         except Exception as e:
             logger.error(f"候補生成フォールバック: {e}")
 
-        # 4. 行動 (Act): 内側ループ（pipeline）で実行
+        # 4. 行動 (Act): pipelineで実行
+        # action_complete起因なら前回のconv_idを引き継ぐ（セッション継続）
+        continue_conv_id = None
+        if self._last_conv_id is not None:
+            has_action_complete = any(s["type"] == "action_complete" for s in signal_snapshot)
+            if has_action_complete:
+                continue_conv_id = self._last_conv_id
+                logger.info(f"セッション継続: conv_id={continue_conv_id}")
+
         request = PipelineRequest(
             source="autonomous",
             goal=action_goal,
+            conv_id=continue_conv_id,
             memory_context=memory_context,
             signal_summary=signal_summary,
             bootstrap_hint=bootstrap_hint,
             selected_action=selected_action,
         )
         result = await pipeline.submit(request)
+        self._last_conv_id = result.conv_id  # 次のアクションでの継続用に保持
 
         # 5. 振り返り (Reflect): 経験からの学び + 自己モデル更新検討
         await self._reflect(selected_action, result, self_model, action_goal)
@@ -236,19 +248,28 @@ class AutonomousScheduler:
 
             action_description = selected_action["description"] if selected_action else action_goal
             if not action_description:
-                return
+                # 目標なしでもツール実行があれば、実行内容から説明を生成
+                tool_names = [s["tool"] for s in result.step_history if s.get("tool")]
+                if tool_names:
+                    action_description = " → ".join(tool_names)
+                else:
+                    return
 
-            lines = []
+            result_lines = []
+            prediction_lines = []
             for s in result.step_history:
-                line = f"{s['tool']}: {s['result_summary']}"
+                result_lines.append(f"{s['tool']}: {s['result_summary']}")
                 if s.get('expected'):
-                    line += f"\n  予測: {s['expected']}"
-                lines.append(line)
-            tool_results_text = "\n".join(lines)
+                    prediction_lines.append(
+                        f"{s['tool']}: 予測「{s['expected']}」→ 結果「{s['result_summary']}」"
+                    )
+            tool_results_text = "\n".join(result_lines)
             if result.last_full_result:
                 tool_results_text += f"\n\n最後の結果:\n{result.last_full_result[:500]}"
             if not tool_results_text:
                 return
+
+            prediction_text = "\n".join(prediction_lines) if prediction_lines else ""
 
             # ツール実行エラーがあった場合のシグナル
             has_error = any(
@@ -259,7 +280,7 @@ class AutonomousScheduler:
 
             # 原則蒸留
             principle = await self._reflect_on_action(
-                action_description, tool_results_text, self_model
+                action_description, tool_results_text, self_model, prediction_text
             )
             if principle:
                 self._save_principle(principle, self_model)
@@ -347,7 +368,8 @@ class AutonomousScheduler:
 
     # --- Phase 2: 経験フィードバック＆原則蒸留 ---
 
-    async def _reflect_on_action(self, action_description: str, tool_results: str, self_model: dict) -> str | None:
+    async def _reflect_on_action(self, action_description: str, tool_results: str,
+                                   self_model: dict, prediction_text: str = "") -> str | None:
         principles = self_model.get("principles", [])
         principles_ctx = ""
         if isinstance(principles, list) and principles:
@@ -355,12 +377,16 @@ class AutonomousScheduler:
             p_texts = [p["text"] if isinstance(p, dict) and "text" in p else str(p) for p in recent]
             principles_ctx = "\n既存の原則:\n" + "\n".join(f"- {t}" for t in p_texts) + "\n既に同じ内容の原則があれば「なし」と答えてください。\n"
 
+        prediction_section = ""
+        if prediction_text:
+            prediction_section = f"\n予測と実際の比較:\n{prediction_text}\n"
+
         reflect_prompt = f"""あなたは以下の行動を行いました:
 行動: {action_description}
 
 結果:
 {tool_results[:1500]}
-{principles_ctx}
+{prediction_section}{principles_ctx}
 この経験から学んだことを1文の原則として蒸留してください。
 新しい学びがなければ「なし」とだけ答えてください。
 形式: 原則: [学んだこと]"""

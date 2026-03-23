@@ -105,16 +105,6 @@ async def trigger_autonomous():
     return {"triggered": True}
 
 
-class ToolRoundsRequest(BaseModel):
-    rounds: int
-
-@router.post("/dev/tool-max-rounds")
-async def set_tool_max_rounds(req: ToolRoundsRequest):
-    """ツール最大ラウンド数を変更"""
-    import config
-    config.TOOL_MAX_ROUNDS = max(1, min(30, req.rounds))
-    return {"tool_max_rounds": config.TOOL_MAX_ROUNDS}
-
 
 @router.post("/dev/reset-db")
 async def reset_db():
@@ -150,10 +140,8 @@ async def set_concurrent_mode(req: ConcurrentModeRequest):
 @router.get("/dev/settings")
 async def get_dev_settings():
     """開発用設定の現在値を取得"""
-    import config
     return {
         "autonomous_interval": scheduler._interval,
-        "tool_max_rounds": config.TOOL_MAX_ROUNDS,
         "concurrent_mode": scheduler._concurrent_mode,
         "motivation_energy": round(scheduler._motivation_energy, 1),
     }

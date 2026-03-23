@@ -31,7 +31,8 @@ AUTONOMOUS_INTERVAL_JITTER = 0   # 一時停止中
 MEMORY_SEARCH_LIMIT = 5
 
 # ツール
-TOOL_MAX_ROUNDS = 8  # 1回の応答で連続実行できるツール回数（暴走防止）
+TOOL_MAX_CALLS_PER_RESPONSE = 6  # 1レスポンス内のツール呼び出し総数上限（ストリーミング中断用）
+TOOL_SAME_NAME_LIMIT = 3  # 同一ツールの連続呼び出し上限（ストリーミング中断用）
 EXEC_CODE_TIMEOUT = 30  # exec_codeのタイムアウト（秒）
 
 # 内発的動機システム

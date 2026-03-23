@@ -794,11 +794,11 @@ async def fetch_raw_resource(url: str = "", max_size: str = "100000") -> str:
         return f"エラー: リソース取得失敗: {e}"
 
 
-async def output(content: str = "", to: str = "chat") -> str:
+async def output_UI(content: str = "", to: str = "chat") -> str:
     """ユーザーに向けてテキストを出力する（UIに表示される）"""
     if not content:
         return "エラー: contentを指定してください。"
-    # 実際のUI表示はchat.py/autonomous.pyが tool_name=="output" を検知して処理する
+    # 実際のUI表示はpipeline.pyが tool_name=="output_UI" を検知して処理する
     return content
 
 
@@ -873,10 +873,10 @@ def register_all():
         required_args=["query"],
     )
     register_tool(
-        "output",
+        "output_UI",
         "ユーザーに向けてテキストを出力する。発言したい時はこのツールを使う。使わなければUIには何も表示されない",
         'content=出力するテキスト to=出力先（デフォルト: chat）',
-        output,
+        output_UI,
         required_args=["content"],
     )
     register_tool(
