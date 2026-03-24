@@ -412,6 +412,38 @@
 - [x] `_trim_repeated()`ヘルパー追加（ループ部分を切って1回分だけ残す）
 - [x] `LMStudioProvider`に`last_repeat_detected`フラグ + `_find_repeat_start()`メソッド追加
 
+### Step 43: 計画-実行分離 + 環境刺激注入 + 蒸留モニタリングUI
+
+**Feature 1: 計画-実行分離アーキテクチャ**
+- [x] `_process_plan_execute()` — 自律行動用の計画→実行パイプライン（Phase1: LLMにツール順序を計画させる → Phase2: ツールごとに1回のLLM呼び出し、前回結果を参照可能）
+- [x] `_execute_single_tool()` — ツール実行の共通ヘルパー抽出（シグナル・エネルギー消費・DB記録・承認・UI通知を一元管理）
+- [x] `build_planning_prompt()` — 計画フェーズ用ツールリスト（引数なし、名前+説明のみ）
+- [x] `parse_plan()` — LLM出力からツール名リストを抽出（`1. ツール名`等のパターン対応、登録済みツール名のみ）
+- [x] `_build_planning_prompt()` / `_build_execution_prompt()` — 計画/実行フェーズ用プロンプト
+- [x] `_run()` でsource=autonomousかつPLAN_EXECUTE_ENABLED時に`_process_plan_execute()`にルーティング
+- [x] 計画パース失敗時は既存`_process()`にフォールバック
+- [x] config.py: `PLAN_EXECUTE_ENABLED=True`, `PLAN_MAX_TOOLS=5`
+- [x] 実行プロンプトにexpect=の構造指示を追加（予測→誤差→学習ループの活性化）
+
+**Feature 2: 環境刺激注入**
+- [x] `_generate_env_stimulus()` — 確率的（30%）に環境刺激を生成
+- [x] 4種の生成器: ランダムワード2語、時間パターン、ランダムファイル、ランダム数値
+- [x] `_speak()`のObserveフェーズで`env_stimulus`シグナルとして注入
+- [x] config.py: `ENV_STIMULUS_ENABLED`, `ENV_STIMULUS_PROBABILITY=0.3`, `ENV_STIMULUS_WORDS`（80語）
+- [x] `MOTIVATION_DEFAULT_WEIGHTS`に`env_stimulus: 5`追加
+- [x] `_SUMMARY_SIGNALS`に`env_stimulus`追加（シグナルサマリーに表示される）
+
+**Feature 3: 蒸留モニタリングUI**
+- [x] `GET /api/distillation-log` — セッションごとのツール実行履歴+予測情報+原則リストを返す
+- [x] `Pipeline._summarize_result()`で短い要約を生成（DB生データではなく読みやすい形式）
+- [x] 自律度タブに蒸留ログセクション追加（「読み込む」ボタン）
+- [x] セッション一覧: `<details>`折りたたみ、ソースバッジ(自律/チャット)、トリガーバッジ、予測有無、ツール数
+- [x] ラウンド詳細: ツール名、予測、結果、一致/不一致アイコン(○/×/-)、生データ展開
+- [x] 現在の原則リスト表示（最新10個）
+
+**バグ修正**
+- [x] `duckduckgo-search`をPython 3.13にインストール（pipが3.11に紐づいていたため`python -m pip install`で解決）
+
 ## 残タスク
 
 ### 動作検証

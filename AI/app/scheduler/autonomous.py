@@ -11,6 +11,7 @@ from config import (
     MOTIVATION_DEFAULT_WEIGHTS, MOTIVATION_FLUCTUATION_SIGMA,
     MOTIVATION_SIGNAL_BUFFER_SIZE, SCORING_ENABLED,
     MOTIVATION_DEFAULT_ACTION_COSTS, MOTIVATION_DEFAULT_ACTION_COST_FALLBACK,
+    ENV_STIMULUS_ENABLED, ENV_STIMULUS_PROBABILITY, ENV_STIMULUS_WORDS,
 )
 
 logger = logging.getLogger("iku.autonomous")
@@ -227,6 +228,12 @@ class AutonomousScheduler:
         # === 外側ループ: メタ認知 ===
 
         # 1. 観測 (Observe): 現在の状態を把握
+        # 環境刺激注入（確率的）
+        env_stimulus = self._generate_env_stimulus()
+        if env_stimulus:
+            self.add_signal("env_stimulus", env_stimulus)
+            logger.info(f"環境刺激注入: {env_stimulus}")
+
         # シグナルバッファのスナップショットを取る（_check_motivationがクリアしても影響されない）
         signal_snapshot = list(self._signal_buffer)
         self_model = _load_self_model()
@@ -516,7 +523,7 @@ class AutonomousScheduler:
     # --- ユーティリティ ---
 
     # LLMに見せるシグナル種別（行動判断に有意味なもののみ）
-    _SUMMARY_SIGNALS = {"user_message", "user_connect", "tool_success", "tool_error", "self_model_update", "approval_denied"}
+    _SUMMARY_SIGNALS = {"user_message", "user_connect", "tool_success", "tool_error", "self_model_update", "approval_denied", "env_stimulus"}
 
     def _build_signal_summary(self, signals: list[dict] | None = None) -> str:
         source = signals if signals is not None else list(self._signal_buffer)
@@ -544,6 +551,79 @@ class AutonomousScheduler:
         if parts:
             summary += f", {', '.join(parts)}"
         return f"\n最近の刺激: {summary}\n"
+
+    def _generate_env_stimulus(self) -> str | None:
+        """環境刺激をランダム生成。確率的に発火し、多様な観測情報を提供する"""
+        if not ENV_STIMULUS_ENABLED:
+            return None
+        if random.random() > ENV_STIMULUS_PROBABILITY:
+            return None
+
+        generators = [
+            self._stimulus_random_word,
+            self._stimulus_time_pattern,
+            self._stimulus_random_file,
+            self._stimulus_random_number,
+        ]
+        return random.choice(generators)()
+
+    def _stimulus_random_word(self) -> str:
+        words = random.sample(ENV_STIMULUS_WORDS, min(2, len(ENV_STIMULUS_WORDS)))
+        return f"環境観測: {', '.join(words)}"
+
+    def _stimulus_time_pattern(self) -> str:
+        now = datetime.now()
+        hour = now.hour
+        if 5 <= hour < 12:
+            period = "朝"
+        elif 12 <= hour < 17:
+            period = "午後"
+        elif 17 <= hour < 21:
+            period = "夕方"
+        else:
+            period = "深夜帯"
+        weekday = ["月", "火", "水", "木", "金", "土", "日"][now.weekday()]
+        day = now.day
+        if day <= 10:
+            pos = "月初"
+        elif day >= 21:
+            pos = "月末"
+        else:
+            pos = "月中"
+        return f"環境観測: {now.strftime('%H:%M')}（{period}、{weekday}曜日、{pos}）"
+
+    def _stimulus_random_file(self) -> str:
+        import glob
+        from config import BASE_DIR
+        py_files = glob.glob(str(BASE_DIR / "app" / "**" / "*.py"), recursive=True)
+        if not py_files:
+            return "環境観測: プロジェクトファイルなし"
+        chosen = random.choice(py_files)
+        # BASE_DIR相対パスに変換
+        try:
+            rel = str(__import__('pathlib').Path(chosen).relative_to(BASE_DIR))
+        except ValueError:
+            rel = chosen
+        return f"環境観測: ファイル {rel} が存在する"
+
+    def _stimulus_random_number(self) -> str:
+        kind = random.choice(["pi", "day_of_year", "fibonacci", "random"])
+        if kind == "pi":
+            import math
+            digits = str(math.pi).replace(".", "")
+            pos = random.randint(0, min(14, len(digits) - 1))
+            return f"環境観測: 円周率の第{pos + 1}桁は{digits[pos]}"
+        elif kind == "day_of_year":
+            day = datetime.now().timetuple().tm_yday
+            return f"環境観測: 今年の{day}日目"
+        elif kind == "fibonacci":
+            a, b = 0, 1
+            n = random.randint(5, 20)
+            for _ in range(n):
+                a, b = b, a + b
+            return f"環境観測: フィボナッチ数列の第{n}項は{a}"
+        else:
+            return f"環境観測: 乱数 {random.randint(0, 999):03d}"
 
     def _build_bootstrap_hint(self, self_model: dict) -> str:
         # ヒントなし: AIが自分のコードを読んで仕組みを発見する

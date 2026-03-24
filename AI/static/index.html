@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>イク — neo-iku</title>
-    <link rel="stylesheet" href="/static/style.css?v=30">
+    <link rel="stylesheet" href="/static/style.css?v=32">
 </head>
 <body>
     <!-- ステータスバー -->
@@ -132,8 +132,19 @@
         <div id="report-content" class="report-content">
             <div class="report-empty">「集計」を押すとレポートが表示されます</div>
         </div>
+
+        <!-- 蒸留ログ -->
+        <div class="distillation-section">
+            <div class="distillation-header">
+                <h3>蒸留ログ</h3>
+                <button id="distillation-load-btn" class="report-load-btn">読み込む</button>
+            </div>
+            <div id="distillation-content" class="distillation-content">
+                <div class="report-empty">「読み込む」を押すと蒸留ログが表示されます</div>
+            </div>
+        </div>
     </div>
 
-    <script src="/static/app.js?v=32"></script>
+    <script src="/static/app.js?v=34"></script>
 </body>
 </html>

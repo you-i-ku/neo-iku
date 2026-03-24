@@ -1569,6 +1569,230 @@ details[open] > .dev-tool-result-summary::before {
     padding: 8px;
 }
 
+/* 蒸留ログ */
+.distillation-section {
+    margin-top: 24px;
+    padding-top: 16px;
+    border-top: 1px solid #21262d;
+}
+
+.distillation-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+    padding: 0 8px;
+}
+
+.distillation-header h3 {
+    font-size: 15px;
+    color: #c9d1d9;
+}
+
+.distillation-content {
+    padding: 0 8px;
+}
+
+.distillation-total {
+    font-size: 12px;
+    color: #484f58;
+    margin-bottom: 8px;
+}
+
+.distillation-principles {
+    background: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    padding: 12px 16px;
+    margin-bottom: 16px;
+}
+
+.distillation-principles h4 {
+    font-size: 13px;
+    color: #8b949e;
+    margin-bottom: 8px;
+}
+
+.distillation-principles ul {
+    list-style: none;
+}
+
+.distillation-principle-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 4px 0;
+    font-size: 12px;
+    color: #c9d1d9;
+    border-bottom: 1px solid #21262d;
+}
+
+.distillation-principle-item:last-child {
+    border-bottom: none;
+}
+
+.distillation-principle-date {
+    font-size: 10px;
+    color: #484f58;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+.distillation-session {
+    background: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 6px;
+    margin-bottom: 6px;
+}
+
+.distillation-session > summary {
+    cursor: pointer;
+    padding: 8px 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: #c9d1d9;
+    flex-wrap: wrap;
+}
+
+.distillation-session > summary:hover {
+    background: #1c2128;
+}
+
+.distillation-session-time {
+    font-family: "Consolas", monospace;
+    font-size: 11px;
+    color: #8b949e;
+}
+
+.distillation-session-count {
+    color: #484f58;
+    margin-left: auto;
+}
+
+.distillation-session-body {
+    padding: 8px 12px;
+    border-top: 1px solid #21262d;
+}
+
+/* バッジ */
+.badge-auto {
+    background: #8b5cf6;
+    color: #fff;
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 3px;
+}
+
+.badge-chat {
+    background: #58a6ff;
+    color: #fff;
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 3px;
+}
+
+.badge-trigger {
+    background: #21262d;
+    color: #8b949e;
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 3px;
+}
+
+.badge-pred {
+    background: #1a4731;
+    color: #3fb950;
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 3px;
+}
+
+.badge-pred.none {
+    background: #21262d;
+    color: #484f58;
+}
+
+/* ラウンド */
+.distillation-round {
+    padding: 6px 8px;
+    border-bottom: 1px solid #21262d;
+    font-size: 12px;
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.distillation-round:last-child {
+    border-bottom: none;
+}
+
+.distillation-round-error {
+    background: rgba(248, 81, 73, 0.08);
+}
+
+.distillation-round-num {
+    color: #484f58;
+    font-size: 11px;
+    flex-shrink: 0;
+}
+
+.distillation-round-tool {
+    font-family: "Consolas", monospace;
+    color: #58a6ff;
+    flex-shrink: 0;
+}
+
+.distillation-round-status {
+    color: #8b949e;
+    font-size: 11px;
+}
+
+.distillation-expect {
+    width: 100%;
+    font-size: 11px;
+    color: #d29922;
+    padding-left: 32px;
+}
+
+.distillation-round-summary {
+    font-size: 11px;
+    color: #c9d1d9;
+}
+
+.distillation-raw {
+    width: 100%;
+    padding-left: 32px;
+    margin-top: 4px;
+}
+
+.distillation-raw summary {
+    font-size: 10px;
+    color: #484f58;
+    cursor: pointer;
+}
+
+.distillation-raw pre {
+    font-size: 10px;
+    color: #8b949e;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 120px;
+    overflow-y: auto;
+    background: #0d1117;
+    padding: 6px;
+    border-radius: 4px;
+    margin-top: 4px;
+}
+
+/* 一致表示 */
+.match-ok { color: #3fb950; font-weight: bold; flex-shrink: 0; }
+.match-fail { color: #f85149; font-weight: bold; flex-shrink: 0; }
+.match-none { color: #484f58; flex-shrink: 0; }
+
 /* レスポンシブ */
 @media (max-width: 768px) {
     .dev-layout {

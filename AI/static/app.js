@@ -1226,6 +1226,95 @@ function renderMetricCard(title, value, bodyHtml) {
     `;
 }
 
+// --- 蒸留ログ ---
+
+const distillationContent = document.getElementById("distillation-content");
+const distillationLoadBtn = document.getElementById("distillation-load-btn");
+
+distillationLoadBtn.addEventListener("click", loadDistillationLog);
+
+async function loadDistillationLog() {
+    distillationLoadBtn.disabled = true;
+    distillationLoadBtn.textContent = "読み込み中...";
+    distillationContent.innerHTML = '<div class="report-loading">読み込み中...</div>';
+    try {
+        const resp = await fetch("/api/distillation-log?limit=20&offset=0");
+        const data = await resp.json();
+        renderDistillationLog(data);
+    } catch (e) {
+        distillationContent.innerHTML = `<div class="report-error">取得エラー: ${escapeHtml(e.message)}</div>`;
+    } finally {
+        distillationLoadBtn.textContent = "読み込む";
+        distillationLoadBtn.disabled = false;
+    }
+}
+
+function renderDistillationLog(data) {
+    let html = "";
+
+    // 現在の原則リスト
+    if (data.current_principles && data.current_principles.length > 0) {
+        html += '<div class="distillation-principles"><h4>現在の原則</h4><ul>';
+        for (const p of data.current_principles) {
+            const text = typeof p === "object" && p.text ? p.text : String(p);
+            const date = typeof p === "object" && p.created ? p.created.slice(0, 16) : "";
+            html += `<li class="distillation-principle-item"><span>${escapeHtml(text)}</span>${date ? `<span class="distillation-principle-date">${date}</span>` : ""}</li>`;
+        }
+        html += '</ul></div>';
+    }
+
+    // セッション一覧
+    html += `<div class="distillation-total">総セッション数: ${data.total}</div>`;
+    for (const s of data.sessions) {
+        const sourceBadge = s.source === "autonomous"
+            ? '<span class="badge-auto">自律</span>'
+            : '<span class="badge-chat">チャット</span>';
+        const triggerBadge = s.trigger
+            ? `<span class="badge-trigger">${escapeHtml(s.trigger)}</span>`
+            : "";
+        const predBadge = s.has_predictions
+            ? '<span class="badge-pred">予測あり</span>'
+            : '<span class="badge-pred none">予測なし</span>';
+
+        let roundsHtml = "";
+        for (let i = 0; i < s.rounds.length; i++) {
+            const r = s.rounds[i];
+            const matchIcon = r.has_prediction
+                ? (r.status === "success" ? '<span class="match-ok">○</span>' : '<span class="match-fail">×</span>')
+                : '<span class="match-none">-</span>';
+            const statusClass = r.status === "error" ? "distillation-round-error" : "";
+            const expectHtml = r.expected
+                ? `<div class="distillation-expect">予測: ${escapeHtml(r.expected)}</div>`
+                : "";
+            const rawHtml = r.result_raw && r.result_raw !== r.result_summary
+                ? `<details class="distillation-raw"><summary>詳細</summary><pre>${escapeHtml(r.result_raw)}</pre></details>`
+                : "";
+            roundsHtml += `
+                <div class="distillation-round ${statusClass}">
+                    <span class="distillation-round-num">#${i + 1}</span>
+                    ${matchIcon}
+                    <span class="distillation-round-tool">${escapeHtml(r.tool_name)}</span>
+                    <span class="distillation-round-status">${escapeHtml(r.status)}</span>
+                    <span class="distillation-round-summary">${escapeHtml(r.result_summary)}</span>
+                    ${expectHtml}
+                    ${rawHtml}
+                </div>`;
+        }
+
+        html += `
+            <details class="distillation-session">
+                <summary>
+                    <span class="distillation-session-time">${escapeHtml(s.started_at)}</span>
+                    ${sourceBadge} ${triggerBadge} ${predBadge}
+                    <span class="distillation-session-count">${s.round_count}ツール</span>
+                </summary>
+                <div class="distillation-session-body">${roundsHtml || '<div class="report-metric-empty">ツール実行なし</div>'}</div>
+            </details>`;
+    }
+
+    distillationContent.innerHTML = html;
+}
+
 // --- 初期化 ---
 
 connect();

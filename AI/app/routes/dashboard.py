@@ -367,3 +367,81 @@ async def _calc_principle_accumulation(session, date_from: str, date_to: str) ->
     current = len(principles) if isinstance(principles, list) else 0
 
     return {"distillation_count": distillation_count, "current_principles": current}
+
+
+# --- 蒸留モニタリング ---
+
+@router.get("/distillation-log")
+async def distillation_log(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """蒸留ログ: セッションごとのツール実行履歴+予測情報を返す"""
+    from app.tools.builtin import _load_self_model
+    from app.pipeline import Pipeline
+
+    async with async_session() as session:
+        # セッション一覧（最新順）
+        total_row = (await session.execute(text(
+            "SELECT COUNT(*) FROM conversations WHERE is_imported = 0"
+        ))).fetchone()
+        total = total_row[0] if total_row else 0
+
+        conv_rows = (await session.execute(text(
+            "SELECT id, started_at, source, trigger FROM conversations "
+            "WHERE is_imported = 0 "
+            "ORDER BY started_at DESC LIMIT :limit OFFSET :offset"
+        ), {"limit": limit, "offset": offset})).fetchall()
+
+        sessions = []
+        for conv in conv_rows:
+            conv_id, started_at, source, trigger = conv
+
+            # このセッションのツール実行
+            tool_rows = (await session.execute(text(
+                "SELECT tool_name, result_summary, expected_result, status "
+                "FROM tool_actions WHERE conversation_id = :cid "
+                "ORDER BY created_at"
+            ), {"cid": conv_id})).fetchall()
+
+            rounds = []
+            has_predictions = False
+            for tr in tool_rows:
+                has_pred = tr[2] is not None and tr[2] != ""
+                if has_pred:
+                    has_predictions = True
+                # 生データ（DB）と短い要約の両方を返す
+                raw_result = tr[1] or ""
+                short_summary = Pipeline._summarize_result(tr[0], raw_result, tr[3] or "success")
+                rounds.append({
+                    "tool_name": tr[0],
+                    "result_summary": short_summary,
+                    "result_raw": raw_result[:200] if len(raw_result) > 80 else raw_result,
+                    "expected": tr[2] if has_pred else None,
+                    "status": tr[3],
+                    "has_prediction": has_pred,
+                })
+
+            sessions.append({
+                "conv_id": conv_id,
+                "started_at": str(started_at) if started_at else "",
+                "source": source or "chat",
+                "trigger": trigger,
+                "rounds": rounds,
+                "round_count": len(rounds),
+                "has_predictions": has_predictions,
+            })
+
+    # 現在の原則
+    model = _load_self_model()
+    principles = model.get("principles", [])
+    if isinstance(principles, list):
+        current_principles = principles[-10:]
+    else:
+        current_principles = []
+
+    return {
+        "sessions": sessions,
+        "current_principles": current_principles,
+        "total": total,
+    }

@@ -66,7 +66,11 @@ neo-iku/
 
 ## 統一パイプライン（pipeline.py）
 
-- **1アクション制**: 1回のシグナル発火 → 1回のLLM呼び出し → 応答内の全ツールを実行 → 完了。マルチラウンドループは廃止
+- **1アクション制（チャット）**: チャットは1回のLLM呼び出し → 応答内の全ツールを実行 → 完了。従来の`_process()`を使用
+- **計画-実行分離（自律行動）**: `PLAN_EXECUTE_ENABLED=True`時、自律行動は`_process_plan_execute()`を使用。Phase1: 計画（ツール名リストを生成）→ Phase2: 実行（ツールごとに1回のLLM呼び出し、前回結果を参照可能）。計画パース失敗時は`_process()`にフォールバック。`PLAN_MAX_TOOLS`（デフォルト5）で計画の最大ツール数を制限。計画外ツールはスキップ（output_UI/non_responseは例外許可）
+- **_execute_single_tool()**: ツール実行の共通ヘルパー。`_process()`のツール実行ループと`_process_plan_execute()`の両方から使用。シグナル発火・エネルギー消費・DB記録・承認フロー・UI通知を一元管理
+- **build_planning_prompt()**: 計画フェーズ用のツールリスト（引数なし、ツール名+説明のみ）。`registry.py`で定義
+- **parse_plan()**: LLM出力からツール名リストを抽出。`1. ツール名`等のパターンに対応。登録済みツール名のみ抽出
 - **イベント駆動連鎖**: 行動完了時に`action_complete`シグナルを発火 → 動機エネルギーが閾値を超えていれば次の行動が自動起動（セッション継続: conv_id引き継ぎ）
 - **ストリーミング溢れ検出**: `_call_llm_streaming()`が`(response, repeat_detected, stream_had_tool_markers)`を返す。ストリーミング中に登録ツール名が`[TOOL`マーカー付近に検出されたらカウントし、`TOOL_MAX_CALLS_PER_RESPONSE`（デフォルト6）超過または同一ツール`TOOL_SAME_NAME_LIMIT`（デフォルト3）超過でストリーミングを中断
 - **シグナル種別**: `action_complete`（行動完了）、`tool_fail`（ツール未実行）、`user_message`（ユーザー割り込み）をpipelineから発火。従来のtool_success/tool_error/prediction_madeも継続
@@ -134,7 +138,7 @@ neo-iku/
 ## 内発的動機システム
 
 - **シグナルバッファ**: `AutonomousScheduler._signal_buffer`（deque, maxlen=100）にI/Oイベントを蓄積。`add_signal(type, detail)`で追加
-- **シグナル種別**: `prediction_made`, `conversation_end`, `user_message`, `tool_success`, `tool_error`, `tool_fail`, `self_model_update`, `idle_tick`, `action_complete`
+- **シグナル種別**: `prediction_made`, `conversation_end`, `user_message`, `tool_success`, `tool_error`, `tool_fail`, `self_model_update`, `idle_tick`, `action_complete`, `env_stimulus`
 - **シグナル発生元**: `pipeline.py`（user_message, tool_success/error, tool_fail, prediction_made, action_complete）、`chat.py`（conversation_end）、`autonomous.py`（idle_tick）、`builtin.py`（self_model_update）
 - **動機チェック**: `_check_motivation()`がself_model.jsonの`motivation_rules`を読み、weightsでエネルギー計算、decay適用、閾値判定。LLM呼び出しなし
 - **ルールはAIが定義**: `update_self_model`でkey=motivation_rules, value=JSON文字列。自動パースされてdict/listとして保存
@@ -152,6 +156,7 @@ neo-iku/
 - **原則蒸留と予測データ**: `_reflect_on_action()`に予測データ（expect引数の値と実際の結果の比較）を渡す。予測がある場合はLLMが予測誤差から学べる、予測がない場合は従来通り結果のみで蒸留。蒸留プロンプトは具体的な行動粒度を要求（「AするときはBを確認する」等）、抽象的すぎる原則を抑制
 - **セッション継続**: `_last_conv_id`でaction_complete駆動の連続行動時にconv_idを引き継ぎ、文脈を維持。タイマー起動時はリセット（新セッション）
 - **自律行動目標**: `action_goal`のデフォルトは空文字列。`drives`定義済みなら候補選択で具体的な目標に上書き。`_build_initial_prompt()`は`action_goal`が空なら`行動目標:`行を省略する（時刻・シグナル・ツール一覧のみ渡す非作為設計）
+- **環境刺激注入**: `_speak()`のObserveフェーズで確率的（`ENV_STIMULUS_PROBABILITY=0.3`）に環境刺激を`env_stimulus`シグナルとして注入。生成器4種（ランダムワード2語、時間パターン、ランダムファイル、ランダム数値）。環境は作為ではなく、時刻をプロンプトに含めるのと同じ層。AIが何をするかは操作しない。`MOTIVATION_DEFAULT_WEIGHTS`に`env_stimulus: 5`。設定: `ENV_STIMULUS_ENABLED`, `ENV_STIMULUS_PROBABILITY`, `ENV_STIMULUS_WORDS`（config.py）
 
 ## UI構成（タブUI）
 

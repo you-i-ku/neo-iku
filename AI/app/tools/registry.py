@@ -316,6 +316,64 @@ def parse_tool_calls(text: str) -> list[tuple[str, dict]]:
     return filtered
 
 
+def build_planning_prompt() -> str:
+    """計画フェーズ用のツールリスト（引数なし、ツール名+説明のみ）"""
+    if not _tools:
+        return ""
+
+    _categories = [
+        ("ファイル", ["read_file", "list_files", "search_files", "create_file", "overwrite_file"]),
+        ("記憶", ["search_memories", "write_diary", "search_action_log"]),
+        ("自己モデル", ["read_self_model", "update_self_model"]),
+        ("外部", ["web_search", "fetch_raw_resource"]),
+        ("実行・拡張", ["exec_code", "create_tool"]),
+        ("システム", ["get_system_metrics"]),
+        ("出力", ["output_UI"]),
+        ("待機", ["non_response"]),
+    ]
+
+    lines = []
+    categorized = set()
+    for cat_name, tool_names in _categories:
+        cat_tools = [(n, _tools[n]) for n in tool_names if n in _tools]
+        if not cat_tools:
+            continue
+        lines.append(f"# {cat_name}")
+        for name, info in cat_tools:
+            lines.append(f"  {name}: {info['description']}")
+            categorized.add(name)
+        lines.append("")
+
+    uncategorized = [(n, _tools[n]) for n in _tools if n not in categorized]
+    if uncategorized:
+        lines.append("# その他")
+        for name, info in uncategorized:
+            lines.append(f"  {name}: {info['description']}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def parse_plan(text: str) -> list[str]:
+    """LLM出力からツール名リストを抽出。登録済みツール名のみ返す"""
+    tool_names = list(_tools.keys())
+    results = []
+
+    for line in text.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        # パターン: "1. tool_name", "1: tool_name", "- tool_name", "tool_name"
+        cleaned = re.sub(r'^[\d]+[.:)\s]+', '', line).strip()
+        cleaned = re.sub(r'^[-*]\s*', '', cleaned).strip()
+        # 最初のスペースまでを取得
+        candidate = cleaned.split()[0] if cleaned.split() else ""
+        if candidate in tool_names and candidate not in results:
+            results.append(candidate)
+
+    return results
+
+
 async def execute_tool(name: str, args: dict) -> str:
     """ツールを実行し結果文字列を返す。エラーも文字列として返す"""
     # 引数パースエラーがある場合はそのまま返す
