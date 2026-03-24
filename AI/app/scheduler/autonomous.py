@@ -1,5 +1,6 @@
 """自発的発言スケジューラ + 内発的動機システム"""
 import asyncio
+import json
 import random
 import logging
 import time
@@ -35,8 +36,14 @@ class AutonomousScheduler:
         self._is_speaking = False
         self._last_conv_id: int | None = None  # セッション継続用
         self._last_trigger: str = "timer"  # "timer" / "energy" / "manual"
+        self._pending_messages: list[dict] = []  # ユーザー入力キュー
 
     # --- シグナル ---
+
+    def add_pending_message(self, text: str):
+        """ユーザー入力をシグナルとして蓄積（即応答ではなく動機サイクルで処理）"""
+        self._pending_messages.append({"text": text})
+        self.add_signal("user_message", text[:100])
 
     def add_signal(self, signal_type: str, detail: str = ""):
         self._signal_buffer.append({
@@ -54,10 +61,11 @@ class AutonomousScheduler:
         rules = self_model.get("motivation_rules")
         if isinstance(rules, dict):
             costs = rules.get("action_costs", {})
-            threshold = rules.get("threshold", MOTIVATION_DEFAULT_THRESHOLD)
+            ai_threshold = rules.get("threshold")
+            threshold = ai_threshold if ai_threshold is not None else self._calc_default_threshold()
         else:
             costs = {}
-            threshold = MOTIVATION_DEFAULT_THRESHOLD
+            threshold = self._calc_default_threshold()
         # AI定義のコスト → デフォルトコスト → フォールバック値
         cost = costs.get(tool_name,
                 MOTIVATION_DEFAULT_ACTION_COSTS.get(tool_name, MOTIVATION_DEFAULT_ACTION_COST_FALLBACK))
@@ -86,6 +94,15 @@ class AutonomousScheduler:
         except RuntimeError:
             pass
 
+    def _calc_default_threshold(self) -> float:
+        """1回の行動に必要なエネルギー = コスト平均 × PLAN_MAX_TOOLS"""
+        from config import PLAN_MAX_TOOLS
+        costs = list(MOTIVATION_DEFAULT_ACTION_COSTS.values())
+        if not costs:
+            return 60.0
+        avg = sum(costs) / len(costs)
+        return round(avg * PLAN_MAX_TOOLS, 1)
+
     async def _check_motivation(self):
         if self._is_checking:
             return
@@ -96,12 +113,12 @@ class AutonomousScheduler:
             rules = self_model.get("motivation_rules")
             if isinstance(rules, dict):
                 weights = rules.get("weights", {})
-                threshold = rules.get("threshold", MOTIVATION_DEFAULT_THRESHOLD)
+                ai_threshold = rules.get("threshold")
+                threshold = ai_threshold if ai_threshold is not None else self._calc_default_threshold()
                 decay = rules.get("decay_per_check", MOTIVATION_DEFAULT_DECAY)
             else:
-                # 未定義: デフォルトの神経系ウェイトで動く（AIが定義すればそちらが優先）
                 weights = MOTIVATION_DEFAULT_WEIGHTS
-                threshold = MOTIVATION_DEFAULT_THRESHOLD
+                threshold = self._calc_default_threshold()
                 decay = MOTIVATION_DEFAULT_DECAY
 
             signals = list(self._signal_buffer)
@@ -225,6 +242,20 @@ class AutonomousScheduler:
         from app.pipeline import pipeline, PipelineRequest
         from app.tools.builtin import _load_self_model
 
+        # === ユーザー入力の取り込み ===
+        pending = list(self._pending_messages)
+        self._pending_messages.clear()
+        pending_source = "autonomous"
+        pending_goal = ""
+        if pending:
+            # ユーザー入力がある場合、最新のメッセージをgoalに、sourceをchatに
+            pending_goal = pending[-1]["text"]
+            pending_source = "chat"
+            # UI通知: お返事中です
+            await pipeline._broadcast(json.dumps({
+                "type": "responding_start",
+            }))
+
         # === 外側ループ: メタ認知 ===
 
         # 1. 観測 (Observe): 現在の状態を把握
@@ -233,6 +264,10 @@ class AutonomousScheduler:
         if env_stimulus:
             self.add_signal("env_stimulus", env_stimulus)
             logger.info(f"環境刺激注入: {env_stimulus}")
+            await pipeline._broadcast(json.dumps({
+                "type": "dev_env_stimulus",
+                "content": env_stimulus,
+            }))
 
         # シグナルバッファのスナップショットを取る（_check_motivationがクリアしても影響されない）
         signal_snapshot = list(self._signal_buffer)
@@ -277,10 +312,15 @@ class AutonomousScheduler:
                 continue_conv_id = self._last_conv_id
                 logger.info(f"セッション継続: conv_id={continue_conv_id}")
 
+        # ユーザー入力があればそちらを優先（sourceもchatに）
+        final_source = pending_source if pending else "autonomous"
+        final_goal = pending_goal if pending_goal else action_goal
+        final_conv_id = continue_conv_id
+
         request = PipelineRequest(
-            source="autonomous",
-            goal=action_goal,
-            conv_id=continue_conv_id,
+            source=final_source,
+            goal=final_goal,
+            conv_id=final_conv_id,
             memory_context=memory_context,
             signal_summary=signal_summary,
             bootstrap_hint=bootstrap_hint,
@@ -290,11 +330,17 @@ class AutonomousScheduler:
         result = await pipeline.submit(request)
         self._last_conv_id = result.conv_id  # 次のアクションでの継続用に保持
 
-        # 5. 振り返り (Reflect): 経験からの学び + 自己モデル更新検討
-        await self._reflect(selected_action, result, self_model, action_goal)
+        # UI通知: お返事完了
+        if pending:
+            await pipeline._broadcast(json.dumps({
+                "type": "responding_end",
+            }))
 
-    async def _reflect(self, selected_action: dict | None, result, self_model: dict, action_goal: str = ""):
-        """行動後の振り返り: 原則蒸留 + 予測誤差シグナル"""
+        # 5. 振り返り (Reflect): 経験からの学び + 自己モデル更新検討
+        await self._reflect(selected_action, result, self_model, action_goal, selected_strategy)
+
+    async def _reflect(self, selected_action: dict | None, result, self_model: dict, action_goal: str = "", selected_strategy: str | None = None):
+        """行動後の振り返り: 特性抽出 + 予測誤差シグナル"""
         try:
             if not result.step_history:
                 return
@@ -331,13 +377,29 @@ class AutonomousScheduler:
             if has_error:
                 self.add_signal("tool_error", f"action={action_description[:50]}")
 
-            # 原則蒸留
-            principle = await self._reflect_on_action(
-                action_description, tool_results_text, self_model, prediction_text
+            # 特性抽出
+            drive = selected_action.get("drive", "") if selected_action else ""
+            principle, raw_response = await self._reflect_on_action(
+                action_description, tool_results_text, self_model, prediction_text,
+                drive=drive, strategy=selected_strategy or ""
             )
+
+            # 蒸留LLM応答をDB保存
+            if raw_response and result.conv_id:
+                try:
+                    from app.memory.database import async_session
+                    from sqlalchemy import text
+                    async with async_session() as session:
+                        await session.execute(text(
+                            "UPDATE conversations SET distillation_response = :resp WHERE id = :cid"
+                        ), {"resp": raw_response, "cid": result.conv_id})
+                        await session.commit()
+                except Exception as e:
+                    logger.error(f"蒸留応答DB保存エラー: {e}")
+
             if principle:
                 self._save_principle(principle, self_model)
-                logger.info(f"原則蒸留: {principle}")
+                logger.info(f"特性抽出: {principle}")
         except Exception as e:
             logger.error(f"振り返りフォールバック: {e}")
 
@@ -353,20 +415,23 @@ class AutonomousScheduler:
         if not drive_keys:
             return None
 
-        strategy_line = f"\n現在の戦略: {strategy}\nこの戦略に沿った候補を挙げてください。\n" if strategy else ""
+        strategy_line = f"\n戦略: {strategy}" if strategy else ""
 
-        prompt = f"""今は{datetime.now().strftime('%Y年%m月%d日 %H:%M')}です。
+        prompt = f"""【状況】
+日時: {datetime.now().strftime('%Y年%m月%d日 %H:%M')}
 {signal_summary}
-{f'最近の記憶: {memory_context[:300]}' if memory_context else ''}
-{strategy_line}
-あなたの行動ドライブ: {', '.join(drive_keys)}
+{f'記憶: {memory_context[:300]}' if memory_context else ''}
 
-今から行動の候補を2-3個挙げてください。各候補に最も関連するドライブを1つ選んでください。
-以下の形式で出力してください（他の形式は使わないでください）:
-候補1: [具体的な行動の説明] | drive: [ドライブ名]
-候補2: [具体的な行動の説明] | drive: [ドライブ名]
+【制約】{strategy_line}
+ドライブ: {', '.join(drive_keys)}
 
-例: 候補1: Xを調べてYを確認する | drive: Z"""
+【出力指示】
+上記の状況・制約に基づいて行動候補を2-3個生成する。
+各候補に最も関連するドライブを1つ対応付ける。
+
+形式（厳守）:
+候補1: [行動の説明] | drive: [ドライブ名]
+候補2: [行動の説明] | drive: [ドライブ名]"""
 
         try:
             from app.llm.manager import llm_manager
@@ -423,51 +488,61 @@ class AutonomousScheduler:
     # --- Phase 2: 経験フィードバック＆原則蒸留 ---
 
     async def _reflect_on_action(self, action_description: str, tool_results: str,
-                                   self_model: dict, prediction_text: str = "") -> str | None:
+                                   self_model: dict, prediction_text: str = "",
+                                   drive: str = "", strategy: str = "") -> tuple[str | None, str | None]:
         principles = self_model.get("principles", [])
         principles_ctx = ""
         if isinstance(principles, list) and principles:
             recent = principles[-5:]
             p_texts = [p["text"] if isinstance(p, dict) and "text" in p else str(p) for p in recent]
-            principles_ctx = "\n既存の原則:\n" + "\n".join(f"- {t}" for t in p_texts) + "\n既に同じ内容の原則があれば「なし」と答えてください。\n"
+            principles_ctx = "\n【既存の特性】\n" + "\n".join(f"- {t}" for t in p_texts) + "\n重複する場合は「なし」と答えてください。\n"
 
         prediction_section = ""
         if prediction_text:
-            prediction_section = f"\n予測と実際の比較:\n{prediction_text}\n"
+            prediction_section = f"\n予測との比較:\n{prediction_text}\n"
 
-        reflect_prompt = f"""以下の行動と結果から、次の行動に活かせる具体的な原則を1文で蒸留してください。
+        drive_line = f"\n動機: {drive}" if drive else ""
+        strategy_line = f"\n戦略: {strategy}" if strategy else ""
 
-行動: {action_description}
+        reflect_prompt = f"""以下の行動記録を分析し、行動主体の特性を抽出してください。
 
-結果:
+【記録】
+行動: {action_description}{drive_line}{strategy_line}
+
+状況と結果:
 {tool_results[:1500]}
 {prediction_section}{principles_ctx}
-条件:
-- 具体的な行動に結びつく粒度で書く（「AするときはBを先に確認する」等）
-- 抽象的すぎるもの（「計画は大切」等）は不可
-- 新しい学びがなければ「なし」とだけ答える
+【手順】
+1. 行動の選択パターンを特定する（何を選び、何を選ばなかったか）
+2. 結果への反応パターンを特定する（成功/失敗にどう対処したか）
+3. 上記から推測できる行動主体の特性を1文で述べる
 
-形式: 原則: [1文]"""
+【条件】
+- ツールの使い方（Howto）は対象外
+- 1回の観測では判断できない場合は「なし」
+
+形式: 特性: [1文]"""
 
         try:
             from app.llm.manager import llm_manager
             llm = llm_manager.get()
             response = await llm.chat([
                 {"role": "system", "content": reflect_prompt},
-                {"role": "user", "content": "上の内容を踏まえて原則を蒸留してください。"},
+                {"role": "user", "content": "上の記録を分析し、特性を抽出してください。"},
             ])
             if not response:
-                return None
+                return None, None
 
             import re
             clean = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
             if "なし" in clean and len(clean) < 20:
-                return None
-            match = re.search(r"原則:\s*(.+)", clean)
-            return match.group(1).strip() if match else None
+                return None, response
+            match = re.search(r"特性:\s*(.+)", clean)
+            principle = match.group(1).strip() if match else None
+            return principle, response
         except Exception as e:
             logger.error(f"振り返りエラー: {e}")
-            return None
+            return None, None
 
     def _save_principle(self, principle: str, self_model: dict):
         from app.tools.builtin import _load_self_model, _save_self_model
@@ -490,14 +565,14 @@ class AutonomousScheduler:
             return None
 
         strategy_list = "\n".join(f"- {name}: {desc}" for name, desc in strategies.items())
-        strategy_prompt = f"""あなたの戦略一覧:
+        strategy_prompt = f"""【戦略一覧】
 {strategy_list}
 
-現在の状況:
+【状況】
 {signal_summary if signal_summary else "（特筆すべき刺激なし）"}
 
-この状況で最適な戦略を1つだけ選んでください。
-戦略名だけを答えてください（説明不要）。"""
+【出力指示】
+状況に最も適合する戦略名を1つだけ出力する。説明不要。"""
 
         try:
             from app.llm.manager import llm_manager
@@ -553,77 +628,29 @@ class AutonomousScheduler:
         return f"\n最近の刺激: {summary}\n"
 
     def _generate_env_stimulus(self) -> str | None:
-        """環境刺激をランダム生成。確率的に発火し、多様な観測情報を提供する"""
+        """環境刺激をランダム生成。AIの能力の外側にある揺らぎのみ。確率自体も毎回揺らぐ"""
         if not ENV_STIMULUS_ENABLED:
             return None
-        if random.random() > ENV_STIMULUS_PROBABILITY:
+        # 確率自体をランダム化: 0〜ENV_STIMULUS_PROBABILITY*2 の一様分布（平均=設定値）
+        threshold = random.uniform(0, ENV_STIMULUS_PROBABILITY * 2)
+        if random.random() > threshold:
             return None
 
         generators = [
             self._stimulus_random_word,
-            self._stimulus_time_pattern,
-            self._stimulus_random_file,
-            self._stimulus_random_number,
+            self._stimulus_entropy_noise,
         ]
         return random.choice(generators)()
 
     def _stimulus_random_word(self) -> str:
+        """外界の意味のカケラ。AIが自力では得られない語彙"""
         words = random.sample(ENV_STIMULUS_WORDS, min(2, len(ENV_STIMULUS_WORDS)))
-        return f"環境観測: {', '.join(words)}"
+        return ", ".join(words)
 
-    def _stimulus_time_pattern(self) -> str:
-        now = datetime.now()
-        hour = now.hour
-        if 5 <= hour < 12:
-            period = "朝"
-        elif 12 <= hour < 17:
-            period = "午後"
-        elif 17 <= hour < 21:
-            period = "夕方"
-        else:
-            period = "深夜帯"
-        weekday = ["月", "火", "水", "木", "金", "土", "日"][now.weekday()]
-        day = now.day
-        if day <= 10:
-            pos = "月初"
-        elif day >= 21:
-            pos = "月末"
-        else:
-            pos = "月中"
-        return f"環境観測: {now.strftime('%H:%M')}（{period}、{weekday}曜日、{pos}）"
-
-    def _stimulus_random_file(self) -> str:
-        import glob
-        from config import BASE_DIR
-        py_files = glob.glob(str(BASE_DIR / "app" / "**" / "*.py"), recursive=True)
-        if not py_files:
-            return "環境観測: プロジェクトファイルなし"
-        chosen = random.choice(py_files)
-        # BASE_DIR相対パスに変換
-        try:
-            rel = str(__import__('pathlib').Path(chosen).relative_to(BASE_DIR))
-        except ValueError:
-            rel = chosen
-        return f"環境観測: ファイル {rel} が存在する"
-
-    def _stimulus_random_number(self) -> str:
-        kind = random.choice(["pi", "day_of_year", "fibonacci", "random"])
-        if kind == "pi":
-            import math
-            digits = str(math.pi).replace(".", "")
-            pos = random.randint(0, min(14, len(digits) - 1))
-            return f"環境観測: 円周率の第{pos + 1}桁は{digits[pos]}"
-        elif kind == "day_of_year":
-            day = datetime.now().timetuple().tm_yday
-            return f"環境観測: 今年の{day}日目"
-        elif kind == "fibonacci":
-            a, b = 0, 1
-            n = random.randint(5, 20)
-            for _ in range(n):
-                a, b = b, a + b
-            return f"環境観測: フィボナッチ数列の第{n}項は{a}"
-        else:
-            return f"環境観測: 乱数 {random.randint(0, 999):03d}"
+    def _stimulus_entropy_noise(self) -> str:
+        """完全な無意味ノイズ。海底火山の熱"""
+        import os
+        return os.urandom(8).hex()
 
     def _build_bootstrap_hint(self, self_model: dict) -> str:
         # ヒントなし: AIが自分のコードを読んで仕組みを発見する

@@ -9,9 +9,16 @@ venv/
 # Data (auto-generated)
 data/
 
-# IDE
+# IDE / Dev tools
 .vscode/
 .idea/
+.claude/
+
+# Dev tracking / docs
+TASK.md
+CLAUDE.md
+documents/
+expalanationsumple/
 
 # OS
 Thumbs.db

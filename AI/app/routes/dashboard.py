@@ -388,14 +388,14 @@ async def distillation_log(
         total = total_row[0] if total_row else 0
 
         conv_rows = (await session.execute(text(
-            "SELECT id, started_at, source, trigger FROM conversations "
+            "SELECT id, started_at, source, trigger, distillation_response FROM conversations "
             "WHERE is_imported = 0 "
             "ORDER BY started_at DESC LIMIT :limit OFFSET :offset"
         ), {"limit": limit, "offset": offset})).fetchall()
 
         sessions = []
         for conv in conv_rows:
-            conv_id, started_at, source, trigger = conv
+            conv_id, started_at, source, trigger, distillation_resp = conv
 
             # このセッションのツール実行
             tool_rows = (await session.execute(text(
@@ -430,6 +430,7 @@ async def distillation_log(
                 "rounds": rounds,
                 "round_count": len(rounds),
                 "has_predictions": has_predictions,
+                "distillation_response": distillation_resp,
             })
 
     # 現在の原則

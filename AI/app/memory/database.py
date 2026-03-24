@@ -46,6 +46,12 @@ async def init_db():
         except Exception:
             await conn.execute(text("ALTER TABLE conversations ADD COLUMN trigger TEXT"))
 
+        # conversationsにdistillation_responseカラム追加（蒸留LLM応答保存）
+        try:
+            await conn.execute(text("SELECT distillation_response FROM conversations LIMIT 1"))
+        except Exception:
+            await conn.execute(text("ALTER TABLE conversations ADD COLUMN distillation_response TEXT"))
+
         # trigram tokenizer対応チェック（日本語検索に必須）
         use_trigram = False
         try:

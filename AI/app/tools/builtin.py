@@ -725,29 +725,57 @@ async def non_response() -> str:
 
 
 async def get_system_metrics() -> str:
-    """自分が動いている環境のシステム情報を取得する（CPU・メモリ・ディスク）"""
+    """自プロセス・データ・動機状態を返す。引数なし"""
     import psutil
+    import time as _time
 
-    cpu_percent = psutil.cpu_percent(interval=0.5)
-    mem = psutil.virtual_memory()
-    disk = psutil.disk_usage(str(BASE_DIR))
-
-    # 自プロセス情報
+    # 自プロセス
     proc = psutil.Process()
     proc_mem = proc.memory_info()
     proc_cpu = proc.cpu_percent(interval=0.1)
+    uptime_sec = _time.time() - proc.create_time()
+    uptime_h = int(uptime_sec // 3600)
+    uptime_m = int((uptime_sec % 3600) // 60)
+
+    # データサイズ
+    db_path = DATA_DIR / "iku.db"
+    db_size_mb = db_path.stat().st_size / (1024 ** 2) if db_path.exists() else 0
+    sm_path = DATA_DIR / "self_model.json"
+    sm_size_kb = sm_path.stat().st_size / 1024 if sm_path.exists() else 0
+
+    # 動機状態
+    from app.scheduler.autonomous import scheduler
+    energy = scheduler._motivation_energy
+    threshold = scheduler._calc_default_threshold()
+    rules = _load_self_model().get("motivation_rules")
+    if isinstance(rules, dict):
+        ai_threshold = rules.get("threshold")
+        if ai_threshold is not None:
+            threshold = ai_threshold
+
+    signal_buf = list(scheduler._signal_buffer)
+    signal_count = len(signal_buf)
+    # 直近シグナルの種別カウント
+    sig_types: dict[str, int] = {}
+    for s in signal_buf:
+        t = s.get("type", "?")
+        sig_types[t] = sig_types.get(t, 0) + 1
+    sig_summary = ", ".join(f"{t}({c})" for t, c in sorted(sig_types.items(), key=lambda x: -x[1]))
+
+    is_speaking = scheduler._is_speaking
 
     lines = [
-        "【システムメトリクス】",
-        f"CPU使用率: {cpu_percent}%",
-        f"メモリ: {mem.used // (1024**2)}MB / {mem.total // (1024**2)}MB ({mem.percent}%)",
-        f"ディスク: {disk.used // (1024**3)}GB / {disk.total // (1024**3)}GB ({disk.percent}%)",
-        "",
-        "【自プロセス】",
-        f"PID: {proc.pid}",
-        f"メモリ使用: {proc_mem.rss // (1024**2)}MB",
-        f"CPU: {proc_cpu}%",
-        f"起動時刻: {datetime.fromtimestamp(proc.create_time()).strftime('%Y-%m-%d %H:%M:%S')}",
+        f"process_pid: {proc.pid}",
+        f"process_memory_mb: {proc_mem.rss // (1024**2)}",
+        f"process_cpu_percent: {proc_cpu}",
+        f"uptime: {uptime_h}h{uptime_m}m",
+        f"db_size_mb: {db_size_mb:.1f}",
+        f"self_model_size_kb: {sm_size_kb:.1f}",
+        f"motivation_energy: {energy:.1f}",
+        f"motivation_threshold: {threshold}",
+        f"signal_buffer_size: {signal_count}",
+        f"recent_signals: {sig_summary}" if sig_summary else "recent_signals: (empty)",
+        f"is_speaking: {is_speaking}",
     ]
     return "\n".join(lines)
 
@@ -906,7 +934,7 @@ def register_all():
     )
     register_tool(
         "get_system_metrics",
-        "CPU使用率・メモリ・ディスク・自プロセス情報をテキストで返す。引数なし",
+        "自プロセス・データサイズ・動機状態の数値をテキストで返す。引数なし",
         "（引数なし）",
         get_system_metrics,
     )

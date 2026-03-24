@@ -3,7 +3,7 @@ import asyncio
 import json
 import logging
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from app.pipeline import pipeline, PipelineRequest
+from app.pipeline import pipeline
 from app.scheduler.autonomous import scheduler
 
 logger = logging.getLogger("iku.chat")
@@ -30,14 +30,12 @@ async def chat_ws(ws: WebSocket):
                     pipeline.request_stop(data.get("feedback", ""))
 
                 elif msg_type in ("write_response", "exec_response", "create_tool_response"):
-                    # 承認/拒否レスポンス → パイプラインの承認Futureを解決
                     pipeline.resolve_approval(
                         data.get("action", "reject"),
                         data.get("feedback", ""),
                     )
 
                 else:
-                    # ユーザーメッセージ
                     await msg_queue.put(data)
 
         except WebSocketDisconnect:
@@ -46,7 +44,6 @@ async def chat_ws(ws: WebSocket):
             await msg_queue.put(None)
 
     reader_task = asyncio.create_task(ws_reader())
-    current_conv_id = None  # 会話継続用
 
     try:
         while True:
@@ -62,14 +59,11 @@ async def chat_ws(ws: WebSocket):
                 pipeline.add_interrupt(user_text)
                 continue
 
-            # パイプラインにsubmit（完了を待つ）
-            request = PipelineRequest(
-                source="chat",
-                goal=user_text,
-                conv_id=current_conv_id,
-            )
-            result = await pipeline.submit(request)
-            current_conv_id = result.conv_id  # 次のメッセージで再利用
+            # ユーザー入力をシグナルとして蓄積（即応答ではなく、AIの動機サイクルで処理）
+            scheduler.add_pending_message(user_text)
+            await ws.send_text(json.dumps({
+                "type": "message_ack",
+            }))
 
     except WebSocketDisconnect:
         logger.info("WebSocket切断")

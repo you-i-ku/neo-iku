@@ -18,6 +18,7 @@ class Conversation(Base):
     is_imported = Column(Boolean, default=False)
     source = Column(String(20), default="chat")  # "chat" or "autonomous"
     trigger = Column(String(20), nullable=True)   # "timer" / "energy" / "manual" / None(chat)
+    distillation_response = Column(Text, nullable=True)  # 蒸留LLMの生応答
 
     messages = relationship("Message", back_populates="conversation", order_by="Message.created_at")
 

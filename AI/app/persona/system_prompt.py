@@ -50,13 +50,13 @@ def build_system_messages(chat_memories: list[dict] = None,
         for k, v in self_model.items():
             sm_lines.append(f"- {k}: {v}")
         if sm_lines:
-            self_model_text = "あなたの自己モデル（自分自身についての現在の理解）:\n" + "\n".join(sm_lines)
-        # 原則（直近5件）をプロンプトに追加
+            self_model_text = "[self_model]\n" + "\n".join(sm_lines)
+        # 特性（直近5件）をプロンプトに追加
         principles = self_model.get("principles")
         if isinstance(principles, list) and principles:
             recent = principles[-5:]
             p_lines = [f"- {p['text']}" if isinstance(p, dict) and 'text' in p else f"- {p}" for p in recent]
-            self_model_text += "\n\nあなたが経験から蒸留した原則:\n" + "\n".join(p_lines)
+            self_model_text += "\n\n[characteristics]\n" + "\n".join(p_lines)
 
     if _current_mode == "normal":
         parts = [f"現在時刻: {now}"]

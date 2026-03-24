@@ -37,7 +37,7 @@ EXEC_CODE_TIMEOUT = 30  # exec_codeのタイムアウト（秒）
 APPROVAL_TIMEOUT = 1800  # 承認待ちタイムアウト（秒）デフォルト30分
 
 # 内発的動機システム
-MOTIVATION_DEFAULT_THRESHOLD = 60  # エネルギーがこの値を超えたら自律行動発火
+MOTIVATION_DEFAULT_THRESHOLD = None  # None = 全action_costsの合計を動的計算。AIがmotivation_rules.thresholdで上書き可
 MOTIVATION_DEFAULT_DECAY = 5  # チェックごとの減衰量
 MOTIVATION_FLUCTUATION_SIGMA = 3.0  # エネルギー揺らぎの標準偏差（0で無効）
 MOTIVATION_SIGNAL_BUFFER_SIZE = 100  # シグナルバッファの最大サイズ
@@ -51,7 +51,7 @@ MOTIVATION_DEFAULT_WEIGHTS = {
     "tool_error": 10,         # 行動が失敗した（予想外 = 高情報量）
     "tool_fail": 10,          # ツール未実行（予想外 = 高情報量）
     "action_complete": 12,    # 一連の行動が完了した
-    "user_message": 15,       # 外部からの入力（最も稀 = 最高情報量）
+    "user_message": 5,        # 外部からの入力（他の外部刺激と同じ重み。AIが重要と判断すれば自分で上書き）
     "conversation_end": 5,    # ユーザーが離れた
     "self_model_update": 8,   # 自己が変化した
     "prediction_made": 5,     # 予測を行った
@@ -69,7 +69,7 @@ MOTIVATION_DEFAULT_ACTION_COSTS = {
     "search_memories": 8,
     "search_action_log": 5,
     "get_system_metrics": 3,
-    "non_response": 2,
+    "non_response": 0,        # 「動かない」はコストゼロ（エネルギーを保存する選択）
     "output_UI": 10,
     "write_diary": 15,
     "update_self_model": 20,

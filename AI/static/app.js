@@ -94,6 +94,18 @@ function connect() {
                 break;
 
             // --- チャットタブ ---
+            case "message_ack":
+                showMessageAck();
+                break;
+
+            case "responding_start":
+                showRespondingIndicator();
+                break;
+
+            case "responding_end":
+                hideRespondingIndicator();
+                break;
+
             case "processing_start":
                 showProcessingIndicator();
                 break;
@@ -104,6 +116,7 @@ function connect() {
 
             case "output":
                 hideProcessingIndicator();
+                hideRespondingIndicator();
                 if (data.source === "autonomous") {
                     addMessage("autonomous", data.content);
                 } else {
@@ -134,6 +147,10 @@ function connect() {
                 appendDevToolResult(data.name, data.content);
                 loadMemories(memorySearch.value.trim());
                 if (data.name === "update_self_model" || data.name === "read_self_model") loadSelfModel();
+                break;
+
+            case "dev_env_stimulus":
+                appendDevEnvStimulus(data.content);
                 break;
 
             case "write_approval":
@@ -290,6 +307,16 @@ function appendDevToolResult(name, content) {
     devScrollToBottom();
 }
 
+function appendDevEnvStimulus(content) {
+    const s = devS();
+    if (!s.sessionEl) return;
+    const el = document.createElement("div");
+    el.className = "dev-env-stimulus";
+    el.textContent = "~ " + content;
+    s.sessionEl.appendChild(el);
+    devScrollToBottom();
+}
+
 // --- チャット: 処理中インジケーター ---
 
 function showProcessingIndicator() {
@@ -318,6 +345,55 @@ function hideProcessingIndicator() {
         }
         processingIndicator.remove();
         processingIndicator = null;
+    }
+}
+
+// --- チャット: メッセージ受付・応答中インジケーター ---
+
+let respondingIndicator = null;
+
+function showMessageAck() {
+    // 「受け付けました」を一時表示（既存のackがあれば差し替え）
+    hideMessageAck();
+    const el = document.createElement("div");
+    el.className = "message message-ack";
+    el.textContent = "受け付けました";
+    el.id = "message-ack";
+    chatMessages.appendChild(el);
+    scrollToBottom();
+}
+
+function hideMessageAck() {
+    const existing = document.getElementById("message-ack");
+    if (existing) existing.remove();
+}
+
+function showRespondingIndicator() {
+    hideMessageAck();
+    hideRespondingIndicator();
+    const el = document.createElement("div");
+    el.className = "message responding-indicator";
+    el.innerHTML = `<span class="responding-dots">お返事中です.</span>`;
+    chatMessages.appendChild(el);
+    respondingIndicator = el;
+
+    let dotCount = 1;
+    el._dotInterval = setInterval(() => {
+        dotCount = (dotCount % 3) + 1;
+        const span = el.querySelector(".responding-dots");
+        if (span) span.textContent = "お返事中です" + ".".repeat(dotCount);
+    }, 500);
+
+    scrollToBottom();
+}
+
+function hideRespondingIndicator() {
+    if (respondingIndicator) {
+        if (respondingIndicator._dotInterval) {
+            clearInterval(respondingIndicator._dotInterval);
+        }
+        respondingIndicator.remove();
+        respondingIndicator = null;
     }
 }
 
@@ -1283,11 +1359,15 @@ function renderDistillationLog(data) {
                 ? (r.status === "success" ? '<span class="match-ok">○</span>' : '<span class="match-fail">×</span>')
                 : '<span class="match-none">-</span>';
             const statusClass = r.status === "error" ? "distillation-round-error" : "";
-            const expectHtml = r.expected
+            const expectLine = r.expected
                 ? `<div class="distillation-expect">予測: ${escapeHtml(r.expected)}</div>`
                 : "";
-            const rawHtml = r.result_raw && r.result_raw !== r.result_summary
-                ? `<details class="distillation-raw"><summary>詳細</summary><pre>${escapeHtml(r.result_raw)}</pre></details>`
+            const rawLine = r.result_raw && r.result_raw !== r.result_summary
+                ? `<pre>${escapeHtml(r.result_raw)}</pre>`
+                : "";
+            const detailContent = expectLine || rawLine;
+            const detailHtml = detailContent
+                ? `<details class="distillation-raw"><summary>詳細</summary>${expectLine}${rawLine}</details>`
                 : "";
             roundsHtml += `
                 <div class="distillation-round ${statusClass}">
@@ -1296,20 +1376,28 @@ function renderDistillationLog(data) {
                     <span class="distillation-round-tool">${escapeHtml(r.tool_name)}</span>
                     <span class="distillation-round-status">${escapeHtml(r.status)}</span>
                     <span class="distillation-round-summary">${escapeHtml(r.result_summary)}</span>
-                    ${expectHtml}
-                    ${rawHtml}
+                    ${detailHtml}
                 </div>`;
         }
 
+        const distillHtml = s.distillation_response
+            ? `<div class="distillation-llm-response"><div class="distillation-llm-label">蒸留</div><pre>${escapeHtml(s.distillation_response)}</pre></div>`
+            : "";
+
         html += `
-            <details class="distillation-session">
-                <summary>
-                    <span class="distillation-session-time">${escapeHtml(s.started_at)}</span>
-                    ${sourceBadge} ${triggerBadge} ${predBadge}
-                    <span class="distillation-session-count">${s.round_count}ツール</span>
-                </summary>
-                <div class="distillation-session-body">${roundsHtml || '<div class="report-metric-empty">ツール実行なし</div>'}</div>
-            </details>`;
+            <div class="distillation-session-wrapper">
+                <details class="distillation-session">
+                    <summary>
+                        <span class="distillation-session-time">${escapeHtml(s.started_at)}</span>
+                        ${sourceBadge} ${triggerBadge} ${predBadge}
+                        <span class="distillation-session-count">${s.round_count}ツール</span>
+                    </summary>
+                    <div class="distillation-session-body">
+                        ${roundsHtml || '<div class="report-metric-empty">ツール実行なし</div>'}
+                    </div>
+                </details>
+                ${distillHtml}
+            </div>`;
     }
 
     distillationContent.innerHTML = html;

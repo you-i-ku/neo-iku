@@ -127,6 +127,10 @@ body {
     flex-direction: column;
 }
 
+#tab-report {
+    overflow-y: auto;
+}
+
 /* --- チャットタブ --- */
 #tab-chat {
     background: #0d1117;
@@ -886,6 +890,16 @@ body {
 }
 
 /* 開発者タブ: ツール呼び出し/結果 */
+.dev-env-stimulus {
+    font-size: 11px;
+    color: #6e40c9;
+    font-family: "Consolas", "Courier New", monospace;
+    padding: 3px 8px;
+    margin: 2px 0;
+    border-left: 2px solid #6e40c9;
+    opacity: 0.8;
+}
+
 .dev-tool-call {
     font-size: 12px;
     color: #8b949e;
@@ -952,6 +966,24 @@ details[open] > .dev-tool-result-summary::before {
     border: 1px solid #21262d;
     border-bottom-left-radius: 4px;
     color: #6e7681;
+    font-size: 13px;
+}
+
+.message-ack {
+    align-self: flex-start;
+    background: transparent;
+    border: none;
+    color: #484f58;
+    font-size: 12px;
+    padding: 4px 12px;
+}
+
+.responding-indicator {
+    align-self: flex-start;
+    background: #161b22;
+    border: 1px solid #2d1f5e;
+    border-bottom-left-radius: 4px;
+    color: #8b5cf6;
     font-size: 13px;
 }
 
@@ -1639,6 +1671,10 @@ details[open] > .dev-tool-result-summary::before {
     flex-shrink: 0;
 }
 
+.distillation-session-wrapper {
+    margin-bottom: 8px;
+}
+
 .distillation-session {
     background: #161b22;
     border: 1px solid #21262d;
@@ -1675,6 +1711,8 @@ details[open] > .dev-tool-result-summary::before {
 .distillation-session-body {
     padding: 8px 12px;
     border-top: 1px solid #21262d;
+    max-height: 400px;
+    overflow-y: auto;
 }
 
 /* バッジ */
@@ -1786,6 +1824,32 @@ details[open] > .dev-tool-result-summary::before {
     padding: 6px;
     border-radius: 4px;
     margin-top: 4px;
+}
+
+/* 蒸留LLM応答 */
+.distillation-llm-response {
+    margin-top: 8px;
+    padding: 8px;
+    border-top: 1px solid #21262d;
+    border-left: 2px solid #8b5cf6;
+}
+.distillation-llm-label {
+    font-size: 10px;
+    color: #8b5cf6;
+    font-weight: bold;
+    margin-bottom: 4px;
+}
+.distillation-llm-response pre {
+    font-size: 11px;
+    color: #c9d1d9;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 150px;
+    overflow-y: auto;
+    background: #0d1117;
+    padding: 6px;
+    border-radius: 4px;
+    margin: 0;
 }
 
 /* 一致表示 */
