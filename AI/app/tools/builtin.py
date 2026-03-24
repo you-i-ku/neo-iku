@@ -672,7 +672,7 @@ async def read_self_model() -> str:
     """現在の自己モデルを読む"""
     model = _load_self_model()
     if not model:
-        return "自己モデルはまだ空です。update_self_modelで更新できます。"
+        return "自己モデルは未定義です。"
 
     lines = ["【現在の自己モデル】"]
     for key, value in model.items():
@@ -888,8 +888,8 @@ def register_all():
     )
     register_tool(
         "read_self_model",
-        "自己モデル（data/self_model.json）の現在の内容をJSON文字列で返す",
-        "",
+        "自己モデル（data/self_model.json）の現在の内容をJSON文字列で返す。引数なし",
+        "（引数なし）",
         read_self_model,
     )
     register_tool(
@@ -900,14 +900,14 @@ def register_all():
     )
     register_tool(
         "non_response",
-        "何も行動しないことを選択する。呼ぶとこの応答は即完了する",
-        "",
+        "何も行動しないことを選択する。呼ぶとこの応答は即完了する。引数なし",
+        "（引数なし）",
         non_response,
     )
     register_tool(
         "get_system_metrics",
-        "CPU使用率・メモリ・ディスク・自プロセス情報をテキストで返す",
-        "",
+        "CPU使用率・メモリ・ディスク・自プロセス情報をテキストで返す。引数なし",
+        "（引数なし）",
         get_system_metrics,
     )
     register_tool(

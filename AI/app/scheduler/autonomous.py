@@ -10,6 +10,7 @@ from config import (
     MOTIVATION_DEFAULT_THRESHOLD, MOTIVATION_DEFAULT_DECAY,
     MOTIVATION_DEFAULT_WEIGHTS, MOTIVATION_FLUCTUATION_SIGMA,
     MOTIVATION_SIGNAL_BUFFER_SIZE, SCORING_ENABLED,
+    MOTIVATION_DEFAULT_ACTION_COSTS, MOTIVATION_DEFAULT_ACTION_COST_FALLBACK,
 )
 
 logger = logging.getLogger("iku.autonomous")
@@ -44,6 +45,36 @@ class AutonomousScheduler:
         })
         logger.debug(f"シグナル追加: {signal_type} ({detail})")
         self._try_check_motivation()
+
+    def consume_energy(self, tool_name: str):
+        """ツール実行によるエネルギー消費"""
+        from app.tools.builtin import _load_self_model
+        self_model = _load_self_model()
+        rules = self_model.get("motivation_rules")
+        if isinstance(rules, dict):
+            costs = rules.get("action_costs", {})
+            threshold = rules.get("threshold", MOTIVATION_DEFAULT_THRESHOLD)
+        else:
+            costs = {}
+            threshold = MOTIVATION_DEFAULT_THRESHOLD
+        # AI定義のコスト → デフォルトコスト → フォールバック値
+        cost = costs.get(tool_name,
+                MOTIVATION_DEFAULT_ACTION_COSTS.get(tool_name, MOTIVATION_DEFAULT_ACTION_COST_FALLBACK))
+        if isinstance(cost, (int, float)) and cost > 0:
+            self._motivation_energy = max(0, self._motivation_energy - cost)
+            logger.info(f"エネルギー消費: {tool_name} cost={cost} → energy={self._motivation_energy:.1f}")
+            # UI更新
+            try:
+                import json
+                from app.pipeline import pipeline
+                loop = asyncio.get_running_loop()
+                loop.create_task(pipeline._broadcast(json.dumps({
+                    "type": "motivation_energy",
+                    "energy": round(self._motivation_energy, 1),
+                    "threshold": threshold,
+                })))
+            except RuntimeError:
+                pass
 
     def _try_check_motivation(self):
         if self._is_checking:
@@ -98,9 +129,9 @@ class AutonomousScheduler:
             }))
 
             # 発火判定: 行動中でなく、閾値を超えた場合のみ
+            # エネルギーはリセットしない（ツール実行時にconsume_energyで消費される）
             if not self._is_speaking and self._motivation_energy >= threshold:
                 logger.info(f"動機発火！ energy={self._motivation_energy:.1f} >= threshold={threshold}")
-                self._motivation_energy = 0
                 self._last_trigger = "energy"
                 self._trigger_event.set()
 
@@ -186,9 +217,8 @@ class AutonomousScheduler:
                 logger.error(f"自律行動エラー: {e}\n{traceback.format_exc()}")
             finally:
                 self._is_speaking = False
-                # 行動中に溜まったシグナルを処理（UI上のエネルギー表示を更新）
-                if self._signal_buffer:
-                    self._try_check_motivation()
+                # 行動中に溜まったエネルギーの発火判定（バッファ空でも実行）
+                self._try_check_motivation()
 
     async def _speak(self, trigger: str = "timer"):
         from app.pipeline import pipeline, PipelineRequest

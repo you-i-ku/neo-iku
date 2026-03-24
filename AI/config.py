@@ -57,6 +57,30 @@ MOTIVATION_DEFAULT_WEIGHTS = {
     "prediction_made": 5,     # 予測を行った
 }
 
+# デフォルト行動コスト（神経系）: ツール実行ごとのエネルギー消費量
+# AIがself_modelにmotivation_rules.action_costsを定義すればそちらが優先される
+# 値の根拠: 副作用の大きさに比例（読むだけ=低、書き換え/外部通信=高）
+MOTIVATION_DEFAULT_ACTION_COSTS = {
+    "read_file": 5,
+    "list_files": 3,
+    "search_files": 5,
+    "read_self_model": 3,
+    "search_memories": 8,
+    "search_action_log": 5,
+    "get_system_metrics": 3,
+    "non_response": 2,
+    "output_UI": 10,
+    "write_diary": 15,
+    "update_self_model": 20,
+    "web_search": 15,
+    "fetch_raw_resource": 15,
+    "create_file": 25,
+    "overwrite_file": 40,
+    "exec_code": 40,
+    "create_tool": 40,
+}
+MOTIVATION_DEFAULT_ACTION_COST_FALLBACK = 10  # 未登録ツール（カスタムツール等）のデフォルトコスト
+
 # マルチターン
 CONTEXT_KEEP_ROUNDS = 4  # マルチターンで保持する直近ラウンド数
 

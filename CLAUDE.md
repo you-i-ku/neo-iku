@@ -107,6 +107,7 @@ neo-iku/
 - `app/tools/code_analysis.py`: 構文チェック（ast.parse）+ リスク静的解析（AST walk）。exec_code・create_toolの承認UIにリスクレベル（🔴HIGH/🟡MEDIUM/🟢LOW）を表示
 - 応答中断: 専用停止ボタン（⏹）で即中断可能（送信ボタンとは独立）。入力欄にテキストがあればfeedbackとしてLLMに伝わる。ストリーミング中でも送信ボタンで割り込みメッセージを送れる
 - `register_tool()` の `required_args` で必須引数を指定可能。引数なし→スキップ（会話中の言及）、パース失敗→エラーをLLMに返す
+- 引数なしツール（read_self_model, non_response, get_system_metrics）は`args_desc="（引数なし）"`と説明に「引数なし」を明記（LLMのハルシネーション引数を抑制）
 - 引数パーサーはクォート内の `\n`→改行、`\t`→タブのエスケープシーケンス変換に対応
 - ツールループ中のユーザー割り込み: WebSocketをasyncio.Queueで管理し、次のLLM呼び出し前にユーザーメッセージをhistoryに挿入
 - 自律行動のツール表示: running→ラベル更新、success/error→メッセージ化
@@ -127,7 +128,7 @@ neo-iku/
 - **動的自己モデル**: `data/self_model.json`にAIの自己理解を保持。`read_self_model`/`update_self_model`ツールで読み書き。キーバリュー+自由テキスト(`__free_text__`)の両形式対応
 - **自己モデルのプロンプト注入**: `pipeline.py`の`_build_system_base()`で、現在の自己モデル内容をシステムプロンプトに自動注入（モード問わず）
 - **設計思想**: 予測誤差が自己モデル更新の自然なきっかけになる（強制更新ではない）。ルール（構造）は定義するが作為（知識注入）はしない
-- **自己モデルの自律性**: `data/self_model.json`は初期状態`{}`。motivation_rules/drives/strategies等の構造はAIが自分のコードを読んで発見・定義する。人間が初期値を仕込まない
+- **自己モデルの自律性**: `data/self_model.json`は初期状態`{}`。motivation_rules/drives/strategies等の構造はAIが自分のコードを読んで発見・定義する。人間が初期値を仕込まない。`read_self_model`が空の場合は「自己モデルは未定義です。」とだけ返す（行動を促す文言は作為のため排除）
 - **自己モデルスナップショット**: `_save_self_model()`呼び出し時にfire-and-forgetで`self_model_snapshots`テーブルにJSON全体+変更キーを記録。自己進化の計測基盤
 
 ## 内発的動機システム
@@ -139,11 +140,12 @@ neo-iku/
 - **ルールはAIが定義**: `update_self_model`でkey=motivation_rules, value=JSON文字列。自動パースされてdict/listとして保存
 - **デフォルト神経系**: motivation_rules未定義時、`MOTIVATION_DEFAULT_WEIGHTS`（config.py）をフォールバック先として使用。シグナル種別ごとの覚醒エネルギーが定義されており、エネルギーが溜まって自律行動がトリガーされる。AIが`update_self_model`で`motivation_rules.weights`を定義すればそちらが優先（身体のデフォルトを意志で上書き）。weightsの値は情報量に比例（高頻度シグナル=低め、低頻度=高め）
 - **drives/strategiesは空**: 行動方向（何をするか）のデフォルトは持たない。AIが自分で定義するまで`action_goal`は空のまま。weightsは「いつ目が覚めるか」（覚醒）、drivesは「何をするか」（意志）— 前者は身体、後者は心に属する
-- **発火**: エネルギーが閾値を超えたら`_trigger_event.set()`で自律行動ループを起動、エネルギーをリセット
+- **発火**: エネルギーが閾値を超えたら`_trigger_event.set()`で自律行動ループを起動（エネルギーはリセットしない。ツール実行時にaction_costsで消費される）
+- **行動コスト（action_costs）**: ツール実行ごとにエネルギーを消費する。`MOTIVATION_DEFAULT_ACTION_COSTS`（config.py）にツール別デフォルトコストを定義。AIが`self_model.motivation_rules.action_costs`で上書き可能（weightsと同じパターン）。値は副作用の大きさに比例（読むだけ=低、書き換え/外部通信=高）。`consume_energy(tool_name)`がpipeline内のツール実行後に呼ばれる。weightsが「いつ目が覚めるか」（覚醒）、action_costsが「どれだけ疲れるか」（消耗）— どちらも身体の話
 - **再入防止**: `_is_checking`フラグ + `_is_speaking`チェックで多重実行を防止
 - **UI**: ステータスバーに`⚡ energy/threshold`表示、`motivation_energy` WSメッセージでリアルタイム更新
 - **揺らぎ**: `_check_motivation()`のエネルギー計算にガウスノイズ`random.gauss(0, σ)`を加算。何を考えるかは操作せず、エネルギーの溜まり方に偶然性を持たせる（「ふと動く」状況の構造的実現）
-- **設定**: `MOTIVATION_DEFAULT_THRESHOLD=60`, `MOTIVATION_DEFAULT_DECAY=5`, `MOTIVATION_FLUCTUATION_SIGMA=3.0`（0で無効）, `MOTIVATION_SIGNAL_BUFFER_SIZE=100`（config.py）
+- **設定**: `MOTIVATION_DEFAULT_THRESHOLD=60`, `MOTIVATION_DEFAULT_DECAY=5`, `MOTIVATION_FLUCTUATION_SIGMA=3.0`（0で無効）, `MOTIVATION_SIGNAL_BUFFER_SIZE=100`, `MOTIVATION_DEFAULT_ACTION_COSTS`（ツール別消費エネルギー）, `MOTIVATION_DEFAULT_ACTION_COST_FALLBACK=10`（config.py）
 - **並行モード**: `_concurrent_mode`フラグ（デフォルトOFF）、開発タブのトグルで切替、`/api/dev/concurrent-mode`エンドポイント
 - **外側ループ（メタ認知）**: `_speak()`は「1.観測(Observe) → 2.方向付け(Orient) → 3.決定(Decide) → 4.行動(Act) → 5.振り返り(Reflect)」のOODAループ構造
 - **振り返り**: `_reflect()`が行動後に原則蒸留。ツール実行エラーがあれば`tool_error`シグナルを発火。drives未定義時もツール名から行動説明を自動生成（self_modelが空でも振り返りが動作する）

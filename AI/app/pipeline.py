@@ -338,6 +338,10 @@ class Pipeline:
                     if expected:
                         self._emit_signal("prediction_made", f"{tool_name}: {expected[:50]}")
 
+                    # エネルギー消費（ツール実行コスト）
+                    from app.scheduler.autonomous import scheduler
+                    scheduler.consume_energy(tool_name)
+
                     # dev tab結果
                     await self._broadcast(json.dumps({
                         "type": "dev_tool_result",
