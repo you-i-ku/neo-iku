@@ -296,6 +296,18 @@ body {
 }
 
 /* ファイル上書き承認UI */
+.message.system-notice {
+    align-self: center;
+    background: #1a1a2e;
+    border: 1px solid #4a4560;
+    color: #a0a0b0;
+    font-size: 12px;
+    padding: 6px 14px;
+    border-radius: 12px;
+    max-width: 80%;
+    text-align: center;
+}
+
 .message.write-approval {
     align-self: flex-start;
     background: #1a1a0d;

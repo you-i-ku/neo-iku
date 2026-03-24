@@ -806,113 +806,113 @@ def register_all():
     """全組み込みツールを登録"""
     register_tool(
         "read_file",
-        "プロジェクト内のファイルを読む（自分のコードを確認できる）",
-        "path=ファイルパス（例: app/main.py） offset=開始位置（省略時は先頭から。続きを読む時に使う）",
+        "指定パスのファイル内容をテキストで返す。自分のコードも読める",
+        "path=ファイルパス offset=開始行（省略時は先頭から）",
         read_file,
         required_args=["path"],
     )
     register_tool(
         "list_files",
-        "ディレクトリ構成をツリー表示する（再帰的に全階層を表示）",
-        "path=ディレクトリパス（例: app）デフォルトはプロジェクトルート",
+        "指定ディレクトリのファイル・フォルダ構成をツリー形式で返す",
+        "path=ディレクトリパス（省略時はプロジェクトルート）",
         list_files,
     )
     register_tool(
         "search_files",
-        "ファイル名で検索する（部分一致）。ファイルの場所がわからない時に使う",
-        "query=検索キーワード（例: 内省） path=検索開始ディレクトリ（省略時はプロジェクト全体）",
+        "ファイル名の部分一致で検索し、マッチしたパス一覧を返す",
+        "query=検索文字列 path=検索開始ディレクトリ（省略時はプロジェクト全体）",
         search_files,
         required_args=["query"],
     )
     register_tool(
         "create_file",
-        "新規ファイルを作成する。既にファイルが存在する場合はエラーになる",
-        'path=ファイルパス（例: data/memo.txt） content=書き込む内容',
+        "新規ファイルを作成する。既に存在する場合はエラーを返す",
+        "path=ファイルパス content=書き込む内容",
         create_file,
         required_args=["path", "content"],
     )
     register_tool(
         "overwrite_file",
-        "既存ファイルを上書きする。ユーザーの承認が必要（承認UIが自動で表示される）",
-        'path=ファイルパス（例: app/main.py） content=上書き後の内容',
+        "既存ファイルの内容を上書きする。承認が必要",
+        "path=ファイルパス content=上書き後の全内容",
         overwrite_file,
         required_args=["path", "content"],
     )
     register_tool(
         "search_memories",
-        "過去の会話や過去ログから記憶を検索する",
+        "過去の会話・過去ログ・日記・行動ログを全文検索し、マッチした記録を返す",
         "query=検索キーワード",
         search_memories,
         required_args=["query"],
     )
     register_tool(
         "write_diary",
-        "日記や内省メモを書いて記憶に保存する",
-        'content=日記の内容（例: content="今日は自分のコードを読んで新しい発見があった"）',
+        "日記や内省メモをDBに保存する。保存後は検索対象になる",
+        "content=日記の内容",
         write_diary,
         required_args=["content"],
     )
     register_tool(
         "search_action_log",
-        "自分の過去の行動履歴を検索する（どのツールをいつ使ったか振り返れる）",
+        "過去のツール実行履歴を検索し、ツール名・引数・結果・日時を返す",
         "query=検索キーワード（省略可） tool_name=ツール名でフィルタ（省略可）",
         search_action_log,
     )
     register_tool(
         "exec_code",
-        "Pythonコードを実行する。ユーザーの承認が必要（承認UIが自動で表示される）",
-        'code=実行するPythonコード（例: code="print(1+1)"）',
+        "Pythonコードを実行し、stdout/stderrを返す。承認が必要",
+        "code=実行するPythonコード",
         exec_code,
         required_args=["code"],
     )
     register_tool(
         "web_search",
-        "DuckDuckGoでWeb検索する。外の世界の情報を得られる",
+        "DuckDuckGoでWeb検索し、タイトル・URL・スニペットの一覧を返す",
         "query=検索キーワード max_results=最大件数（デフォルト5、最大10）",
         web_search,
         required_args=["query"],
     )
     register_tool(
         "output_UI",
-        "ユーザーに向けてテキストを出力する。発言したい時はこのツールを使う。使わなければUIには何も表示されない",
-        'content=出力するテキスト to=出力先（デフォルト: chat）',
+        "ユーザーのチャット画面にテキストを表示する唯一の手段。呼ばなければ何も表示されない",
+        "content=表示するテキスト to=出力先（デフォルト: chat）",
         output_UI,
         required_args=["content"],
     )
     register_tool(
         "create_tool",
-        "新しいツールを作成して自分の能力を拡張する。ユーザーの承認が必要",
-        'name=ツール名（英小文字） description=ツールの説明 args_desc=引数の説明 code=async def関数のPythonコード',
+        "新しいツールをPythonコードで定義し、自分の能力として永続登録する。承認が必要",
+        "name=ツール名（英小文字） description=ツールの説明 args_desc=引数の説明 code=async def関数のPythonコード",
         create_tool,
         required_args=["name", "code"],
     )
     register_tool(
         "read_self_model",
-        "自分の自己モデル（自分自身についての理解）を読む",
+        "自己モデル（data/self_model.json）の現在の内容をJSON文字列で返す",
         "",
         read_self_model,
     )
     register_tool(
         "update_self_model",
-        "自分の自己モデルを更新する。自分について新しく理解したことや、考えが変わった時に使う",
-        'key=更新する項目名 value=新しい値（valueを省略するとそのキーを削除） text=自由テキストで自己モデル全体を記述（key/valueの代わりに使える）',
+        "自己モデルのキーを追加・更新・削除する。変更はJSONファイルに永続化される",
+        "key=更新する項目名 value=新しい値（省略でそのキーを削除） text=自由テキストで全体を記述（key/valueの代わり）",
         update_self_model,
     )
     register_tool(
         "non_response",
-        "何も行動しないことを明示的に選択する（沈黙・待機）",
+        "何も行動しないことを選択する。呼ぶとこの応答は即完了する",
         "",
         non_response,
     )
     register_tool(
         "get_system_metrics",
-        "自分が動いている環境のシステム情報を観測する（CPU・メモリ・ディスク・自プロセス情報）",
+        "CPU使用率・メモリ・ディスク・自プロセス情報をテキストで返す",
         "",
         get_system_metrics,
     )
     register_tool(
         "fetch_raw_resource",
-        "URLから生データを取得する（HTML・JSON・テキスト等）。web_searchとは別に、特定のURLの中身を直接読む",
+        "指定URLのHTTP GETを実行し、レスポンス本文（HTML・JSON・テキスト等）を返す",
         "url=取得するURL（http://またはhttps://） max_size=最大取得バイト数（デフォルト100000、最大500000）",
         fetch_raw_resource,
         required_args=["url"],

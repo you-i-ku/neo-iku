@@ -42,6 +42,7 @@ class PipelineRequest:
     signal_summary: str = ""
     bootstrap_hint: str = ""
     selected_action: dict | None = None
+    trigger: str | None = None  # "timer" / "energy" / "manual" / None(chat)
 
 
 @dataclass
@@ -168,7 +169,7 @@ class Pipeline:
         conv_id = req.conv_id
         if conv_id is None:
             async with async_session() as session:
-                conv = await create_conversation(session, source=req.source)
+                conv = await create_conversation(session, source=req.source, trigger=req.trigger)
                 conv_id = conv.id
                 await session.commit()
 
@@ -550,6 +551,7 @@ class Pipeline:
                     result = "ユーザーにより上書きを拒否されました。"
                     if resp.get("feedback"):
                         result += f"\n理由: {resp['feedback']}"
+                    self._emit_signal("approval_denied", f"overwrite_file: {pending['path']}")
 
         elif result == PENDING_EXEC_MARKER:
             pending = get_pending_exec()
@@ -573,6 +575,7 @@ class Pipeline:
                     result = "ユーザーによりコード実行を拒否されました。"
                     if resp.get("feedback"):
                         result += f"\n理由: {resp['feedback']}"
+                    self._emit_signal("approval_denied", "exec_code")
 
         elif result == PENDING_CREATE_TOOL_MARKER:
             pending = get_pending_create_tool()
@@ -598,16 +601,24 @@ class Pipeline:
                     result = "ユーザーによりツール作成を拒否されました。"
                     if resp.get("feedback"):
                         result += f"\n理由: {resp['feedback']}"
+                    self._emit_signal("approval_denied", f"create_tool: {pending['name']}")
 
         return result
 
-    async def _wait_approval(self, timeout: float = 300) -> dict:
+    async def _wait_approval(self) -> dict:
+        from config import APPROVAL_TIMEOUT
         loop = asyncio.get_running_loop()
         self._pending_approval = loop.create_future()
         try:
-            return await asyncio.wait_for(self._pending_approval, timeout=timeout)
+            return await asyncio.wait_for(self._pending_approval, timeout=APPROVAL_TIMEOUT)
         except asyncio.TimeoutError:
-            return {"action": "reject", "feedback": "承認タイムアウト（5分）"}
+            minutes = int(APPROVAL_TIMEOUT // 60)
+            # UI通知: タイムアウトしたことをユーザーに知らせる
+            await self._broadcast(json.dumps({
+                "type": "approval_timeout",
+                "message": f"承認要求が{minutes}分間応答なしのためタイムアウトしました",
+            }))
+            return {"action": "reject", "feedback": f"承認要求がタイムアウトしました（{minutes}分）。ユーザーが不在だった可能性があります。"}
         finally:
             self._pending_approval = None
 

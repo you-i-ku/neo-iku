@@ -148,6 +148,12 @@ function connect() {
                 showCreateToolApproval(data);
                 break;
 
+            case "approval_timeout":
+                // 承認待ちUIを閉じてタイムアウト通知を表示
+                closeApprovalDialog();
+                appendSystemMessage(data.message || "承認要求がタイムアウトしました");
+                break;
+
             case "exec_start":
                 showExecTerminal(data);
                 break;
@@ -600,6 +606,23 @@ async function loadMemories(query = "") {
     } catch (e) {
         console.error("記憶取得エラー:", e);
     }
+}
+
+function closeApprovalDialog() {
+    // 承認待ちUIのボタンを無効化（タイムアウト時）
+    document.querySelectorAll(".write-approval, .exec-approval, .create-tool-approval").forEach(el => {
+        el.querySelectorAll("button").forEach(b => b.disabled = true);
+        const fb = el.querySelector(".approval-feedback");
+        if (fb) fb.disabled = true;
+    });
+}
+
+function appendSystemMessage(text) {
+    const el = document.createElement("div");
+    el.className = "message system-notice";
+    el.textContent = text;
+    chatMessages.appendChild(el);
+    scrollToBottom();
 }
 
 function escapeHtml(text) {
@@ -1123,10 +1146,18 @@ function renderReport(data) {
     // 1. Autonomy Ratio
     const ar = m.autonomy_ratio;
     const arPct = ar.ratio > 0 ? Math.round(ar.ratio * 100) : 0;
+    const tr = ar.trigger || {energy: 0, timer: 0, manual: 0, energy_ratio: 0};
+    const energyPct = Math.round(tr.energy_ratio * 100);
     html += renderMetricCard("自律性比率", `${arPct}%`, `
         <div class="report-bar-pair">
             <div class="report-bar-row"><span>自律</span><div class="report-bar"><div class="report-bar-fill auto" style="width:${ar.autonomous + ar.chat > 0 ? Math.round(ar.autonomous / (ar.autonomous + ar.chat) * 100) : 0}%"></div></div><span>${ar.autonomous}</span></div>
             <div class="report-bar-row"><span>チャット</span><div class="report-bar"><div class="report-bar-fill chat" style="width:${ar.autonomous + ar.chat > 0 ? Math.round(ar.chat / (ar.autonomous + ar.chat) * 100) : 0}%"></div></div><span>${ar.chat}</span></div>
+        </div>
+        <div class="report-trigger-detail" style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.1)">
+            <div style="font-size:11px;opacity:0.7;margin-bottom:4px">自律行動の内訳（エネルギー駆動率: ${energyPct}%）</div>
+            <div class="report-bar-row"><span>エネルギー</span><div class="report-bar"><div class="report-bar-fill" style="width:${ar.autonomous > 0 ? Math.round(tr.energy / ar.autonomous * 100) : 0}%;background:#f59e0b"></div></div><span>${tr.energy}</span></div>
+            <div class="report-bar-row"><span>タイマー</span><div class="report-bar"><div class="report-bar-fill" style="width:${ar.autonomous > 0 ? Math.round(tr.timer / ar.autonomous * 100) : 0}%;background:#6b7280"></div></div><span>${tr.timer}</span></div>
+            ${tr.manual > 0 ? `<div class="report-bar-row"><span>手動</span><div class="report-bar"><div class="report-bar-fill" style="width:${ar.autonomous > 0 ? Math.round(tr.manual / ar.autonomous * 100) : 0}%;background:#8b5cf6"></div></div><span>${tr.manual}</span></div>` : ''}
         </div>
     `);
 
@@ -1165,9 +1196,11 @@ function renderReport(data) {
 
     // 6. Memory Utilization
     const mu = m.memory_utilization;
-    html += renderMetricCard("記憶活用", `${mu.search_count + mu.write_count}回`, `
-        <div class="report-stat-row"><span>検索</span><span>${mu.search_count}</span></div>
-        <div class="report-stat-row"><span>日記</span><span>${mu.write_count}</span></div>
+    const muTotal = mu.memory_search + mu.memory_write + mu.action_search;
+    html += renderMetricCard("記憶活用", `${muTotal}回`, `
+        <div class="report-stat-row"><span>記憶検索</span><span>${mu.memory_search}</span></div>
+        <div class="report-stat-row"><span>日記</span><span>${mu.memory_write}</span></div>
+        <div class="report-stat-row"><span>行動検索</span><span>${mu.action_search}</span></div>
     `);
 
     // 7. Principle Accumulation

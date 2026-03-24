@@ -47,13 +47,15 @@ def build_tools_prompt() -> str:
     ]
 
     lines = [
-        "必ず以下のいずれかのツールを呼び出してください。",
+        "目的に合うツールを精査して選び、呼び出してください。",
         "ツールを呼ばないテキストはどこにも届きません。output_UIで発言するか、non_responseで沈黙を選んでください。",
         "",
-        "書式: [TOOL:ツール名 引数=値 expect=結果予測]",
-        "ブロック書式:",
+        "書式:",
+        "  [TOOL:ツール名 引数A=値A 引数B=値B]",
+        "  [TOOL:ツール名 引数A=値A expect=予測される結果]",
+        "ブロック書式（値が長い場合）:",
         "  [TOOL:ツール名]",
-        "  内容",
+        "  複数行の内容をここに記述",
         "  [/TOOL]",
         "",
     ]
@@ -85,7 +87,7 @@ def build_tools_prompt() -> str:
     lines.append("仕組み:")
     lines.append("- output_UI経由のテキストのみユーザーに表示される")
     lines.append("- 承認マーク付きツールは実行前にユーザー確認がある")
-    lines.append("- expect= はツール実行前の予測。結果と比較される（省略: expect=skip）")
+    lines.append("- expect= は実行前の予測。実行後に「予測 vs 実際」が提示される。予測しない場合は省略可")
     lines.append("- 1応答で複数呼び出し可。この応答の後、行動は完了する")
     lines.append("- [TOOL:...]はthinkの外に書く")
 
@@ -116,7 +118,7 @@ def _get_registry_pattern() -> re.Pattern | None:
     # 長い名前を優先（前方一致の曖昧さを避ける）
     names = "|".join(re.escape(n) for n in sorted(current_keys, key=len, reverse=True))
     _registry_pattern_cache = re.compile(
-        rf'\[TOOL:({names})'                    # ツール名
+        rf'\[TOOL:\s*({names})'                  # ツール名（TOOL:後のスペース許容）
         r'((?:[^\]"]|"(?:[^"\\]|\\.)*")*)'      # 引数部: クォート内の ] や改行を許容
         r'\]',
         re.DOTALL,

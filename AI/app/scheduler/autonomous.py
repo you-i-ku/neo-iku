@@ -8,6 +8,7 @@ from datetime import datetime
 from config import (
     AUTONOMOUS_INTERVAL_MIN, AUTONOMOUS_INTERVAL_JITTER,
     MOTIVATION_DEFAULT_THRESHOLD, MOTIVATION_DEFAULT_DECAY,
+    MOTIVATION_DEFAULT_WEIGHTS, MOTIVATION_FLUCTUATION_SIGMA,
     MOTIVATION_SIGNAL_BUFFER_SIZE, SCORING_ENABLED,
 )
 
@@ -31,6 +32,7 @@ class AutonomousScheduler:
         self._concurrent_mode = False
         self._is_speaking = False
         self._last_conv_id: int | None = None  # セッション継続用
+        self._last_trigger: str = "timer"  # "timer" / "energy" / "manual"
 
     # --- シグナル ---
 
@@ -44,7 +46,7 @@ class AutonomousScheduler:
         self._try_check_motivation()
 
     def _try_check_motivation(self):
-        if self._is_checking or self._is_speaking:
+        if self._is_checking:
             return
         try:
             loop = asyncio.get_running_loop()
@@ -53,7 +55,7 @@ class AutonomousScheduler:
             pass
 
     async def _check_motivation(self):
-        if self._is_checking or self._is_speaking:
+        if self._is_checking:
             return
         self._is_checking = True
         try:
@@ -65,8 +67,8 @@ class AutonomousScheduler:
                 threshold = rules.get("threshold", MOTIVATION_DEFAULT_THRESHOLD)
                 decay = rules.get("decay_per_check", MOTIVATION_DEFAULT_DECAY)
             else:
-                # 未定義: ゼロweightで動く（エネルギーは溜まらないが、仕組み自体は稼働する）
-                weights = {}
+                # 未定義: デフォルトの神経系ウェイトで動く（AIが定義すればそちらが優先）
+                weights = MOTIVATION_DEFAULT_WEIGHTS
                 threshold = MOTIVATION_DEFAULT_THRESHOLD
                 decay = MOTIVATION_DEFAULT_DECAY
 
@@ -80,7 +82,12 @@ class AutonomousScheduler:
 
             self._motivation_energy = max(0, self._motivation_energy - decay)
 
-            logger.info(f"動機チェック: energy={self._motivation_energy:.1f} threshold={threshold} signals={len(signals)}")
+            # 揺らぎ: エネルギーの溜まり方に偶然性を持たせる（何を考えるかは操作しない）
+            if MOTIVATION_FLUCTUATION_SIGMA > 0:
+                fluctuation = random.gauss(0, MOTIVATION_FLUCTUATION_SIGMA)
+                self._motivation_energy = max(0, self._motivation_energy + fluctuation)
+
+            logger.info(f"動機チェック: energy={self._motivation_energy:.1f} threshold={threshold} signals={len(signals)} speaking={self._is_speaking}")
 
             import json
             from app.pipeline import pipeline
@@ -90,9 +97,11 @@ class AutonomousScheduler:
                 "threshold": threshold,
             }))
 
-            if self._motivation_energy >= threshold:
+            # 発火判定: 行動中でなく、閾値を超えた場合のみ
+            if not self._is_speaking and self._motivation_energy >= threshold:
                 logger.info(f"動機発火！ energy={self._motivation_energy:.1f} >= threshold={threshold}")
                 self._motivation_energy = 0
+                self._last_trigger = "energy"
                 self._trigger_event.set()
 
         except Exception as e:
@@ -123,6 +132,7 @@ class AutonomousScheduler:
         self._trigger_event.set()
 
     def trigger_now(self):
+        self._last_trigger = "manual"
         self._trigger_event.set()
 
     # --- メインループ ---
@@ -147,9 +157,9 @@ class AutonomousScheduler:
             self._trigger_event.clear()
             try:
                 await asyncio.wait_for(self._trigger_event.wait(), timeout=interval)
-                logger.info("即時実行トリガーを受信")
+                logger.info(f"即時実行トリガーを受信 (trigger={self._last_trigger})")
             except asyncio.TimeoutError:
-                pass
+                self._last_trigger = "timer"
 
             if self._skip_speak:
                 self._skip_speak = False
@@ -163,19 +173,24 @@ class AutonomousScheduler:
                 logger.warning("前回の自律行動がまだ実行中。スキップ。")
                 continue
 
-            self._last_conv_id = None  # タイマー起因は新規セッション
+            trigger = self._last_trigger
+            if trigger == "timer":
+                self._last_conv_id = None  # タイマー起因は新規セッション
             self.add_signal("idle_tick")
 
             try:
                 self._is_speaking = True
-                await self._speak()
+                await self._speak(trigger=trigger)
             except Exception as e:
                 import traceback
                 logger.error(f"自律行動エラー: {e}\n{traceback.format_exc()}")
             finally:
                 self._is_speaking = False
+                # 行動中に溜まったシグナルを処理（UI上のエネルギー表示を更新）
+                if self._signal_buffer:
+                    self._try_check_motivation()
 
-    async def _speak(self):
+    async def _speak(self, trigger: str = "timer"):
         from app.pipeline import pipeline, PipelineRequest
         from app.tools.builtin import _load_self_model
 
@@ -233,6 +248,7 @@ class AutonomousScheduler:
             signal_summary=signal_summary,
             bootstrap_hint=bootstrap_hint,
             selected_action=selected_action,
+            trigger=trigger,
         )
         result = await pipeline.submit(request)
         self._last_conv_id = result.conv_id  # 次のアクションでの継続用に保持
@@ -310,9 +326,10 @@ class AutonomousScheduler:
 
 今から行動の候補を2-3個挙げてください。各候補に最も関連するドライブを1つ選んでください。
 以下の形式で出力してください（他の形式は使わないでください）:
-候補1: [行動の説明] | drive: [ドライブ名]
-候補2: [行動の説明] | drive: [ドライブ名]
-候補3: [行動の説明] | drive: [ドライブ名]"""
+候補1: [具体的な行動の説明] | drive: [ドライブ名]
+候補2: [具体的な行動の説明] | drive: [ドライブ名]
+
+例: 候補1: Xを調べてYを確認する | drive: Z"""
 
         try:
             from app.llm.manager import llm_manager
@@ -381,15 +398,19 @@ class AutonomousScheduler:
         if prediction_text:
             prediction_section = f"\n予測と実際の比較:\n{prediction_text}\n"
 
-        reflect_prompt = f"""あなたは以下の行動を行いました:
+        reflect_prompt = f"""以下の行動と結果から、次の行動に活かせる具体的な原則を1文で蒸留してください。
+
 行動: {action_description}
 
 結果:
 {tool_results[:1500]}
 {prediction_section}{principles_ctx}
-この経験から学んだことを1文の原則として蒸留してください。
-新しい学びがなければ「なし」とだけ答えてください。
-形式: 原則: [学んだこと]"""
+条件:
+- 具体的な行動に結びつく粒度で書く（「AするときはBを先に確認する」等）
+- 抽象的すぎるもの（「計画は大切」等）は不可
+- 新しい学びがなければ「なし」とだけ答える
+
+形式: 原則: [1文]"""
 
         try:
             from app.llm.manager import llm_manager
@@ -464,16 +485,35 @@ class AutonomousScheduler:
 
     # --- ユーティリティ ---
 
+    # LLMに見せるシグナル種別（行動判断に有意味なもののみ）
+    _SUMMARY_SIGNALS = {"user_message", "user_connect", "tool_success", "tool_error", "self_model_update", "approval_denied"}
+
     def _build_signal_summary(self, signals: list[dict] | None = None) -> str:
         source = signals if signals is not None else list(self._signal_buffer)
         if not source:
             return ""
+
+        # idle_tickから最後の活動からの経過時間を算出
+        non_idle = [s for s in source if s["type"] != "idle_tick"]
+        if non_idle:
+            last_activity = max(s["time"] for s in non_idle)
+            elapsed_min = int((time.time() - last_activity) / 60)
+            idle_text = f"最後の活動から{elapsed_min}分経過" if elapsed_min > 0 else "直前に活動あり"
+        else:
+            idle_text = f"idle状態（{len(source)}tick）"
+
+        # 有意味なシグナルのみカウント
         counts: dict[str, int] = {}
         for sig in source:
-            t = sig["type"]
-            counts[t] = counts.get(t, 0) + 1
+            if sig["type"] in self._SUMMARY_SIGNALS:
+                t = sig["type"]
+                counts[t] = counts.get(t, 0) + 1
+
         parts = [f"{t}×{c}" for t, c in counts.items()]
-        return f"\n最近の刺激: {', '.join(parts)} (蓄積エネルギー: {self._motivation_energy:.1f})\n"
+        summary = idle_text
+        if parts:
+            summary += f", {', '.join(parts)}"
+        return f"\n最近の刺激: {summary}\n"
 
     def _build_bootstrap_hint(self, self_model: dict) -> str:
         # ヒントなし: AIが自分のコードを読んで仕組みを発見する

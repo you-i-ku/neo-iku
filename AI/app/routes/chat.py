@@ -14,6 +14,7 @@ router = APIRouter()
 async def chat_ws(ws: WebSocket):
     await ws.accept()
     await pipeline.register_ws(ws)
+    scheduler.add_signal("user_connect")
 
     msg_queue: asyncio.Queue = asyncio.Queue()
 

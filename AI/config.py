@@ -34,11 +34,28 @@ MEMORY_SEARCH_LIMIT = 5
 TOOL_MAX_CALLS_PER_RESPONSE = 6  # 1レスポンス内のツール呼び出し総数上限（ストリーミング中断用）
 TOOL_SAME_NAME_LIMIT = 3  # 同一ツールの連続呼び出し上限（ストリーミング中断用）
 EXEC_CODE_TIMEOUT = 30  # exec_codeのタイムアウト（秒）
+APPROVAL_TIMEOUT = 1800  # 承認待ちタイムアウト（秒）デフォルト30分
 
 # 内発的動機システム
 MOTIVATION_DEFAULT_THRESHOLD = 60  # エネルギーがこの値を超えたら自律行動発火
 MOTIVATION_DEFAULT_DECAY = 5  # チェックごとの減衰量
+MOTIVATION_FLUCTUATION_SIGMA = 3.0  # エネルギー揺らぎの標準偏差（0で無効）
 MOTIVATION_SIGNAL_BUFFER_SIZE = 100  # シグナルバッファの最大サイズ
+
+# デフォルト動機ウェイト（神経系）: シグナル種別ごとの覚醒エネルギー
+# AIがself_modelにmotivation_rules.weightsを定義すればそちらが優先される
+# 値の根拠: 高頻度シグナルは低め、低頻度シグナルは高め（情報量に比例）
+MOTIVATION_DEFAULT_WEIGHTS = {
+    "idle_tick": 3,           # 高頻度（毎タイマーサイクル）
+    "tool_success": 8,        # 行動が成功した
+    "tool_error": 10,         # 行動が失敗した（予想外 = 高情報量）
+    "tool_fail": 10,          # ツール未実行（予想外 = 高情報量）
+    "action_complete": 12,    # 一連の行動が完了した
+    "user_message": 15,       # 外部からの入力（最も稀 = 最高情報量）
+    "conversation_end": 5,    # ユーザーが離れた
+    "self_model_update": 8,   # 自己が変化した
+    "prediction_made": 5,     # 予測を行った
+}
 
 # マルチターン
 CONTEXT_KEEP_ROUNDS = 4  # マルチターンで保持する直近ラウンド数

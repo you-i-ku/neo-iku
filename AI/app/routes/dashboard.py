@@ -111,7 +111,7 @@ async def reset_db():
     """iku_logs以外の全テーブルをクリア"""
     from sqlalchemy import text
     async with async_session() as session:
-        for table in ["messages", "conversations", "memory_summaries", "tool_actions"]:
+        for table in ["messages", "conversations", "memory_summaries", "tool_actions", "self_model_snapshots"]:
             await session.execute(text(f"DELETE FROM {table}"))
         for fts in ["messages_fts", "memory_summaries_fts", "tool_actions_fts"]:
             await session.execute(text(f"DELETE FROM {fts}"))
@@ -193,7 +193,7 @@ async def autonomy_report(
     # normalize self-evolution: cap at 50 changes
     normalized_self_evolution = min(evolution["total_changes"] / 50, 1.0) if evolution["total_changes"] > 0 else 0
     # normalize memory utilization: cap at 100 operations
-    mem_total = memory["search_count"] + memory["write_count"]
+    mem_total = memory["memory_search"] + memory["memory_write"] + memory["action_search"]
     normalized_memory_util = min(mem_total / 100, 1.0) if mem_total > 0 else 0
 
     autonomy_score = round(
@@ -247,7 +247,24 @@ async def _calc_autonomy_ratio(session, date_from: str, date_to: str) -> dict:
     chat = counts.get("chat", 0)
     total = autonomous + chat
     ratio = round(autonomous / total, 3) if total > 0 else 0.0
-    return {"autonomous": autonomous, "chat": chat, "ratio": ratio}
+
+    # トリガー別内訳（タイマー vs エネルギー vs 手動）
+    trigger_rows = (await session.execute(text(
+        "SELECT trigger, COUNT(*) as cnt FROM conversations "
+        "WHERE started_at BETWEEN :f AND :t AND is_imported = 0 AND source = 'autonomous' "
+        "GROUP BY trigger"
+    ), {"f": date_from, "t": date_to})).fetchall()
+
+    trigger_counts = {(r[0] or "timer"): r[1] for r in trigger_rows}
+    energy = trigger_counts.get("energy", 0)
+    timer = trigger_counts.get("timer", 0)
+    manual = trigger_counts.get("manual", 0)
+    energy_ratio = round(energy / autonomous, 3) if autonomous > 0 else 0.0
+
+    return {
+        "autonomous": autonomous, "chat": chat, "ratio": ratio,
+        "trigger": {"energy": energy, "timer": timer, "manual": manual, "energy_ratio": energy_ratio},
+    }
 
 
 async def _calc_tool_diversity(session, date_from: str, date_to: str) -> dict:
@@ -322,13 +339,17 @@ async def _calc_metacognition(session, date_from: str, date_to: str) -> dict:
 async def _calc_memory_utilization(session, date_from: str, date_to: str) -> dict:
     rows = (await session.execute(text(
         "SELECT tool_name, COUNT(*) as cnt FROM tool_actions "
-        "WHERE tool_name IN ('search_memories', 'write_diary') "
+        "WHERE tool_name IN ('search_memories', 'write_diary', 'search_action_log') "
         "AND created_at BETWEEN :f AND :t "
         "GROUP BY tool_name"
     ), {"f": date_from, "t": date_to})).fetchall()
 
     counts = {r[0]: r[1] for r in rows}
-    return {"search_count": counts.get("search_memories", 0), "write_count": counts.get("write_diary", 0)}
+    return {
+        "memory_search": counts.get("search_memories", 0),
+        "memory_write": counts.get("write_diary", 0),
+        "action_search": counts.get("search_action_log", 0),
+    }
 
 
 async def _calc_principle_accumulation(session, date_from: str, date_to: str) -> dict:
