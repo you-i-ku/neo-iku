@@ -12,8 +12,10 @@ from config import (
     MOTIVATION_DEFAULT_WEIGHTS, MOTIVATION_FLUCTUATION_SIGMA,
     MOTIVATION_SIGNAL_BUFFER_SIZE, SCORING_ENABLED,
     MOTIVATION_DEFAULT_ACTION_COSTS, MOTIVATION_DEFAULT_ACTION_COST_FALLBACK,
-    ENV_STIMULUS_ENABLED, ENV_STIMULUS_PROBABILITY, ENV_STIMULUS_WORDS,
+    ENV_STIMULUS_ENABLED, ENV_STIMULUS_PROBABILITY,
+    DATA_DIR,
 )
+import math
 
 logger = logging.getLogger("iku.autonomous")
 
@@ -162,6 +164,7 @@ class AutonomousScheduler:
 
     def start(self):
         if self._task is None:
+            self._load_stimulus_pools()
             self._running = True
             self._task = asyncio.create_task(self._loop())
             logger.info("自発的発言スケジューラ開始")
@@ -627,28 +630,90 @@ class AutonomousScheduler:
             summary += f", {', '.join(parts)}"
         return f"\n最近の刺激: {summary}\n"
 
+    # --- 環境刺激: 5プール × 1-3語クロス ---
+
+    _pool_nouns: list[str] = []
+    _pool_verbs: list[str] = []
+    _pool_adjs: list[str] = []
+
+    @classmethod
+    def _load_stimulus_pools(cls):
+        """IPAdic品詞別辞書をロード（起動時1回）"""
+        for name, attr in [("nouns", "_pool_nouns"), ("verbs", "_pool_verbs"), ("adjectives", "_pool_adjs")]:
+            path = DATA_DIR / f"ipadic_{name}.txt"
+            if path.exists():
+                with open(path, encoding="utf-8") as f:
+                    setattr(cls, attr, [line.strip() for line in f if line.strip()])
+        logger.info(f"刺激プールロード: 名詞{len(cls._pool_nouns)} 動詞{len(cls._pool_verbs)} 形容詞{len(cls._pool_adjs)}")
+
+    # 5プール: 各プールは1語を返す
+    _POOLS = [
+        "_stim_noun",      # Pool 1: 名詞（69k語）
+        "_stim_verb",      # Pool 2: 動詞（14k語）
+        "_stim_adj",       # Pool 3: 形容詞（1.7k語）
+        "_stim_math",      # Pool 4: 数式・数値
+        "_stim_entropy",   # Pool 5: 16進数エントロピー
+    ]
+
     def _generate_env_stimulus(self) -> str | None:
-        """環境刺激をランダム生成。AIの能力の外側にある揺らぎのみ。確率自体も毎回揺らぐ"""
+        """1-3語をそれぞれ独立なランダムプールから引く。確率自体も毎回揺らぐ"""
         if not ENV_STIMULUS_ENABLED:
             return None
-        # 確率自体をランダム化: 0〜ENV_STIMULUS_PROBABILITY*2 の一様分布（平均=設定値）
         threshold = random.uniform(0, ENV_STIMULUS_PROBABILITY * 2)
         if random.random() > threshold:
             return None
 
-        generators = [
-            self._stimulus_random_word,
-            self._stimulus_entropy_noise,
-        ]
-        return random.choice(generators)()
+        n_words = random.randint(1, 3)
+        parts = []
+        for _ in range(n_words):
+            pool_method = getattr(self, random.choice(self._POOLS))
+            parts.append(pool_method())
+        return ", ".join(parts)
 
-    def _stimulus_random_word(self) -> str:
-        """外界の意味のカケラ。AIが自力では得られない語彙"""
-        words = random.sample(ENV_STIMULUS_WORDS, min(2, len(ENV_STIMULUS_WORDS)))
-        return ", ".join(words)
+    def _stim_noun(self) -> str:
+        if not self._pool_nouns:
+            return "名詞"
+        return random.choice(self._pool_nouns)
 
-    def _stimulus_entropy_noise(self) -> str:
-        """完全な無意味ノイズ。海底火山の熱"""
+    def _stim_verb(self) -> str:
+        if not self._pool_verbs:
+            return "動く"
+        return random.choice(self._pool_verbs)
+
+    def _stim_adj(self) -> str:
+        if not self._pool_adjs:
+            return "大きい"
+        return random.choice(self._pool_adjs)
+
+    def _stim_math(self) -> str:
+        kind = random.randint(0, 5)
+        if kind == 0:
+            n = random.randint(2, 200)
+            return f"√{n}≈{math.sqrt(n):.6f}"
+        elif kind == 1:
+            primes = [2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67,71,
+                      73,79,83,89,97,101,127,149,173,191,197,211,223,239,251,257,
+                      269,277,281,293,307,311,331,347,359,373,389,397,419,431,443,
+                      457,461,479,487,499,509,521,541,557,569,577,587,599,601,613,
+                      631,641,653,659,673,683,701,719,727,739,751,761,773,797,809,
+                      821,839,853,863,877,887,907,919,929,937,947,967,977,991,997]
+            return f"素数:{random.choice(primes)}"
+        elif kind == 2:
+            return f"({random.uniform(-90,90):.4f},{random.uniform(-180,180):.4f})"
+        elif kind == 3:
+            a, b = random.randint(1, 99), random.randint(2, 99)
+            return f"{a}/{b}≈{a/b:.6f}"
+        elif kind == 4:
+            n = random.randint(5, 25)
+            a, b = 0, 1
+            for _ in range(n):
+                a, b = b, a + b
+            return f"F({n})={a}"
+        else:
+            n = random.randint(1, 10)
+            return f"e^{n}≈{math.exp(n):.4f}"
+
+    def _stim_entropy(self) -> str:
         import os
         return os.urandom(8).hex()
 

@@ -1621,6 +1621,33 @@ details[open] > .dev-tool-result-summary::before {
     color: #c9d1d9;
 }
 
+.distillation-summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px;
+    font-size: 15px;
+    font-weight: 600;
+    color: #c9d1d9;
+    cursor: pointer;
+    list-style: none;
+}
+
+.distillation-summary::-webkit-details-marker {
+    display: none;
+}
+
+.distillation-summary::before {
+    content: "▶";
+    margin-right: 8px;
+    font-size: 11px;
+    transition: transform 0.2s;
+}
+
+details.distillation-section[open] > .distillation-summary::before {
+    transform: rotate(90deg);
+}
+
 .distillation-content {
     padding: 0 8px;
 }
