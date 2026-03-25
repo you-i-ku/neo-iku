@@ -1,8 +1,9 @@
-"""ベクトル検索ストア — LM Studio embeddingによる意味検索"""
+"""ベクトル検索ストア — bge-m3 (ONNX/CPU) / LM Studio フォールバック"""
 import json
 import math
 import logging
 import asyncio
+import numpy as np
 from sqlalchemy import text
 from config import VECTOR_SEARCH_ENABLED, VECTOR_SEARCH_LIMIT
 from app.memory.database import async_session
@@ -11,6 +12,79 @@ logger = logging.getLogger("iku.vector")
 
 # embedding利用可能かどうか（起動後の最初の試行で判定）
 _embed_available: bool | None = None
+
+# ONNX bge-m3 モデル（遅延初期化、シングルトン）
+_onnx_session = None
+_onnx_tokenizer = None
+_onnx_tried = False
+
+
+def _load_bge_m3():
+    """bge-m3 ONNXモデルを遅延初期化で取得（HuggingFaceから自動ダウンロード）"""
+    global _onnx_session, _onnx_tokenizer, _onnx_tried
+    if _onnx_tried:
+        return _onnx_session is not None
+    _onnx_tried = True
+    try:
+        from huggingface_hub import hf_hub_download
+        from tokenizers import Tokenizer
+        import onnxruntime as ort
+
+        model_path = hf_hub_download("BAAI/bge-m3", "onnx/model.onnx")
+        tok_path = hf_hub_download("BAAI/bge-m3", "onnx/tokenizer.json")
+
+        _onnx_tokenizer = Tokenizer.from_file(tok_path)
+        _onnx_tokenizer.enable_padding(pad_id=1, pad_token="<pad>", length=128)
+        _onnx_tokenizer.enable_truncation(max_length=512)
+
+        _onnx_session = ort.InferenceSession(
+            model_path, providers=["CPUExecutionProvider"]
+        )
+        logger.info("bge-m3 (ONNX/CPU) をロード完了 — VRAMゼロ、1024次元")
+        return True
+    except ImportError as e:
+        logger.info(f"ONNX推論の依存不足: {e} — LM Studioフォールバックを使用")
+        return False
+    except Exception as e:
+        logger.warning(f"bge-m3ロード失敗: {e} — LM Studioフォールバックを使用")
+        return False
+
+
+def _embed_sync(texts: list[str]) -> list[list[float]] | None:
+    """bge-m3 ONNX（CPU同期）でembedding取得"""
+    if not _load_bge_m3():
+        return None
+    try:
+        encoded = _onnx_tokenizer.encode_batch(texts)
+        input_ids = np.array([e.ids for e in encoded], dtype=np.int64)
+        attention_mask = np.array([e.attention_mask for e in encoded], dtype=np.int64)
+
+        outputs = _onnx_session.run(
+            None, {"input_ids": input_ids, "attention_mask": attention_mask}
+        )
+
+        # mean pooling + L2 normalize
+        embeddings = outputs[0]  # (batch, seq, 1024)
+        mask = attention_mask[:, :, np.newaxis].astype(np.float32)
+        pooled = (embeddings * mask).sum(axis=1) / mask.sum(axis=1)
+        norms = np.linalg.norm(pooled, axis=1, keepdims=True)
+        pooled = pooled / norms
+
+        return [vec.tolist() for vec in pooled]
+    except Exception as e:
+        logger.warning(f"bge-m3推論エラー: {e}")
+        return None
+
+
+async def _embed_via_lmstudio(texts: list[str]) -> list[list[float]] | None:
+    """LM Studio /v1/embeddings 経由でembedding取得（フォールバック）"""
+    try:
+        from app.llm.manager import llm_manager
+        llm = llm_manager.get()
+        return await llm.embed(texts)
+    except Exception as e:
+        logger.debug(f"LM Studio embedding失敗: {e}")
+        return None
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -24,23 +98,30 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 async def embed_text(text_content: str) -> list[float] | None:
-    """テキスト1件の埋め込みベクトルを取得"""
+    """テキスト1件の埋め込みベクトルを取得（bge-m3 ONNX優先 → LM Studio → None）"""
     global _embed_available
     if _embed_available is False:
         return None
-    try:
-        from app.llm.manager import llm_manager
-        llm = llm_manager.get()
-        result = await llm.embed([text_content[:2000]])  # 長すぎるテキストは切り詰め
-        if result and len(result) > 0:
-            _embed_available = True
-            return result[0]
-        _embed_available = False
-        return None
-    except Exception as e:
-        logger.debug(f"Embedding取得失敗: {e}")
-        _embed_available = False
-        return None
+
+    truncated = text_content[:2000]
+
+    # 1. bge-m3 ONNX（CPU、VRAMゼロ）
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _embed_sync, [truncated])
+    if result and len(result) > 0:
+        _embed_available = True
+        return result[0]
+
+    # 2. LM Studio フォールバック
+    lm_result = await _embed_via_lmstudio([truncated])
+    if lm_result and len(lm_result) > 0:
+        _embed_available = True
+        return lm_result[0]
+
+    # 3. どちらも使えない
+    _embed_available = False
+    logger.info("Embedding利用不可（bge-m3・LM Studio両方失敗）— FTS5のみで検索")
+    return None
 
 
 async def store_embedding(source_table: str, source_id: int, content: str):
@@ -183,4 +264,5 @@ def get_status() -> dict:
     return {
         "enabled": VECTOR_SEARCH_ENABLED,
         "embed_available": _embed_available,
+        "backend": "bge-m3-onnx" if _onnx_session else ("lmstudio" if _embed_available else "none"),
     }

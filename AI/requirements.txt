@@ -5,3 +5,8 @@ aiosqlite
 httpx
 duckduckgo-search
 psutil
+websockets
+onnxruntime
+tokenizers
+huggingface-hub
+numpy
