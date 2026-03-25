@@ -158,27 +158,29 @@ async def search_memories(query: str = "") -> str:
         return "エラー: queryを指定してください。"
 
     from app.memory.database import async_session
-    from app.memory.search import search_messages, search_iku_logs, search_diary
-    from app.persona.system_prompt import get_mode
+    from app.memory.search import search_messages, search_persona_episodes, search_diary
+    from app.persona.system_prompt import get_active_persona_id
+
+    persona_id = get_active_persona_id()
 
     async with async_session() as session:
-        chat_results = await search_messages(session, query)
-        log_results = await search_iku_logs(session, query) if get_mode() == "iku" else []
-        diary_results = await search_diary(session, query)
+        chat_results = await search_messages(session, query, persona_id=persona_id)
+        episode_results = await search_persona_episodes(session, query, persona_id) if persona_id is not None else []
+        diary_results = await search_diary(session, query, persona_id=persona_id)
 
     lines = []
     if chat_results:
         lines.append("【会話の記憶】")
         for m in chat_results:
-            role = "ユーザー" if m["role"] == "user" else "イク"
+            role = "ユーザー" if m["role"] == "user" else "AI"
             content = _clean_memory_content(m["content"])[:200]
             if content:
                 lines.append(f"- {role}: {content}")
 
-    if log_results:
+    if episode_results:
         lines.append("【過去ログの記憶】")
-        for m in log_results:
-            role = "ユーザー" if m["role"] == "user" else "イク"
+        for m in episode_results:
+            role = "ユーザー" if m["role"] == "user" else "AI"
             content = _clean_memory_content(m["content"])[:200]
             if content:
                 lines.append(f"- {role}: {content}")
@@ -197,9 +199,9 @@ async def search_memories(query: str = "") -> str:
         if VECTOR_SEARCH_ENABLED:
             from app.memory.vector_store import search_similar, fetch_content_for_results
             tables = ["messages", "memory_summaries"]
-            if get_mode() == "iku":
-                tables.append("iku_logs")
-            similar = await search_similar(query, tables, limit=3)
+            if persona_id is not None:
+                tables.append("persona_episodes")
+            similar = await search_similar(query, tables, limit=3, persona_id=persona_id)
             if similar:
                 # FTS5結果と重複するsource_idを除外
                 fts_ids = set()
@@ -207,8 +209,8 @@ async def search_memories(query: str = "") -> str:
                     fts_ids.add(("messages", m.get("id")))
                 for m in diary_results:
                     fts_ids.add(("memory_summaries", m.get("id")))
-                for m in log_results:
-                    fts_ids.add(("iku_logs", m.get("id")))
+                for m in episode_results:
+                    fts_ids.add(("persona_episodes", m.get("id")))
 
                 unique_similar = [s for s in similar
                                   if (s["source_table"], s["source_id"]) not in fts_ids
@@ -223,7 +225,7 @@ async def search_memories(query: str = "") -> str:
                                 sim = f"({e['similarity']:.2f})"
                                 role_prefix = ""
                                 if e.get("role"):
-                                    role_prefix = ("ユーザー" if e["role"] == "user" else "イク") + ": "
+                                    role_prefix = ("ユーザー" if e["role"] == "user" else "AI") + ": "
                                 lines.append(f"- {role_prefix}{content} {sim}")
     except Exception:
         pass  # ベクトル検索失敗時はFTS5結果のみ
@@ -440,11 +442,14 @@ async def write_diary(content: str = "", keywords: str = "") -> str:
 
     kw = keywords if keywords else datetime.now().strftime("%Y-%m-%d")
 
+    from app.persona.system_prompt import get_active_persona_id
+
     async with async_session() as session:
         entry = MemorySummary(
             content=content,
             source="diary",
             keywords=kw,
+            persona_id=get_active_persona_id(),
         )
         session.add(entry)
         await session.flush()
@@ -670,23 +675,38 @@ def load_custom_tools():
             logger.error(f"カスタムツール {py_file.name} の読み込みエラー: {e}")
 
 
-SELF_MODEL_PATH = DATA_DIR / "self_model.json"
+SELF_MODEL_PATH = DATA_DIR / "self_model.json"  # ノーマルモード用（後方互換）
+
+
+def _get_self_model_path() -> Path:
+    """ペルソナ有効時はペルソナ用パス、ノーマル時はデフォルトパスを返す"""
+    from app.persona.system_prompt import get_active_persona_id
+    from config import PERSONAS_DIR
+    pid = get_active_persona_id()
+    if pid is not None:
+        persona_dir = PERSONAS_DIR / str(pid)
+        persona_dir.mkdir(parents=True, exist_ok=True)
+        return persona_dir / "self_model.json"
+    return SELF_MODEL_PATH
 
 
 def _load_self_model() -> dict:
     """自己モデルをファイルから読み込む"""
-    if not SELF_MODEL_PATH.exists():
+    path = _get_self_model_path()
+    if not path.exists():
         return {}
     try:
-        return json.loads(SELF_MODEL_PATH.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 
 def _save_self_model(model: dict, changed_key: str = ""):
     """自己モデルをファイルに保存 + スナップショット記録"""
+    path = _get_self_model_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     content_json = json.dumps(model, ensure_ascii=False, indent=2)
-    SELF_MODEL_PATH.write_text(content_json, encoding="utf-8")
+    path.write_text(content_json, encoding="utf-8")
     # fire-and-forget でスナップショット記録
     try:
         import asyncio
@@ -701,10 +721,12 @@ async def _record_snapshot(content_json: str, changed_key: str):
     try:
         from app.memory.database import async_session
         from app.memory.models import SelfModelSnapshot
+        from app.persona.system_prompt import get_active_persona_id
         async with async_session() as session:
             snapshot = SelfModelSnapshot(
                 content=content_json,
                 changed_key=changed_key or None,
+                persona_id=get_active_persona_id(),
             )
             session.add(snapshot)
             await session.commit()
@@ -790,7 +812,7 @@ async def get_system_metrics() -> str:
     # データサイズ
     db_path = DATA_DIR / "iku.db"
     db_size_mb = db_path.stat().st_size / (1024 ** 2) if db_path.exists() else 0
-    sm_path = DATA_DIR / "self_model.json"
+    sm_path = _get_self_model_path()
     sm_size_kb = sm_path.stat().st_size / 1024 if sm_path.exists() else 0
 
     # 動機状態

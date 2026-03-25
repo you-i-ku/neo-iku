@@ -4,6 +4,7 @@ from pathlib import Path
 # パス
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
+PERSONAS_DIR = DATA_DIR / "personas"
 STATIC_DIR = BASE_DIR / "static"
 
 # DB

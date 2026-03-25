@@ -45,6 +45,8 @@ tabBtns.forEach(btn => {
 
         // ログタブ初回表示時にWebSocket接続
         if (tab === "log" && !logWs) connectLog();
+        // 自律度タブ初回表示時に蒸留ログを自動読み込み
+        if (tab === "report" && !distillationLoaded) loadDistillationLog();
     });
 });
 
@@ -206,6 +208,16 @@ function connect() {
 
             case "user_interrupt_ack":
                 addMessage("system", `💬 割り込みメッセージを受け付けました: ${data.content}`);
+                break;
+
+            case "distillation_session":
+                if (distillationLoaded) {
+                    prependDistillationSession(data.session);
+                }
+                break;
+
+            case "distillation_update":
+                updateDistillationResponse(data.conv_id, data.distillation_response, data.principle);
                 break;
         }
     };
@@ -531,33 +543,102 @@ chatInput.addEventListener("input", () => {
     chatInput.style.height = Math.min(chatInput.scrollHeight, 120) + "px";
 });
 
-// --- モード切替 ---
+// --- モード・ペルソナ切替 ---
 
-function updateModeUI(mode) {
+let activePersona = null; // {id, name, display_name, color_theme, ...} or null
+
+function updateModeUI(mode, persona) {
     currentMode = mode;
-    modeBtn.textContent = mode === "iku" ? "イク" : "ノーマル";
-    modeBtn.className = `mode-btn ${mode}`;
-    updateStatusBarMode(mode);
+    activePersona = persona || null;
+
+    if (persona) {
+        modeBtn.textContent = persona.display_name;
+        modeBtn.className = `mode-btn persona`;
+        document.body.className = `theme-${persona.color_theme || 'purple'}`;
+        document.querySelector('.tab-btn-persona').style.display = '';
+        updateStatusBarMode(persona.display_name);
+        loadPersonaTab(persona.id);
+    } else {
+        modeBtn.textContent = "ノーマル";
+        modeBtn.className = `mode-btn normal`;
+        document.body.className = '';
+        document.querySelector('.tab-btn-persona').style.display = 'none';
+        updateStatusBarMode("ノーマル");
+        // ペルソナタブがアクティブなら切替
+        if (document.getElementById('tab-persona').classList.contains('active')) {
+            document.querySelector('.tab-btn[data-tab="chat"]').click();
+        }
+    }
 }
 
-modeBtn.addEventListener("click", async () => {
-    const newMode = currentMode === "iku" ? "normal" : "iku";
-    modeBtn.disabled = true;
+modeBtn.addEventListener("click", () => {
+    document.getElementById('persona-popup').style.display = 'flex';
+    loadPersonaPopup();
+});
+
+// ペルソナポップアップ
+document.querySelector('.persona-popup-close').addEventListener('click', () => {
+    document.getElementById('persona-popup').style.display = 'none';
+});
+document.getElementById('persona-popup').addEventListener('click', (e) => {
+    if (e.target.id === 'persona-popup') e.target.style.display = 'none';
+});
+
+async function loadPersonaPopup() {
+    const list = document.getElementById('persona-popup-list');
     try {
-        const resp = await fetch("/api/mode", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ mode: newMode }),
+        const resp = await fetch('/api/personas');
+        const data = await resp.json();
+        let html = `<div class="persona-popup-normal ${!activePersona ? 'active' : ''}" onclick="selectPersona(null)">ノーマルモード</div>`;
+        for (const p of data.personas) {
+            const active = activePersona && activePersona.id === p.id ? 'active' : '';
+            html += `<div class="persona-popup-item ${active}" onclick="selectPersona(${p.id})">
+                <span class="dot" style="background:${{purple:'#8b5cf6',blue:'#3b82f6',green:'#22c55e',orange:'#f97316',red:'#ef4444',pink:'#ec4899'}[p.color_theme]||'#8b5cf6'}"></span>
+                <span class="name">${p.display_name}</span>
+            </div>`;
+        }
+        list.innerHTML = html;
+    } catch (e) {
+        list.innerHTML = '<div style="color:#f08080">読み込みエラー</div>';
+    }
+}
+
+async function selectPersona(id) {
+    try {
+        if (id === null) {
+            await fetch('/api/personas/deactivate', { method: 'POST' });
+            updateModeUI('normal', null);
+        } else {
+            const resp = await fetch(`/api/personas/${id}/activate`, { method: 'POST' });
+            const data = await resp.json();
+            if (data.active_persona) {
+                updateModeUI('persona', data.active_persona);
+            }
+        }
+        document.getElementById('persona-popup').style.display = 'none';
+        updateStatus();
+    } catch (e) {
+        console.error("ペルソナ切替エラー:", e);
+    }
+}
+
+document.getElementById('persona-create-btn').addEventListener('click', async () => {
+    const name = document.getElementById('persona-new-name').value.trim();
+    const displayName = document.getElementById('persona-new-display').value.trim();
+    if (!name || !displayName) return;
+    try {
+        const resp = await fetch('/api/personas', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, display_name: displayName }),
         });
         const data = await resp.json();
-        updateModeUI(data.mode);
-        if (data.import) {
-            updateStatus();
-        }
+        if (data.error) { alert(data.error); return; }
+        document.getElementById('persona-new-name').value = '';
+        document.getElementById('persona-new-display').value = '';
+        loadPersonaPopup();
     } catch (e) {
-        console.error("モード切替エラー:", e);
-    } finally {
-        modeBtn.disabled = false;
+        console.error("ペルソナ作成エラー:", e);
     }
 });
 
@@ -615,9 +696,9 @@ function updateStatusBarLLM(available) {
     statusLLM.style.color = available ? "#3fb950" : "#f08080";
 }
 
-function updateStatusBarMode(mode) {
-    statusMode.textContent = `モード: ${mode === "iku" ? "イク" : "ノーマル"}`;
-    statusMode.style.color = mode === "iku" ? "#a78bfa" : "#8b949e";
+function updateStatusBarMode(label) {
+    statusMode.textContent = `モード: ${label}`;
+    statusMode.style.color = activePersona ? "var(--accent-text, #a78bfa)" : "#8b949e";
 }
 
 function updateStatusBarCountdown(text) {
@@ -631,7 +712,7 @@ async function updateStatus() {
 
         updateStatusBarLLM(data.llm_available);
         statusMemories.textContent = `記憶: ${data.message_count}件`;
-        if (data.mode) updateModeUI(data.mode);
+        if (data.mode) updateModeUI(data.mode, data.active_persona);
     } catch (e) {
         console.error("状態取得エラー:", e);
     }
@@ -1430,23 +1511,18 @@ function renderMetricCard(title, value, bodyHtml) {
 // --- 蒸留ログ ---
 
 const distillationContent = document.getElementById("distillation-content");
-const distillationLoadBtn = document.getElementById("distillation-load-btn");
-
-distillationLoadBtn.addEventListener("click", loadDistillationLog);
+let distillationLoaded = false;
 
 async function loadDistillationLog() {
-    distillationLoadBtn.disabled = true;
-    distillationLoadBtn.textContent = "読み込み中...";
+    if (distillationLoaded) return;
     distillationContent.innerHTML = '<div class="report-loading">読み込み中...</div>';
     try {
         const resp = await fetch("/api/distillation-log?limit=20&offset=0");
         const data = await resp.json();
         renderDistillationLog(data);
+        distillationLoaded = true;
     } catch (e) {
         distillationContent.innerHTML = `<div class="report-error">取得エラー: ${escapeHtml(e.message)}</div>`;
-    } finally {
-        distillationLoadBtn.textContent = "読み込む";
-        distillationLoadBtn.disabled = false;
     }
 }
 
@@ -1466,70 +1542,246 @@ function renderDistillationLog(data) {
 
     // セッション一覧
     html += `<div class="distillation-total">総セッション数: ${data.total}</div>`;
+    html += '<div id="distillation-sessions">';
     for (const s of data.sessions) {
-        const sourceBadge = s.source === "autonomous"
-            ? '<span class="badge-auto">自律</span>'
-            : '<span class="badge-chat">チャット</span>';
-        const triggerBadge = s.trigger
-            ? `<span class="badge-trigger">${escapeHtml(s.trigger)}</span>`
-            : "";
-        const predBadge = s.has_predictions
-            ? '<span class="badge-pred">予測あり</span>'
-            : '<span class="badge-pred none">予測なし</span>';
-
-        let roundsHtml = "";
-        for (let i = 0; i < s.rounds.length; i++) {
-            const r = s.rounds[i];
-            const matchIcon = r.has_prediction
-                ? (r.status === "success" ? '<span class="match-ok">○</span>' : '<span class="match-fail">×</span>')
-                : '<span class="match-none">-</span>';
-            const statusClass = r.status === "error" ? "distillation-round-error" : "";
-            const intentLine = r.intent
-                ? `<div class="distillation-intent">意図: ${escapeHtml(r.intent)}</div>`
-                : "";
-            const expectLine = r.expected
-                ? `<div class="distillation-expect">予測: ${escapeHtml(r.expected)}</div>`
-                : "";
-            const rawLine = r.result_raw && r.result_raw !== r.result_summary
-                ? `<pre>${escapeHtml(r.result_raw)}</pre>`
-                : "";
-            const detailContent = intentLine || expectLine || rawLine;
-            const detailHtml = detailContent
-                ? `<details class="distillation-raw"><summary>詳細</summary>${intentLine}${expectLine}${rawLine}</details>`
-                : "";
-            roundsHtml += `
-                <div class="distillation-round ${statusClass}">
-                    <span class="distillation-round-num">#${i + 1}</span>
-                    ${matchIcon}
-                    <span class="distillation-round-tool">${escapeHtml(r.tool_name)}</span>
-                    <span class="distillation-round-status">${escapeHtml(r.status)}</span>
-                    <span class="distillation-round-summary">${escapeHtml(r.result_summary)}</span>
-                    ${detailHtml}
-                </div>`;
-        }
-
-        const distillHtml = s.distillation_response
-            ? `<div class="distillation-llm-response"><div class="distillation-llm-label">蒸留</div><pre>${escapeHtml(s.distillation_response)}</pre></div>`
-            : "";
-
-        html += `
-            <div class="distillation-session-wrapper">
-                <details class="distillation-session">
-                    <summary>
-                        <span class="distillation-session-time">${escapeHtml(s.started_at)}</span>
-                        ${sourceBadge} ${triggerBadge} ${predBadge}
-                        <span class="distillation-session-count">${s.round_count}ツール</span>
-                    </summary>
-                    <div class="distillation-session-body">
-                        ${roundsHtml || '<div class="report-metric-empty">ツール実行なし</div>'}
-                    </div>
-                </details>
-                ${distillHtml}
-            </div>`;
+        html += buildDistillationSessionHtml(s);
     }
+    html += '</div>';
 
     distillationContent.innerHTML = html;
 }
+
+function buildDistillationSessionHtml(s) {
+    const sourceBadge = s.source === "autonomous"
+        ? '<span class="badge-auto">自律</span>'
+        : '<span class="badge-chat">チャット</span>';
+    const triggerBadge = s.trigger
+        ? `<span class="badge-trigger">${escapeHtml(s.trigger)}</span>`
+        : "";
+    const predBadge = s.has_predictions
+        ? '<span class="badge-pred">予測あり</span>'
+        : '<span class="badge-pred none">予測なし</span>';
+
+    let roundsHtml = "";
+    for (let i = 0; i < s.rounds.length; i++) {
+        const r = s.rounds[i];
+        const matchIcon = r.has_prediction
+            ? (r.status === "success" ? '<span class="match-ok">○</span>' : '<span class="match-fail">×</span>')
+            : '<span class="match-none">-</span>';
+        const statusClass = r.status === "error" ? "distillation-round-error" : "";
+        const intentLine = r.intent
+            ? `<div class="distillation-intent">意図: ${escapeHtml(r.intent)}</div>`
+            : "";
+        const expectLine = r.expected
+            ? `<div class="distillation-expect">予測: ${escapeHtml(r.expected)}</div>`
+            : "";
+        const rawLine = r.result_raw && r.result_raw !== r.result_summary
+            ? `<pre>${escapeHtml(r.result_raw)}</pre>`
+            : "";
+        const detailContent = intentLine || expectLine || rawLine;
+        const detailHtml = detailContent
+            ? `<details class="distillation-raw"><summary>詳細</summary>${intentLine}${expectLine}${rawLine}</details>`
+            : "";
+        roundsHtml += `
+            <div class="distillation-round ${statusClass}">
+                <span class="distillation-round-num">#${i + 1}</span>
+                ${matchIcon}
+                <span class="distillation-round-tool">${escapeHtml(r.tool_name)}</span>
+                <span class="distillation-round-status">${escapeHtml(r.status)}</span>
+                <span class="distillation-round-summary">${escapeHtml(r.result_summary)}</span>
+                ${detailHtml}
+            </div>`;
+    }
+
+    const distillHtml = s.distillation_response
+        ? `<div class="distillation-llm-response"><div class="distillation-llm-label">蒸留</div><pre>${escapeHtml(s.distillation_response)}</pre></div>`
+        : "";
+
+    return `
+        <div class="distillation-session-wrapper" data-conv-id="${s.conv_id}">
+            <details class="distillation-session">
+                <summary>
+                    <span class="distillation-session-time">${escapeHtml(s.started_at)}</span>
+                    ${sourceBadge} ${triggerBadge} ${predBadge}
+                    <span class="distillation-session-count">${s.round_count}ツール</span>
+                </summary>
+                <div class="distillation-session-body">
+                    ${roundsHtml || '<div class="report-metric-empty">ツール実行なし</div>'}
+                </div>
+            </details>
+            ${distillHtml}
+        </div>`;
+}
+
+function prependDistillationSession(session) {
+    const container = document.getElementById("distillation-sessions");
+    if (!container) {
+        // ログがまだ初回読み込みされていない場合は初回読み込みを実行
+        distillationLoaded = false;
+        loadDistillationLog();
+        return;
+    }
+    const html = buildDistillationSessionHtml(session);
+    container.insertAdjacentHTML("afterbegin", html);
+
+    // 総セッション数を更新
+    const totalEl = distillationContent.querySelector(".distillation-total");
+    if (totalEl) {
+        const match = totalEl.textContent.match(/\d+/);
+        if (match) {
+            totalEl.textContent = `総セッション数: ${parseInt(match[0]) + 1}`;
+        }
+    }
+}
+
+function updateDistillationResponse(convId, response, principle) {
+    const wrapper = distillationContent.querySelector(`.distillation-session-wrapper[data-conv-id="${convId}"]`);
+    if (!wrapper) return;
+
+    // 既存の蒸留応答を削除（あれば）
+    const existing = wrapper.querySelector(".distillation-llm-response");
+    if (existing) existing.remove();
+
+    // 新しい蒸留応答を追加
+    if (response) {
+        const distillHtml = `<div class="distillation-llm-response"><div class="distillation-llm-label">蒸留</div><pre>${escapeHtml(response)}</pre></div>`;
+        wrapper.insertAdjacentHTML("beforeend", distillHtml);
+    }
+}
+
+// --- ペルソナタブ ---
+
+async function loadPersonaTab(personaId) {
+    if (!personaId) return;
+    try {
+        // 詳細取得
+        const resp = await fetch(`/api/personas/${personaId}`);
+        const p = await resp.json();
+
+        document.getElementById('persona-title').textContent = p.display_name;
+
+        // 統計
+        document.getElementById('persona-stats').innerHTML = `
+            <span class="persona-stat"><strong>${p.episode_count}</strong> エピソード</span>
+            <span class="persona-stat"><strong>${p.message_count}</strong> メッセージ</span>
+            <span class="persona-stat"><strong>${p.diary_count}</strong> 日記</span>
+        `;
+
+        // テーマピッカー更新
+        document.querySelectorAll('#persona-theme-picker .theme-dot').forEach(dot => {
+            dot.classList.toggle('active', dot.dataset.theme === p.color_theme);
+        });
+
+        // self_model
+        const smResp = await fetch(`/api/personas/${personaId}/self-model`);
+        const sm = await smResp.json();
+        const smEmpty = !sm || Object.keys(sm).length === 0;
+        if (smEmpty) {
+            // 空の場合はテンプレートを表示
+            document.getElementById('persona-selfmodel').value = JSON.stringify({
+                "__free_text__": "",
+                "drives": {},
+                "strategies": {},
+                "motivation_rules": {
+                    "weights": {},
+                    "action_costs": {},
+                    "threshold": null,
+                    "decay_per_check": 5
+                }
+            }, null, 2);
+        } else {
+            document.getElementById('persona-selfmodel').value = JSON.stringify(sm, null, 2);
+        }
+
+        // エピソード一覧
+        const epResp = await fetch(`/api/personas/${personaId}/episodes?limit=50`);
+        const epData = await epResp.json();
+        const epList = document.getElementById('persona-episode-list');
+        if (epData.episodes && epData.episodes.length > 0) {
+            epList.innerHTML = epData.episodes.map(e =>
+                `<div class="persona-episode-item"><span class="role">${e.role}</span> ${e.content}</div>`
+            ).join('') + `<div style="color:#8b949e;padding:6px 10px;font-size:11px">全${epData.total}件</div>`;
+        } else {
+            epList.innerHTML = '<div style="color:#484f58;padding:10px">エピソードなし</div>';
+        }
+    } catch (e) {
+        console.error("ペルソナタブ読み込みエラー:", e);
+    }
+}
+
+// テーマ切替
+document.getElementById('persona-theme-picker').addEventListener('click', async (e) => {
+    const dot = e.target.closest('.theme-dot');
+    if (!dot || !activePersona) return;
+    const theme = dot.dataset.theme;
+    await fetch(`/api/personas/${activePersona.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ color_theme: theme }),
+    });
+    activePersona.color_theme = theme;
+    document.body.className = `theme-${theme}`;
+    document.querySelectorAll('#persona-theme-picker .theme-dot').forEach(d => {
+        d.classList.toggle('active', d.dataset.theme === theme);
+    });
+});
+
+// self_model保存
+document.getElementById('persona-selfmodel-save').addEventListener('click', async () => {
+    if (!activePersona) return;
+    try {
+        const val = document.getElementById('persona-selfmodel').value;
+        const content = JSON.parse(val);
+        await fetch(`/api/personas/${activePersona.id}/self-model`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content }),
+        });
+        alert('保存しました');
+    } catch (e) {
+        alert('JSONパースエラー: ' + e.message);
+    }
+});
+
+// エピソードインポート
+document.getElementById('persona-episode-import').addEventListener('click', async () => {
+    if (!activePersona) return;
+    const fileInput = document.getElementById('persona-episode-files');
+    if (!fileInput.files.length) return;
+    const status = document.getElementById('persona-episode-status');
+    status.textContent = 'インポート中...';
+    const formData = new FormData();
+    for (const f of fileInput.files) formData.append('files', f);
+    try {
+        const resp = await fetch(`/api/personas/${activePersona.id}/episodes/import`, {
+            method: 'POST',
+            body: formData,
+        });
+        const data = await resp.json();
+        status.textContent = `${data.count}件インポート完了`;
+        fileInput.value = '';
+        loadPersonaTab(activePersona.id);
+    } catch (e) {
+        status.textContent = 'エラー: ' + e.message;
+    }
+});
+
+// ペルソナ削除
+document.getElementById('persona-delete-btn').addEventListener('click', async () => {
+    if (!activePersona) return;
+    if (!confirm(`ペルソナ「${activePersona.display_name}」と全データを削除しますか？`)) return;
+    await fetch(`/api/personas/${activePersona.id}`, { method: 'DELETE' });
+    updateModeUI('normal', null);
+    updateStatus();
+});
+
+// エピソード全削除
+document.getElementById('persona-episodes-clear-btn').addEventListener('click', async () => {
+    if (!activePersona) return;
+    if (!confirm('全エピソードを削除しますか？')) return;
+    await fetch(`/api/personas/${activePersona.id}/episodes`, { method: 'DELETE' });
+    loadPersonaTab(activePersona.id);
+});
 
 // --- 初期化 ---
 

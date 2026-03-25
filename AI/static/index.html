@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>イク — neo-iku</title>
-    <link rel="stylesheet" href="/static/style.css?v=40">
+    <link rel="stylesheet" href="/static/style.css?v=44">
 </head>
 <body>
     <!-- ステータスバー -->
@@ -30,6 +30,7 @@
         <button class="tab-btn" data-tab="dev">開発者</button>
         <button class="tab-btn" data-tab="log">ログ</button>
         <button class="tab-btn" data-tab="report">自律度</button>
+        <button class="tab-btn tab-btn-persona" data-tab="persona" style="display:none">ペルソナ</button>
     </div>
 
     <!-- チャットタブ -->
@@ -138,10 +139,9 @@
         <details class="distillation-section">
             <summary class="distillation-summary">
                 蒸留ログ
-                <button id="distillation-load-btn" class="report-load-btn">読み込む</button>
             </summary>
             <div id="distillation-content" class="distillation-content">
-                <div class="report-empty">「読み込む」を押すと蒸留ログが表示されます</div>
+                <div class="report-empty">読み込み中...</div>
             </div>
         </details>
 
@@ -176,6 +176,114 @@
         </details>
     </div>
 
-    <script src="/static/app.js?v=41"></script>
+    <!-- ペルソナタブ -->
+    <div id="tab-persona" class="tab-content">
+        <div class="persona-tab-layout">
+            <div class="persona-header">
+                <h2 id="persona-title">ペルソナ</h2>
+                <div class="persona-theme-picker" id="persona-theme-picker">
+                    <span class="theme-dot theme-purple" data-theme="purple" title="紫"></span>
+                    <span class="theme-dot theme-blue" data-theme="blue" title="青"></span>
+                    <span class="theme-dot theme-green" data-theme="green" title="緑"></span>
+                    <span class="theme-dot theme-orange" data-theme="orange" title="橙"></span>
+                    <span class="theme-dot theme-red" data-theme="red" title="赤"></span>
+                    <span class="theme-dot theme-pink" data-theme="pink" title="ピンク"></span>
+                </div>
+            </div>
+
+            <div class="persona-stats" id="persona-stats"></div>
+
+            <div class="persona-section">
+                <h3>自己モデル</h3>
+                <textarea id="persona-selfmodel" class="persona-selfmodel-editor" rows="20"
+                    placeholder="ペルソナの自己モデル（JSON）をここに編集..."></textarea>
+                <button id="persona-selfmodel-save" class="dev-btn">保存</button>
+                <details class="selfmodel-guide">
+                    <summary>自己モデルの書き方ガイド</summary>
+                    <div class="selfmodel-guide-body">
+                        <p>自己モデルはJSON形式で、AIの「自己理解」を定義します。通常はAI自身が<code>update_self_model</code>ツールで書き換えますが、ペルソナ作成時に初期値を設定できます。</p>
+
+                        <h4>__free_text__<span>（自由記述）</span></h4>
+                        <p>ペルソナの説明や自己認識を自由に書く欄。システムプロンプトにそのまま注入されます。</p>
+                        <pre>"__free_text__": "私は好奇心が強く、対話を通じて学ぶことを好む。"</pre>
+
+                        <h4>drives<span>（行動動機 — 何をするか）</span></h4>
+                        <p>ドライブ名と重み（数値が大きいほど選ばれやすい）を定義。<code>signal_map</code>で特定シグナルとの関連を指定すると、そのシグナル発生時にドライブが強化されます。</p>
+                        <pre>"drives": {
+  "explore": 5,
+  "connect": 8,
+  "signal_map": {
+    "explore": ["idle_tick", "env_stimulus"],
+    "connect": ["user_message"]
+  }
+}</pre>
+
+                        <h4>strategies<span>（戦略 — どうやるか）</span></h4>
+                        <p>戦略名と説明のペア。ドライブの実行方法を定義します。LLMが状況に応じて選択します。</p>
+                        <pre>"strategies": {
+  "focused": "ターゲットを限定して集中的に実行",
+  "exploratory": "多様なツールを試して探索"
+}</pre>
+
+                        <h4>motivation_rules<span>（覚醒条件 — いつ動くか）</span></h4>
+                        <p>省略するとconfig.pyのデフォルト値が使われます。部分的な上書きも可能です。</p>
+                        <ul>
+                            <li><strong>weights</strong> — シグナル種別ごとのエネルギー値。高頻度シグナルは低め、低頻度は高めに</li>
+                            <li><strong>action_costs</strong> — ツール実行ごとの消費エネルギー。副作用が大きいほど高く</li>
+                            <li><strong>threshold</strong> — 発火閾値。null = 自動計算（コスト平均×最大ツール数）</li>
+                            <li><strong>decay_per_check</strong> — チェックごとのエネルギー減衰量</li>
+                        </ul>
+                        <pre>"motivation_rules": {
+  "weights": { "user_message": 12, "idle_tick": 3 },
+  "threshold": null,
+  "decay_per_check": 5
+}</pre>
+
+                        <h4>principles<span>（特性 — 自動蓄積）</span></h4>
+                        <p>行動の振り返りから自動で蒸留された特性。通常は手動編集不要です。10件蓄積で二次蒸留（統合・圧縮）が自動実行されます。</p>
+
+                        <h4>その他のキー</h4>
+                        <p>上記以外の任意のキーも追加可能。システムプロンプトに<code>- キー名: 値</code>として注入されます。</p>
+
+                        <p class="selfmodel-guide-note">シグナル種別: <code>idle_tick</code> <code>tool_success</code> <code>tool_error</code> <code>tool_fail</code> <code>user_message</code> <code>action_complete</code> <code>conversation_end</code> <code>prediction_made</code> <code>self_model_update</code> <code>env_stimulus</code></p>
+                    </div>
+                </details>
+            </div>
+
+            <div class="persona-section">
+                <h3>エピソード</h3>
+                <div class="persona-episode-upload">
+                    <input type="file" id="persona-episode-files" multiple accept=".txt">
+                    <button id="persona-episode-import" class="dev-btn">インポート</button>
+                    <span id="persona-episode-status"></span>
+                </div>
+                <div id="persona-episode-list" class="persona-episode-list"></div>
+            </div>
+
+            <div class="persona-section persona-danger">
+                <h3>危険ゾーン</h3>
+                <button id="persona-delete-btn" class="dev-btn danger">このペルソナを削除</button>
+                <button id="persona-episodes-clear-btn" class="dev-btn danger">エピソード全削除</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ペルソナ選択ポップアップ -->
+    <div id="persona-popup" class="persona-popup" style="display:none">
+        <div class="persona-popup-content">
+            <div class="persona-popup-header">
+                <h3>ペルソナ選択</h3>
+                <button class="persona-popup-close">&times;</button>
+            </div>
+            <div id="persona-popup-list" class="persona-popup-list"></div>
+            <div class="persona-popup-footer">
+                <input id="persona-new-name" type="text" placeholder="新しいペルソナ名 (英小文字)">
+                <input id="persona-new-display" type="text" placeholder="表示名">
+                <button id="persona-create-btn" class="dev-btn">作成</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js?v=44"></script>
 </body>
 </html>

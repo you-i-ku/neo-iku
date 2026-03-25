@@ -14,7 +14,7 @@ from app.memory.store import (
     create_conversation, add_message, end_conversation,
     record_tool_action,
 )
-from app.persona.system_prompt import get_mode, IKU_SYSTEM_PROMPT
+from app.persona.system_prompt import get_active_persona_id
 from app.tools.registry import parse_tool_calls, execute_tool, build_tools_prompt, build_planning_prompt, parse_plan, get_all_tools, get_tool
 from app.tools.builtin import (
     _load_self_model,
@@ -101,6 +101,50 @@ class Pipeline:
                 dead.add(ws)
         self._websockets -= dead
 
+    async def _broadcast_distillation_session(
+        self, conv_id: int, source: str, trigger: str | None, step_history: list[dict]
+    ):
+        """蒸留ログ: セッション完了時にWSで通知"""
+        try:
+            rounds = []
+            has_predictions = False
+            for s in step_history:
+                tool_name = s.get("tool", "")
+                result_summary = s.get("result_summary", "")
+                expected = s.get("expected")
+                intent = s.get("intent")
+                has_pred = expected is not None and expected != ""
+                has_intent = intent is not None and intent != ""
+                if has_pred:
+                    has_predictions = True
+                short_summary = self._summarize_result(tool_name, result_summary, "success")
+                rounds.append({
+                    "tool_name": tool_name,
+                    "result_summary": short_summary,
+                    "result_raw": result_summary[:200] if len(result_summary) > 80 else result_summary,
+                    "expected": expected if has_pred else None,
+                    "intent": intent if has_intent else None,
+                    "status": "success",
+                    "has_prediction": has_pred,
+                    "has_intent": has_intent,
+                })
+
+            await self._broadcast(json.dumps({
+                "type": "distillation_session",
+                "session": {
+                    "conv_id": conv_id,
+                    "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "source": source or "chat",
+                    "trigger": trigger,
+                    "rounds": rounds,
+                    "round_count": len(rounds),
+                    "has_predictions": has_predictions,
+                    "distillation_response": None,
+                },
+            }))
+        except Exception as e:
+            logger.error(f"蒸留セッションWS通知エラー: {e}")
+
     # --- 制御 ---
 
     def start(self):
@@ -172,7 +216,7 @@ class Pipeline:
         conv_id = req.conv_id
         if conv_id is None:
             async with async_session() as session:
-                conv = await create_conversation(session, source=req.source, trigger=req.trigger)
+                conv = await create_conversation(session, source=req.source, trigger=req.trigger, persona_id=get_active_persona_id())
                 conv_id = conv.id
                 await session.commit()
 
@@ -388,6 +432,7 @@ class Pipeline:
                             result, action_status, exec_ms,
                             expected_result=expected,
                             intent=intent,
+                            persona_id=get_active_persona_id(),
                         )
                         await session.commit()
 
@@ -442,6 +487,11 @@ class Pipeline:
         except Exception:
             pass
 
+        # 蒸留ログ: セッション完了をWS通知
+        await self._broadcast_distillation_session(
+            conv_id, req.source, req.trigger, step_history
+        )
+
         return PipelineResult(
             conv_id=conv_id,
             step_history=step_history,
@@ -460,7 +510,7 @@ class Pipeline:
         conv_id = req.conv_id
         if conv_id is None:
             async with async_session() as session:
-                conv = await create_conversation(session, source=req.source, trigger=req.trigger)
+                conv = await create_conversation(session, source=req.source, trigger=req.trigger, persona_id=get_active_persona_id())
                 conv_id = conv.id
                 await session.commit()
 
@@ -610,6 +660,11 @@ class Pipeline:
         except Exception:
             pass
 
+        # 蒸留ログ: セッション完了をWS通知
+        await self._broadcast_distillation_session(
+            conv_id, req.source, req.trigger, step_history
+        )
+
         return PipelineResult(
             conv_id=conv_id,
             step_history=step_history,
@@ -724,6 +779,7 @@ class Pipeline:
                 result, action_status, exec_ms,
                 expected_result=expected,
                 intent=intent,
+                persona_id=get_active_persona_id(),
             )
             await session.commit()
 
@@ -1111,8 +1167,6 @@ class Pipeline:
                 p_lines = [f"- {p['text']}" if isinstance(p, dict) and 'text' in p else f"- {p}" for p in recent]
                 sm_text += "\n[characteristics]\n" + "\n".join(p_lines)
 
-        if get_mode() == "iku":
-            return f"{IKU_SYSTEM_PROMPT}\n{sm_text}"
         return sm_text
 
     def _build_initial_prompt(

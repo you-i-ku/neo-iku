@@ -8,6 +8,30 @@ class Base(DeclarativeBase):
     pass
 
 
+class Persona(Base):
+    """ペルソナ定義"""
+    __tablename__ = "personas"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False, unique=True)
+    display_name = Column(String(200), nullable=False)
+    color_theme = Column(String(50), default="purple")
+    system_text = Column(Text, nullable=True)  # __free_textの初期値
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class PersonaEpisode(Base):
+    """ペルソナエピソード（過去ログの汎用版）"""
+    __tablename__ = "persona_episodes"
+
+    id = Column(Integer, primary_key=True)
+    persona_id = Column(Integer, ForeignKey("personas.id"), nullable=False)
+    file_name = Column(String(200), nullable=False)
+    role = Column(String(20), nullable=False)
+    content = Column(Text, nullable=False)
+    sequence = Column(Integer, nullable=False)
+
+
 class Conversation(Base):
     __tablename__ = "conversations"
 
@@ -19,6 +43,7 @@ class Conversation(Base):
     source = Column(String(20), default="chat")  # "chat" or "autonomous"
     trigger = Column(String(20), nullable=True)   # "timer" / "energy" / "manual" / None(chat)
     distillation_response = Column(Text, nullable=True)  # 蒸留LLMの生応答
+    persona_id = Column(Integer, ForeignKey("personas.id"), nullable=True)  # NULLならノーマルモード
 
     messages = relationship("Message", back_populates="conversation", order_by="Message.created_at")
 
@@ -52,6 +77,7 @@ class ToolAction(Base):
 
     id = Column(Integer, primary_key=True)
     conversation_id = Column(Integer, nullable=True)
+    persona_id = Column(Integer, ForeignKey("personas.id"), nullable=True)
     tool_name = Column(String(100), nullable=False)
     arguments = Column(Text, nullable=False)       # JSON文字列
     result_summary = Column(Text, nullable=False)   # 結果の先頭500文字
@@ -69,6 +95,7 @@ class SelfModelSnapshot(Base):
     id = Column(Integer, primary_key=True)
     content = Column(Text, nullable=False)          # JSON全体
     changed_key = Column(String(100), nullable=True)  # 変更されたキー
+    persona_id = Column(Integer, ForeignKey("personas.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -84,11 +111,12 @@ class VectorEmbedding(Base):
 
 
 class MemorySummary(Base):
-    """将来イク自身が自発的に生成する要約用（今は未使用）"""
+    """日記・内省メモ"""
     __tablename__ = "memory_summaries"
 
     id = Column(Integer, primary_key=True)
     conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=True)
+    persona_id = Column(Integer, ForeignKey("personas.id"), nullable=True)
     content = Column(Text, nullable=False)
     keywords = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)

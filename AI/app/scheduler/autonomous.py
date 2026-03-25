@@ -441,6 +441,18 @@ class AutonomousScheduler:
                 except Exception as e:
                     logger.error(f"蒸留応答DB保存エラー: {e}")
 
+                # 蒸留完了をWS通知
+                try:
+                    from app.pipeline import pipeline
+                    await pipeline._broadcast(json.dumps({
+                        "type": "distillation_update",
+                        "conv_id": result.conv_id,
+                        "distillation_response": raw_response,
+                        "principle": principle,
+                    }))
+                except Exception as e:
+                    logger.error(f"蒸留更新WS通知エラー: {e}")
+
             if principle:
                 self._save_principle(principle, self_model)
                 logger.info(f"特性抽出: {principle}")

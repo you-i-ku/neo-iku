@@ -147,8 +147,9 @@ async def store_embedding(source_table: str, source_id: int, content: str):
 
 
 async def search_similar(query: str, source_tables: list[str],
-                          limit: int = VECTOR_SEARCH_LIMIT) -> list[dict]:
-    """ベクトル類似度検索"""
+                          limit: int = VECTOR_SEARCH_LIMIT,
+                          persona_id: int | None = None) -> list[dict]:
+    """ベクトル類似度検索（persona_idフィルタ対応）"""
     if not VECTOR_SEARCH_ENABLED:
         return []
 
@@ -159,10 +160,54 @@ async def search_similar(query: str, source_tables: list[str],
     # 指定テーブルの全embeddingをロード（小〜中規模向けbrute force）
     placeholders = ", ".join(f"'{t}'" for t in source_tables)
     async with async_session() as session:
-        rows = (await session.execute(text(
-            f"SELECT source_table, source_id, embedding FROM vector_embeddings "
-            f"WHERE source_table IN ({placeholders})"
-        ))).fetchall()
+        if persona_id is not None:
+            # persona_idフィルタ: テーブルごとに異なるJOIN戦略
+            rows = []
+            for tbl in source_tables:
+                if tbl == "messages":
+                    tbl_rows = (await session.execute(text(
+                        "SELECT v.source_table, v.source_id, v.embedding FROM vector_embeddings v "
+                        "JOIN messages m ON v.source_id = m.id "
+                        "JOIN conversations c ON m.conversation_id = c.id "
+                        "WHERE v.source_table = 'messages' AND c.persona_id = :pid"
+                    ), {"pid": persona_id})).fetchall()
+                elif tbl in ("memory_summaries", "persona_episodes", "tool_actions"):
+                    # 直接persona_idカラムを持つテーブル
+                    src = tbl
+                    tbl_rows = (await session.execute(text(
+                        f"SELECT v.source_table, v.source_id, v.embedding FROM vector_embeddings v "
+                        f"JOIN {src} t ON v.source_id = t.id "
+                        f"WHERE v.source_table = :tbl AND t.persona_id = :pid"
+                    ), {"tbl": tbl, "pid": persona_id})).fetchall()
+                else:
+                    tbl_rows = (await session.execute(text(
+                        "SELECT source_table, source_id, embedding FROM vector_embeddings "
+                        "WHERE source_table = :tbl"
+                    ), {"tbl": tbl})).fetchall()
+                rows.extend(tbl_rows)
+        else:
+            # ノーマルモード: persona_id IS NULL のデータのみ
+            rows = []
+            for tbl in source_tables:
+                if tbl == "messages":
+                    tbl_rows = (await session.execute(text(
+                        "SELECT v.source_table, v.source_id, v.embedding FROM vector_embeddings v "
+                        "JOIN messages m ON v.source_id = m.id "
+                        "JOIN conversations c ON m.conversation_id = c.id "
+                        "WHERE v.source_table = 'messages' AND c.persona_id IS NULL"
+                    ))).fetchall()
+                elif tbl in ("memory_summaries", "tool_actions"):
+                    tbl_rows = (await session.execute(text(
+                        f"SELECT v.source_table, v.source_id, v.embedding FROM vector_embeddings v "
+                        f"JOIN {tbl} t ON v.source_id = t.id "
+                        f"WHERE v.source_table = :tbl AND t.persona_id IS NULL"
+                    ), {"tbl": tbl})).fetchall()
+                else:
+                    tbl_rows = (await session.execute(text(
+                        "SELECT source_table, source_id, embedding FROM vector_embeddings "
+                        "WHERE source_table = :tbl"
+                    ), {"tbl": tbl})).fetchall()
+                rows.extend(tbl_rows)
 
     if not rows:
         return []
@@ -211,6 +256,14 @@ async def fetch_content_for_results(results: list[dict]) -> list[dict]:
                         enriched.append({
                             **r, "content": row[0], "created_at": str(row[1]),
                         })
+                elif table == "persona_episodes":
+                    row = (await session.execute(text(
+                        "SELECT role, content FROM persona_episodes WHERE id = :id"
+                    ), {"id": sid})).fetchone()
+                    if row:
+                        enriched.append({
+                            **r, "role": row[0], "content": row[1],
+                        })
                 elif table == "iku_logs":
                     row = (await session.execute(text(
                         "SELECT role, content FROM iku_logs WHERE id = :id"
@@ -219,27 +272,33 @@ async def fetch_content_for_results(results: list[dict]) -> list[dict]:
                         enriched.append({
                             **r, "role": row[0], "content": row[1],
                         })
+                elif table == "tool_actions":
+                    row = (await session.execute(text(
+                        "SELECT tool_name, result_summary FROM tool_actions WHERE id = :id"
+                    ), {"id": sid})).fetchone()
+                    if row:
+                        enriched.append({
+                            **r, "content": f"{row[0]}: {row[1]}",
+                        })
             except Exception:
                 continue
     return enriched
 
 
 async def reindex_all() -> dict:
-    """全メッセージ・日記のベクトルを再構築"""
+    """全メッセージ・日記・エピソード・アクションログのベクトルを再構築"""
     global _embed_available
     _embed_available = None  # リセットして再判定
 
-    counts = {"messages": 0, "memory_summaries": 0, "skipped": 0}
+    counts = {"messages": 0, "memory_summaries": 0, "persona_episodes": 0, "tool_actions": 0, "skipped": 0}
 
     async with async_session() as session:
         await session.execute(text("DELETE FROM vector_embeddings"))
         await session.commit()
 
+    # messages
     async with async_session() as session:
-        rows = (await session.execute(text(
-            "SELECT id, content FROM messages"
-        ))).fetchall()
-
+        rows = (await session.execute(text("SELECT id, content FROM messages"))).fetchall()
     for row in rows:
         await store_embedding("messages", row[0], row[1])
         if _embed_available is False:
@@ -247,14 +306,29 @@ async def reindex_all() -> dict:
             return counts
         counts["messages"] += 1
 
+    # memory_summaries
     async with async_session() as session:
-        rows = (await session.execute(text(
-            "SELECT id, content FROM memory_summaries"
-        ))).fetchall()
-
+        rows = (await session.execute(text("SELECT id, content FROM memory_summaries"))).fetchall()
     for row in rows:
         await store_embedding("memory_summaries", row[0], row[1])
         counts["memory_summaries"] += 1
+
+    # persona_episodes
+    async with async_session() as session:
+        rows = (await session.execute(text("SELECT id, content FROM persona_episodes"))).fetchall()
+    for row in rows:
+        await store_embedding("persona_episodes", row[0], row[1])
+        counts["persona_episodes"] += 1
+
+    # tool_actions
+    async with async_session() as session:
+        rows = (await session.execute(text(
+            "SELECT id, tool_name, arguments, result_summary FROM tool_actions"
+        ))).fetchall()
+    for row in rows:
+        text_for_embed = f"{row[1]}: {row[2][:200]} → {row[3][:200]}"
+        await store_embedding("tool_actions", row[0], text_for_embed)
+        counts["tool_actions"] += 1
 
     return counts
 

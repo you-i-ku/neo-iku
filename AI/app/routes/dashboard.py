@@ -1,14 +1,21 @@
 """ダッシュボードAPI"""
+import json
 import math
 import logging
+import shutil
 from datetime import datetime
-from fastapi import APIRouter, Query
+from pathlib import Path
+from fastapi import APIRouter, Query, UploadFile, File
 from pydantic import BaseModel
 from sqlalchemy import text
 from app.llm.manager import llm_manager
 from app.memory.database import async_session
-from app.memory.store import count_messages, count_conversations, count_iku_logs
-from app.persona.system_prompt import get_mode, set_mode
+from app.memory.store import count_messages, count_conversations, count_iku_logs, count_persona_episodes
+from app.persona.system_prompt import (
+    get_mode, set_mode, get_active_persona, get_active_persona_id,
+    activate_persona, deactivate_persona,
+)
+from config import PERSONAS_DIR
 
 from app.scheduler.autonomous import scheduler
 from app.pipeline import pipeline
@@ -19,7 +26,7 @@ router = APIRouter(prefix="/api")
 
 @router.get("/status")
 async def get_status():
-    """イクの状態を返す"""
+    """状態を返す"""
     llm = llm_manager.get()
     llm_available = await llm.is_available()
 
@@ -27,6 +34,8 @@ async def get_status():
         msg_count = await count_messages(session)
         conv_count = await count_conversations(session)
         log_count = await count_iku_logs(session)
+
+    persona = get_active_persona()
 
     return {
         "llm_available": llm_available,
@@ -36,6 +45,7 @@ async def get_status():
         "iku_log_count": log_count,
         "connected_clients": pipeline.connected_count,
         "mode": get_mode(),
+        "active_persona": persona,
     }
 
 
@@ -45,21 +55,282 @@ class ModeRequest(BaseModel):
 
 @router.post("/mode")
 async def change_mode(req: ModeRequest):
-    """モード切替。イクモードに切り替え時、過去ログを自動インポート。"""
-    set_mode(req.mode)
-
+    """モード切替（後方互換）。ikuモード→ikuペルソナactivate"""
     if req.mode == "iku":
-        # 過去ログが未インポートなら自動実行
+        # ikuペルソナを探してactivate
         async with async_session() as session:
-            existing = await count_iku_logs(session)
+            row = (await session.execute(text(
+                "SELECT id, name, display_name, color_theme, system_text FROM personas WHERE name = 'iku'"
+            ))).fetchone()
+        if row:
+            activate_persona(row[0], {
+                "id": row[0], "name": row[1], "display_name": row[2],
+                "color_theme": row[3], "system_text": row[4],
+            })
+            return {"mode": get_mode(), "active_persona": get_active_persona()}
+        else:
+            return {"error": "ikuペルソナが見つかりません", "mode": get_mode()}
+    else:
+        deactivate_persona()
+        return {"mode": get_mode()}
 
-        if existing == 0:
-            from app.importer.log_parser import import_iku_logs
-            result = await import_iku_logs(async_session)
-            logger.info(f"過去ログ自動インポート: {result}")
-            return {"mode": get_mode(), "import": result}
 
+# --- ペルソナ CRUD ---
+
+class PersonaCreateRequest(BaseModel):
+    name: str
+    display_name: str
+    color_theme: str = "purple"
+
+class PersonaUpdateRequest(BaseModel):
+    display_name: str | None = None
+    color_theme: str | None = None
+
+
+@router.get("/personas")
+async def list_personas():
+    """ペルソナ一覧"""
+    async with async_session() as session:
+        rows = (await session.execute(text(
+            "SELECT id, name, display_name, color_theme, created_at FROM personas ORDER BY id"
+        ))).fetchall()
+    active_id = get_active_persona_id()
+    return {
+        "personas": [
+            {"id": r[0], "name": r[1], "display_name": r[2], "color_theme": r[3],
+             "created_at": str(r[4]), "active": r[0] == active_id}
+            for r in rows
+        ]
+    }
+
+
+@router.post("/personas")
+async def create_persona(req: PersonaCreateRequest):
+    """ペルソナ作成"""
+    async with async_session() as session:
+        # 重複チェック
+        existing = (await session.execute(text(
+            "SELECT id FROM personas WHERE name = :name"
+        ), {"name": req.name})).fetchone()
+        if existing:
+            return {"error": f"ペルソナ '{req.name}' は既に存在します"}
+
+        await session.execute(text(
+            "INSERT INTO personas (name, display_name, color_theme, created_at) "
+            "VALUES (:name, :display_name, :color_theme, datetime('now'))"
+        ), {"name": req.name, "display_name": req.display_name, "color_theme": req.color_theme})
+        await session.commit()
+
+        row = (await session.execute(text(
+            "SELECT id, name, display_name, color_theme FROM personas WHERE name = :name"
+        ), {"name": req.name})).fetchone()
+
+    # ペルソナ用ディレクトリ + 空self_model作成
+    persona_dir = PERSONAS_DIR / str(row[0])
+    persona_dir.mkdir(parents=True, exist_ok=True)
+    sm_path = persona_dir / "self_model.json"
+    if not sm_path.exists():
+        sm_path.write_text("{}", encoding="utf-8")
+
+    return {"id": row[0], "name": row[1], "display_name": row[2], "color_theme": row[3]}
+
+
+@router.get("/personas/{persona_id}")
+async def get_persona(persona_id: int):
+    """ペルソナ詳細"""
+    async with async_session() as session:
+        row = (await session.execute(text(
+            "SELECT id, name, display_name, color_theme, system_text, created_at FROM personas WHERE id = :id"
+        ), {"id": persona_id})).fetchone()
+        if not row:
+            return {"error": "ペルソナが見つかりません"}
+
+        ep_count = await count_persona_episodes(session, persona_id)
+        msg_count = (await session.execute(text(
+            "SELECT COUNT(*) FROM messages m JOIN conversations c ON m.conversation_id = c.id WHERE c.persona_id = :pid"
+        ), {"pid": persona_id})).scalar() or 0
+        diary_count = (await session.execute(text(
+            "SELECT COUNT(*) FROM memory_summaries WHERE persona_id = :pid"
+        ), {"pid": persona_id})).scalar() or 0
+
+    return {
+        "id": row[0], "name": row[1], "display_name": row[2],
+        "color_theme": row[3], "system_text": row[4], "created_at": str(row[5]),
+        "episode_count": ep_count, "message_count": msg_count, "diary_count": diary_count,
+    }
+
+
+@router.put("/personas/{persona_id}")
+async def update_persona(persona_id: int, req: PersonaUpdateRequest):
+    """ペルソナ更新"""
+    async with async_session() as session:
+        row = (await session.execute(text("SELECT id FROM personas WHERE id = :id"), {"id": persona_id})).fetchone()
+        if not row:
+            return {"error": "ペルソナが見つかりません"}
+
+        if req.display_name is not None:
+            await session.execute(text(
+                "UPDATE personas SET display_name = :dn WHERE id = :id"
+            ), {"dn": req.display_name, "id": persona_id})
+        if req.color_theme is not None:
+            await session.execute(text(
+                "UPDATE personas SET color_theme = :ct WHERE id = :id"
+            ), {"ct": req.color_theme, "id": persona_id})
+        await session.commit()
+
+    # アクティブペルソナのキャッシュも更新
+    if get_active_persona_id() == persona_id:
+        async with async_session() as session:
+            r = (await session.execute(text(
+                "SELECT id, name, display_name, color_theme, system_text FROM personas WHERE id = :id"
+            ), {"id": persona_id})).fetchone()
+            if r:
+                activate_persona(r[0], {
+                    "id": r[0], "name": r[1], "display_name": r[2],
+                    "color_theme": r[3], "system_text": r[4],
+                })
+
+    return {"ok": True}
+
+
+@router.delete("/personas/{persona_id}")
+async def delete_persona(persona_id: int):
+    """ペルソナ削除（関連データ全消去）"""
+    # アクティブなら先にdeactivate
+    if get_active_persona_id() == persona_id:
+        deactivate_persona()
+
+    async with async_session() as session:
+        # 関連データ削除
+        # conversations配下のmessages
+        await session.execute(text(
+            "DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE persona_id = :pid)"
+        ), {"pid": persona_id})
+        await session.execute(text("DELETE FROM conversations WHERE persona_id = :pid"), {"pid": persona_id})
+        await session.execute(text("DELETE FROM tool_actions WHERE persona_id = :pid"), {"pid": persona_id})
+        await session.execute(text("DELETE FROM memory_summaries WHERE persona_id = :pid"), {"pid": persona_id})
+        await session.execute(text("DELETE FROM self_model_snapshots WHERE persona_id = :pid"), {"pid": persona_id})
+        await session.execute(text("DELETE FROM persona_episodes WHERE persona_id = :pid"), {"pid": persona_id})
+        await session.execute(text("DELETE FROM personas WHERE id = :pid"), {"pid": persona_id})
+        await session.commit()
+
+    # ファイル削除
+    persona_dir = PERSONAS_DIR / str(persona_id)
+    if persona_dir.exists():
+        shutil.rmtree(persona_dir, ignore_errors=True)
+
+    return {"deleted": True}
+
+
+@router.post("/personas/{persona_id}/activate")
+async def activate_persona_endpoint(persona_id: int):
+    """ペルソナ有効化"""
+    async with async_session() as session:
+        row = (await session.execute(text(
+            "SELECT id, name, display_name, color_theme, system_text FROM personas WHERE id = :id"
+        ), {"id": persona_id})).fetchone()
+    if not row:
+        return {"error": "ペルソナが見つかりません"}
+
+    activate_persona(row[0], {
+        "id": row[0], "name": row[1], "display_name": row[2],
+        "color_theme": row[3], "system_text": row[4],
+    })
+    return {"active_persona": get_active_persona(), "mode": get_mode()}
+
+
+@router.post("/personas/deactivate")
+async def deactivate_persona_endpoint():
+    """ノーマルモードに戻す"""
+    deactivate_persona()
     return {"mode": get_mode()}
+
+
+@router.post("/personas/{persona_id}/episodes/import")
+async def import_episodes_endpoint(persona_id: int, files: list[UploadFile] = File(...)):
+    """エピソードファイルアップロード"""
+    import tempfile
+    from app.importer.log_parser import import_episodes
+
+    # 一時ディレクトリにファイルを保存
+    temp_paths = []
+    try:
+        for f in files:
+            suffix = Path(f.filename).suffix if f.filename else ".txt"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                content = await f.read()
+                tmp.write(content)
+                temp_paths.append(Path(tmp.name))
+
+        result = await import_episodes(async_session, persona_id, temp_paths)
+    finally:
+        for p in temp_paths:
+            p.unlink(missing_ok=True)
+
+    return result
+
+
+@router.get("/personas/{persona_id}/episodes")
+async def list_episodes(persona_id: int, limit: int = Query(50), offset: int = Query(0)):
+    """エピソード一覧"""
+    async with async_session() as session:
+        total = await count_persona_episodes(session, persona_id)
+        rows = (await session.execute(text(
+            "SELECT id, file_name, role, content, sequence FROM persona_episodes "
+            "WHERE persona_id = :pid ORDER BY file_name, sequence LIMIT :limit OFFSET :offset"
+        ), {"pid": persona_id, "limit": limit, "offset": offset})).fetchall()
+
+    return {
+        "total": total,
+        "episodes": [
+            {"id": r[0], "file_name": r[1], "role": r[2], "content": r[3][:200], "sequence": r[4]}
+            for r in rows
+        ],
+    }
+
+
+@router.delete("/personas/{persona_id}/episodes")
+async def delete_episodes(persona_id: int):
+    """エピソード全削除"""
+    async with async_session() as session:
+        # FTSからも削除
+        await session.execute(text(
+            "DELETE FROM persona_episodes_fts WHERE rowid IN "
+            "(SELECT id FROM persona_episodes WHERE persona_id = :pid)"
+        ), {"pid": persona_id})
+        await session.execute(text("DELETE FROM persona_episodes WHERE persona_id = :pid"), {"pid": persona_id})
+        # ベクトルも削除
+        await session.execute(text(
+            "DELETE FROM vector_embeddings WHERE source_table = 'persona_episodes' "
+            "AND source_id NOT IN (SELECT id FROM persona_episodes)"
+        ))
+        await session.commit()
+    return {"deleted": True}
+
+
+@router.get("/personas/{persona_id}/self-model")
+async def get_persona_self_model(persona_id: int):
+    """ペルソナ用self_model取得"""
+    sm_path = PERSONAS_DIR / str(persona_id) / "self_model.json"
+    if not sm_path.exists():
+        return {}
+    try:
+        return json.loads(sm_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+class SelfModelUpdateRequest(BaseModel):
+    content: dict
+
+@router.post("/personas/{persona_id}/self-model")
+async def update_persona_self_model(persona_id: int, req: SelfModelUpdateRequest):
+    """ペルソナ用self_model更新"""
+    sm_dir = PERSONAS_DIR / str(persona_id)
+    sm_dir.mkdir(parents=True, exist_ok=True)
+    sm_path = sm_dir / "self_model.json"
+    sm_path.write_text(json.dumps(req.content, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"ok": True}
 
 
 @router.get("/models")
@@ -111,7 +382,7 @@ async def reset_db():
     """iku_logs以外の全テーブルをクリア"""
     from sqlalchemy import text
     async with async_session() as session:
-        for table in ["messages", "conversations", "memory_summaries", "tool_actions", "self_model_snapshots"]:
+        for table in ["messages", "conversations", "memory_summaries", "tool_actions", "self_model_snapshots", "vector_embeddings"]:
             await session.execute(text(f"DELETE FROM {table}"))
         for fts in ["messages_fts", "memory_summaries_fts", "tool_actions_fts"]:
             await session.execute(text(f"DELETE FROM {fts}"))
@@ -122,8 +393,10 @@ async def reset_db():
 @router.post("/dev/clear-self-model")
 async def clear_self_model():
     """self_model.jsonの内容をクリア"""
-    from app.tools.builtin import SELF_MODEL_PATH
-    SELF_MODEL_PATH.write_text("{}", encoding="utf-8")
+    from app.tools.builtin import _get_self_model_path
+    path = _get_self_model_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}", encoding="utf-8")
     return {"cleared": True}
 
 
@@ -195,39 +468,43 @@ async def get_self_model():
 async def autonomy_report(
     date_from: str = Query("2020-01-01", alias="from"),
     date_to: str = Query("2030-01-01", alias="to"),
+    persona_id: int | None = Query(None),
 ):
     """自律度計測レポートを生成する"""
+    # persona_id未指定ならアクティブペルソナを使用
+    pid = persona_id if persona_id is not None else get_active_persona_id()
+
     async with async_session() as session:
         # 1. Autonomy Ratio
-        autonomy = await _calc_autonomy_ratio(session, date_from, date_to)
+        autonomy = await _calc_autonomy_ratio(session, date_from, date_to, pid)
 
         # 2. Tool Diversity (Shannon Entropy)
-        diversity = await _calc_tool_diversity(session, date_from, date_to)
+        diversity = await _calc_tool_diversity(session, date_from, date_to, pid)
 
         # 3. Self-Evolution
-        evolution = await _calc_self_evolution(session, date_from, date_to)
+        evolution = await _calc_self_evolution(session, date_from, date_to, pid)
 
         # 4. Error Recovery
-        recovery = await _calc_error_recovery(session, date_from, date_to)
+        recovery = await _calc_error_recovery(session, date_from, date_to, pid)
 
         # 5. Metacognitive Accuracy
-        metacognition = await _calc_metacognition(session, date_from, date_to)
+        metacognition = await _calc_metacognition(session, date_from, date_to, pid)
 
         # 6. Memory Utilization
-        memory = await _calc_memory_utilization(session, date_from, date_to)
+        memory = await _calc_memory_utilization(session, date_from, date_to, pid)
 
         # 7. Principle Accumulation
-        principles = await _calc_principle_accumulation(session, date_from, date_to)
+        principles = await _calc_principle_accumulation(session, date_from, date_to, pid)
 
         # 8. Intent Diversity
-        intent_div = await _calc_intent_diversity(session, date_from, date_to)
+        intent_div = await _calc_intent_diversity(session, date_from, date_to, pid)
 
         # 9-13. Time-series metrics
-        tool_entropy_ts = await _calc_tool_entropy_timeseries(session, date_from, date_to)
-        prediction_ts = await _calc_prediction_accuracy_timeseries(session, date_from, date_to)
-        energy_eff = await _calc_energy_efficiency(session, date_from, date_to)
-        sm_velocity = await _calc_self_model_velocity(session, date_from, date_to)
-        session_length = await _calc_session_length_trend(session, date_from, date_to)
+        tool_entropy_ts = await _calc_tool_entropy_timeseries(session, date_from, date_to, pid)
+        prediction_ts = await _calc_prediction_accuracy_timeseries(session, date_from, date_to, pid)
+        energy_eff = await _calc_energy_efficiency(session, date_from, date_to, pid)
+        sm_velocity = await _calc_self_model_velocity(session, date_from, date_to, pid)
+        session_length = await _calc_session_length_trend(session, date_from, date_to, pid)
 
     # Summary
     total_actions = sum(diversity["distribution"].values()) if diversity["distribution"] else 0
@@ -286,12 +563,22 @@ async def autonomy_report(
     }
 
 
-async def _calc_autonomy_ratio(session, date_from: str, date_to: str) -> dict:
+def _pid_filter(table_alias: str, pid: int | None, col: str = "persona_id") -> tuple[str, dict]:
+    """persona_idフィルタSQL断片を生成"""
+    if pid is not None:
+        return f" AND {table_alias}.{col} = :pid", {"pid": pid}
+    return f" AND {table_alias}.{col} IS NULL", {}
+
+
+async def _calc_autonomy_ratio(session, date_from: str, date_to: str, pid: int | None = None) -> dict:
+    pf, pp = _pid_filter("conversations", pid)
+    params = {"f": date_from, "t": date_to, **pp}
+
     rows = (await session.execute(text(
         "SELECT source, COUNT(*) as cnt FROM conversations "
-        "WHERE started_at BETWEEN :f AND :t AND is_imported = 0 "
+        f"WHERE started_at BETWEEN :f AND :t AND is_imported = 0{pf} "
         "GROUP BY source"
-    ), {"f": date_from, "t": date_to})).fetchall()
+    ), params)).fetchall()
 
     counts = {r[0] or "chat": r[1] for r in rows}
     autonomous = counts.get("autonomous", 0)
@@ -299,12 +586,11 @@ async def _calc_autonomy_ratio(session, date_from: str, date_to: str) -> dict:
     total = autonomous + chat
     ratio = round(autonomous / total, 3) if total > 0 else 0.0
 
-    # トリガー別内訳（タイマー vs エネルギー vs 手動）
     trigger_rows = (await session.execute(text(
         "SELECT trigger, COUNT(*) as cnt FROM conversations "
-        "WHERE started_at BETWEEN :f AND :t AND is_imported = 0 AND source = 'autonomous' "
+        f"WHERE started_at BETWEEN :f AND :t AND is_imported = 0 AND source = 'autonomous'{pf} "
         "GROUP BY trigger"
-    ), {"f": date_from, "t": date_to})).fetchall()
+    ), params)).fetchall()
 
     trigger_counts = {(r[0] or "timer"): r[1] for r in trigger_rows}
     energy = trigger_counts.get("energy", 0)
@@ -318,12 +604,13 @@ async def _calc_autonomy_ratio(session, date_from: str, date_to: str) -> dict:
     }
 
 
-async def _calc_tool_diversity(session, date_from: str, date_to: str) -> dict:
+async def _calc_tool_diversity(session, date_from: str, date_to: str, pid: int | None = None) -> dict:
+    pf, pp = _pid_filter("tool_actions", pid)
     rows = (await session.execute(text(
         "SELECT tool_name, COUNT(*) as cnt FROM tool_actions "
-        "WHERE created_at BETWEEN :f AND :t "
+        f"WHERE created_at BETWEEN :f AND :t{pf} "
         "GROUP BY tool_name"
-    ), {"f": date_from, "t": date_to})).fetchall()
+    ), {"f": date_from, "t": date_to, **pp})).fetchall()
 
     distribution = {r[0]: r[1] for r in rows}
     total = sum(distribution.values())
@@ -340,24 +627,26 @@ async def _calc_tool_diversity(session, date_from: str, date_to: str) -> dict:
     return {"entropy": round(entropy, 3), "max_entropy": max_entropy, "distribution": distribution}
 
 
-async def _calc_self_evolution(session, date_from: str, date_to: str) -> dict:
+async def _calc_self_evolution(session, date_from: str, date_to: str, pid: int | None = None) -> dict:
+    pf, pp = _pid_filter("self_model_snapshots", pid)
     rows = (await session.execute(text(
         "SELECT changed_key, COUNT(*) as cnt FROM self_model_snapshots "
-        "WHERE created_at BETWEEN :f AND :t "
+        f"WHERE created_at BETWEEN :f AND :t{pf} "
         "GROUP BY changed_key"
-    ), {"f": date_from, "t": date_to})).fetchall()
+    ), {"f": date_from, "t": date_to, **pp})).fetchall()
 
     changes_by_key = {(r[0] or "unknown"): r[1] for r in rows}
     total = sum(changes_by_key.values())
     return {"total_changes": total, "unique_keys": len(changes_by_key), "changes_by_key": changes_by_key}
 
 
-async def _calc_error_recovery(session, date_from: str, date_to: str) -> dict:
+async def _calc_error_recovery(session, date_from: str, date_to: str, pid: int | None = None) -> dict:
+    pf, pp = _pid_filter("tool_actions", pid)
     rows = (await session.execute(text(
         "SELECT tool_name, status FROM tool_actions "
-        "WHERE created_at BETWEEN :f AND :t "
+        f"WHERE created_at BETWEEN :f AND :t{pf} "
         "ORDER BY created_at"
-    ), {"f": date_from, "t": date_to})).fetchall()
+    ), {"f": date_from, "t": date_to, **pp})).fetchall()
 
     total_errors = 0
     recovered = 0
@@ -374,26 +663,28 @@ async def _calc_error_recovery(session, date_from: str, date_to: str) -> dict:
     return {"total_errors": total_errors, "recovered": recovered, "recovery_rate": recovery_rate}
 
 
-async def _calc_metacognition(session, date_from: str, date_to: str) -> dict:
+async def _calc_metacognition(session, date_from: str, date_to: str, pid: int | None = None) -> dict:
+    pf, pp = _pid_filter("tool_actions", pid)
     row = (await session.execute(text(
         "SELECT COUNT(*) as total, "
         "SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as success "
         "FROM tool_actions "
-        "WHERE expected_result IS NOT NULL AND created_at BETWEEN :f AND :t"
-    ), {"f": date_from, "t": date_to})).fetchone()
+        f"WHERE expected_result IS NOT NULL AND created_at BETWEEN :f AND :t{pf}"
+    ), {"f": date_from, "t": date_to, **pp})).fetchone()
 
     total = row[0] or 0
     success = row[1] or 0
     return {"predictions_made": total, "success_rate": round(success / total, 3) if total > 0 else 0.0}
 
 
-async def _calc_memory_utilization(session, date_from: str, date_to: str) -> dict:
+async def _calc_memory_utilization(session, date_from: str, date_to: str, pid: int | None = None) -> dict:
+    pf, pp = _pid_filter("tool_actions", pid)
     rows = (await session.execute(text(
         "SELECT tool_name, COUNT(*) as cnt FROM tool_actions "
         "WHERE tool_name IN ('search_memories', 'write_diary', 'search_action_log') "
-        "AND created_at BETWEEN :f AND :t "
+        f"AND created_at BETWEEN :f AND :t{pf} "
         "GROUP BY tool_name"
-    ), {"f": date_from, "t": date_to})).fetchall()
+    ), {"f": date_from, "t": date_to, **pp})).fetchall()
 
     counts = {r[0]: r[1] for r in rows}
     return {
@@ -403,15 +694,16 @@ async def _calc_memory_utilization(session, date_from: str, date_to: str) -> dic
     }
 
 
-async def _calc_principle_accumulation(session, date_from: str, date_to: str) -> dict:
+async def _calc_principle_accumulation(session, date_from: str, date_to: str, pid: int | None = None) -> dict:
+    pf, pp = _pid_filter("self_model_snapshots", pid)
     row = (await session.execute(text(
         "SELECT COUNT(*) FROM self_model_snapshots "
-        "WHERE changed_key = 'principles' AND created_at BETWEEN :f AND :t"
-    ), {"f": date_from, "t": date_to})).fetchone()
+        f"WHERE changed_key = 'principles' AND created_at BETWEEN :f AND :t{pf}"
+    ), {"f": date_from, "t": date_to, **pp})).fetchone()
 
     distillation_count = row[0] if row else 0
 
-    # 現在のself_model.jsonから原則数を取得
+    # 現在のself_model.jsonから原則数を取得（ペルソナ対応: _load_self_modelが動的パス解決）
     from app.tools.builtin import _load_self_model
     model = _load_self_model()
     principles = model.get("principles", [])
@@ -420,24 +712,26 @@ async def _calc_principle_accumulation(session, date_from: str, date_to: str) ->
     return {"distillation_count": distillation_count, "current_principles": current}
 
 
-async def _calc_intent_diversity(session, date_from: str, date_to: str) -> dict:
+async def _calc_intent_diversity(session, date_from: str, date_to: str, pid: int | None = None) -> dict:
     """intent使用率 + ユニーク意図数"""
+    pf, pp = _pid_filter("tool_actions", pid)
+    params = {"f": date_from, "t": date_to, **pp}
+
     row = (await session.execute(text(
         "SELECT COUNT(*) as total, "
         "SUM(CASE WHEN intent IS NOT NULL AND intent != '' THEN 1 ELSE 0 END) as with_intent "
         "FROM tool_actions "
-        "WHERE created_at BETWEEN :f AND :t"
-    ), {"f": date_from, "t": date_to})).fetchone()
+        f"WHERE created_at BETWEEN :f AND :t{pf}"
+    ), params)).fetchone()
 
     total = row[0] or 0
     with_intent = row[1] or 0
     usage_rate = round(with_intent / total, 3) if total > 0 else 0.0
 
-    # ユニーク意図数
     unique_row = (await session.execute(text(
         "SELECT COUNT(DISTINCT intent) FROM tool_actions "
-        "WHERE intent IS NOT NULL AND intent != '' AND created_at BETWEEN :f AND :t"
-    ), {"f": date_from, "t": date_to})).fetchone()
+        f"WHERE intent IS NOT NULL AND intent != '' AND created_at BETWEEN :f AND :t{pf}"
+    ), params)).fetchone()
     unique_intents = unique_row[0] if unique_row else 0
 
     return {
@@ -448,15 +742,15 @@ async def _calc_intent_diversity(session, date_from: str, date_to: str) -> dict:
     }
 
 
-async def _calc_tool_entropy_timeseries(session, date_from: str, date_to: str) -> dict:
+async def _calc_tool_entropy_timeseries(session, date_from: str, date_to: str, pid: int | None = None) -> dict:
     """日別ツールエントロピー（行動多様性の推移）"""
+    pf, pp = _pid_filter("tool_actions", pid)
     rows = (await session.execute(text(
         "SELECT DATE(created_at) as day, tool_name, COUNT(*) as cnt "
-        "FROM tool_actions WHERE created_at BETWEEN :f AND :t "
+        f"FROM tool_actions WHERE created_at BETWEEN :f AND :t{pf} "
         "GROUP BY day, tool_name ORDER BY day"
-    ), {"f": date_from, "t": date_to})).fetchall()
+    ), {"f": date_from, "t": date_to, **pp})).fetchall()
 
-    # 日別に集計
     from collections import defaultdict
     daily: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for day, tool, cnt in rows:
@@ -476,17 +770,18 @@ async def _calc_tool_entropy_timeseries(session, date_from: str, date_to: str) -
     return {"days": days}
 
 
-async def _calc_prediction_accuracy_timeseries(session, date_from: str, date_to: str) -> dict:
+async def _calc_prediction_accuracy_timeseries(session, date_from: str, date_to: str, pid: int | None = None) -> dict:
     """日別予測精度推移"""
+    pf, pp = _pid_filter("tool_actions", pid)
     rows = (await session.execute(text(
         "SELECT DATE(created_at) as day, "
         "COUNT(*) as total, "
         "SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as hits "
         "FROM tool_actions "
         "WHERE expected_result IS NOT NULL AND expected_result != '' "
-        "AND created_at BETWEEN :f AND :t "
+        f"AND created_at BETWEEN :f AND :t{pf} "
         "GROUP BY day ORDER BY day"
-    ), {"f": date_from, "t": date_to})).fetchall()
+    ), {"f": date_from, "t": date_to, **pp})).fetchall()
 
     days = []
     for day, total, hits in rows:
@@ -496,19 +791,19 @@ async def _calc_prediction_accuracy_timeseries(session, date_from: str, date_to:
     return {"days": days}
 
 
-async def _calc_energy_efficiency(session, date_from: str, date_to: str) -> dict:
+async def _calc_energy_efficiency(session, date_from: str, date_to: str, pid: int | None = None) -> dict:
     """エネルギー効率: セッションごとのユニークツールパターン率"""
+    pf, pp = _pid_filter("tool_actions", pid)
     rows = (await session.execute(text(
         "SELECT conversation_id, tool_name "
         "FROM tool_actions "
-        "WHERE created_at BETWEEN :f AND :t AND conversation_id IS NOT NULL "
+        f"WHERE created_at BETWEEN :f AND :t AND conversation_id IS NOT NULL{pf} "
         "ORDER BY conversation_id, created_at"
-    ), {"f": date_from, "t": date_to})).fetchall()
+    ), {"f": date_from, "t": date_to, **pp})).fetchall()
 
     if not rows:
         return {"avg_efficiency": 0.0, "session_count": 0, "sessions": []}
 
-    # セッション別にツール列を集める
     from collections import defaultdict
     sessions: dict[int, list[str]] = defaultdict(list)
     for conv_id, tool in rows:
@@ -527,14 +822,15 @@ async def _calc_energy_efficiency(session, date_from: str, date_to: str) -> dict
     return {"avg_efficiency": avg, "session_count": len(efficiencies), "sessions": efficiencies[-20:]}
 
 
-async def _calc_self_model_velocity(session, date_from: str, date_to: str) -> dict:
+async def _calc_self_model_velocity(session, date_from: str, date_to: str, pid: int | None = None) -> dict:
     """自己モデル変化速度（日別スナップショット数）"""
+    pf, pp = _pid_filter("self_model_snapshots", pid)
     rows = (await session.execute(text(
         "SELECT DATE(created_at) as day, COUNT(*) as cnt "
         "FROM self_model_snapshots "
-        "WHERE created_at BETWEEN :f AND :t "
+        f"WHERE created_at BETWEEN :f AND :t{pf} "
         "GROUP BY day ORDER BY day"
-    ), {"f": date_from, "t": date_to})).fetchall()
+    ), {"f": date_from, "t": date_to, **pp})).fetchall()
 
     days = [{"date": str(day), "count": cnt} for day, cnt in rows]
     total = sum(d["count"] for d in days)
@@ -543,22 +839,22 @@ async def _calc_self_model_velocity(session, date_from: str, date_to: str) -> di
     return {"days": days, "total": total, "avg_per_day": avg_per_day}
 
 
-async def _calc_session_length_trend(session, date_from: str, date_to: str) -> dict:
+async def _calc_session_length_trend(session, date_from: str, date_to: str, pid: int | None = None) -> dict:
     """セッション長推移（自律セッションごとのツール実行数）"""
+    pf, pp = _pid_filter("c", pid)
     rows = (await session.execute(text(
         "SELECT c.id, DATE(c.started_at) as day, COUNT(t.id) as action_count "
         "FROM conversations c "
         "LEFT JOIN tool_actions t ON t.conversation_id = c.id "
         "WHERE c.source = 'autonomous' AND c.is_imported = 0 "
-        "AND c.started_at BETWEEN :f AND :t "
+        f"AND c.started_at BETWEEN :f AND :t{pf} "
         "GROUP BY c.id "
         "ORDER BY c.started_at"
-    ), {"f": date_from, "t": date_to})).fetchall()
+    ), {"f": date_from, "t": date_to, **pp})).fetchall()
 
     if not rows:
         return {"days": [], "avg_length": 0.0}
 
-    # 日別平均
     from collections import defaultdict
     daily: dict[str, list[int]] = defaultdict(list)
     for _, day, cnt in rows:

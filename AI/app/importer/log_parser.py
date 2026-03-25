@@ -9,7 +9,7 @@ LOG_DIR = BASE_DIR / "過去ログ"
 logger = logging.getLogger("iku.importer")
 
 
-def parse_log_file(filepath: Path) -> list[dict]:
+def parse_txt_file(filepath: Path) -> list[dict]:
     """1ファイルをパースしてメッセージ列を返す。
     空行2つ以上で区切り、交互にuser/assistantと判定。
     """
@@ -30,6 +30,10 @@ def parse_log_file(filepath: Path) -> list[dict]:
     return messages
 
 
+# 後方互換
+parse_log_file = parse_txt_file
+
+
 def get_log_files() -> list[Path]:
     """過去ログファイルを番号順で返す"""
     if not LOG_DIR.exists():
@@ -41,8 +45,34 @@ def get_log_files() -> list[Path]:
     return sorted(files, key=sort_key)
 
 
+async def import_episodes(session_factory, persona_id: int, files: list[Path]) -> dict:
+    """ファイルリストからペルソナエピソードをインポート"""
+    from app.memory.store import add_persona_episode
+    total = 0
+
+    for filepath in files:
+        logger.info(f"エピソードインポート中: {filepath.name}")
+        if filepath.suffix.lower() == ".txt":
+            messages = parse_txt_file(filepath)
+        else:
+            logger.warning(f"未対応の形式: {filepath.suffix}")
+            continue
+
+        if not messages:
+            continue
+
+        async with session_factory() as session:
+            for seq, msg in enumerate(messages):
+                await add_persona_episode(session, persona_id, filepath.name, msg["role"], msg["content"], seq)
+                total += 1
+            await session.commit()
+
+    logger.info(f"エピソードインポート完了: {total}件 (persona_id={persona_id})")
+    return {"status": "ok", "count": total}
+
+
 async def import_iku_logs(session_factory):
-    """過去ログをiku_logsテーブルにインポート"""
+    """過去ログをiku_logsテーブルにインポート（後方互換ラッパー）"""
     from app.memory.store import add_iku_log, count_iku_logs
 
     # 既にインポート済みかチェック
@@ -57,11 +87,10 @@ async def import_iku_logs(session_factory):
 
     for filepath in files:
         logger.info(f"インポート中: {filepath.name}")
-        messages = parse_log_file(filepath)
+        messages = parse_txt_file(filepath)
         if not messages:
             continue
 
-        # ファイルごとに独立セッション
         async with session_factory() as session:
             for seq, msg in enumerate(messages):
                 await add_iku_log(session, filepath.name, msg["role"], msg["content"], seq)
