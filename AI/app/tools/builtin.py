@@ -191,6 +191,43 @@ async def search_memories(query: str = "") -> str:
             if content:
                 lines.append(f"- [{date}] {content}")
 
+    # ベクトル類似度検索（FTS5とは別経路で追加）
+    try:
+        from config import VECTOR_SEARCH_ENABLED
+        if VECTOR_SEARCH_ENABLED:
+            from app.memory.vector_store import search_similar, fetch_content_for_results
+            tables = ["messages", "memory_summaries"]
+            if get_mode() == "iku":
+                tables.append("iku_logs")
+            similar = await search_similar(query, tables, limit=3)
+            if similar:
+                # FTS5結果と重複するsource_idを除外
+                fts_ids = set()
+                for m in chat_results:
+                    fts_ids.add(("messages", m.get("id")))
+                for m in diary_results:
+                    fts_ids.add(("memory_summaries", m.get("id")))
+                for m in log_results:
+                    fts_ids.add(("iku_logs", m.get("id")))
+
+                unique_similar = [s for s in similar
+                                  if (s["source_table"], s["source_id"]) not in fts_ids
+                                  and s["similarity"] > 0.5]
+                if unique_similar:
+                    enriched = await fetch_content_for_results(unique_similar)
+                    if enriched:
+                        lines.append("【意味的に近い記憶】")
+                        for e in enriched:
+                            content = _clean_memory_content(e.get("content", ""))[:200]
+                            if content:
+                                sim = f"({e['similarity']:.2f})"
+                                role_prefix = ""
+                                if e.get("role"):
+                                    role_prefix = ("ユーザー" if e["role"] == "user" else "イク") + ": "
+                                lines.append(f"- {role_prefix}{content} {sim}")
+    except Exception:
+        pass  # ベクトル検索失敗時はFTS5結果のみ
+
     if not lines:
         return f"「{query}」に関する記憶は見つかりませんでした。"
 
@@ -416,6 +453,13 @@ async def write_diary(content: str = "", keywords: str = "") -> str:
             "INSERT INTO memory_summaries_fts(rowid, content, keywords) VALUES (:id, :content, :keywords)"
         ), {"id": entry.id, "content": content, "keywords": kw})
         await session.commit()
+        # ベクトル埋め込み（fire-and-forget）
+        try:
+            import asyncio as _aio
+            from app.memory.vector_store import store_embedding
+            _aio.create_task(store_embedding("memory_summaries", entry.id, content))
+        except Exception:
+            pass
 
     return f"日記を保存しました。（{datetime.now().strftime('%Y-%m-%d %H:%M')}）"
 
@@ -670,6 +714,9 @@ async def _record_snapshot(content_json: str, changed_key: str):
 
 async def read_self_model() -> str:
     """現在の自己モデルを読む"""
+    from app.scheduler.autonomous import scheduler
+    if not scheduler.ablation_self_model:
+        return "自己モデルは未定義です。"
     model = _load_self_model()
     if not model:
         return "自己モデルは未定義です。"
@@ -682,6 +729,9 @@ async def read_self_model() -> str:
 
 async def update_self_model(key: str = "", value: str = "", text: str = "") -> str:
     """自己モデルを更新する。key+valueでキーバリュー更新、textで自由テキスト更新"""
+    from app.scheduler.autonomous import scheduler
+    if not scheduler.ablation_self_model:
+        return "自己モデルは現在無効です。"
     model = _load_self_model()
 
     def _emit_signal():
@@ -764,6 +814,14 @@ async def get_system_metrics() -> str:
 
     is_speaking = scheduler._is_speaking
 
+    # エネルギー内訳
+    breakdown = scheduler._energy_breakdown
+    if breakdown:
+        bd_parts = [f"{t}={v:.1f}" for t, v in sorted(breakdown.items(), key=lambda x: -x[1])]
+        bd_text = ", ".join(bd_parts)
+    else:
+        bd_text = "(empty)"
+
     lines = [
         f"process_pid: {proc.pid}",
         f"process_memory_mb: {proc_mem.rss // (1024**2)}",
@@ -773,6 +831,7 @@ async def get_system_metrics() -> str:
         f"self_model_size_kb: {sm_size_kb:.1f}",
         f"motivation_energy: {energy:.1f}",
         f"motivation_threshold: {threshold}",
+        f"energy_breakdown: {bd_text}",
         f"signal_buffer_size: {signal_count}",
         f"recent_signals: {sig_summary}" if sig_summary else "recent_signals: (empty)",
         f"is_speaking: {is_speaking}",

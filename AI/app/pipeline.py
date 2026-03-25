@@ -297,6 +297,14 @@ class Pipeline:
                     expected = tool_args.pop("expect", None)
                     if expected is not None and expected.strip().lower() in ("skip", "", "-", "なし", "none"):
                         expected = None
+                    intent = tool_args.pop("intent", None)
+                    if intent is not None and intent.strip().lower() in ("", "-", "なし", "none"):
+                        intent = None
+                    # Ablation: 予測無効時はexpect/intentを強制クリア
+                    from app.scheduler.autonomous import scheduler as _sched
+                    if not _sched.ablation_prediction:
+                        expected = None
+                        intent = None
 
                     # 重複検出
                     call_key = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
@@ -365,10 +373,13 @@ class Pipeline:
                             "args": args_str, "status": action_status,
                         }))
 
+                    parts = []
+                    if intent:
+                        parts.append(f"あなたの意図: {intent}")
                     if expected:
-                        all_results.append(f"[ツール結果: {tool_name}]\nあなたの予測: {expected}\n実際の結果: {result}")
-                    else:
-                        all_results.append(f"[ツール結果: {tool_name}]\n{result}")
+                        parts.append(f"あなたの予測: {expected}")
+                    parts.append(f"実際の結果: {result}" if (intent or expected) else result)
+                    all_results.append(f"[ツール結果: {tool_name}]\n" + "\n".join(parts))
 
                     # DB記録
                     async with async_session() as session:
@@ -376,6 +387,7 @@ class Pipeline:
                             session, conv_id, tool_name, tool_args,
                             result, action_status, exec_ms,
                             expected_result=expected,
+                            intent=intent,
                         )
                         await session.commit()
 
@@ -385,6 +397,7 @@ class Pipeline:
                         "args_summary": args_str[:80],
                         "result_summary": self._summarize_result(tool_name, result, action_status),
                         "expected": expected,
+                        "intent": intent,
                     })
 
                 # ツール未実行検出
@@ -621,6 +634,14 @@ class Pipeline:
         expected = tool_args.pop("expect", None)
         if expected is not None and expected.strip().lower() in ("skip", "", "-", "なし", "none"):
             expected = None
+        intent = tool_args.pop("intent", None)
+        if intent is not None and intent.strip().lower() in ("", "-", "なし", "none"):
+            intent = None
+        # Ablation: 予測無効時はexpect/intentを強制クリア
+        from app.scheduler.autonomous import scheduler as _sched
+        if not _sched.ablation_prediction:
+            expected = None
+            intent = None
 
         # 重複検出
         call_key = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
@@ -688,10 +709,13 @@ class Pipeline:
                 "args": args_str, "status": action_status,
             }))
 
+        parts = []
+        if intent:
+            parts.append(f"あなたの意図: {intent}")
         if expected:
-            result_text = f"[ツール結果: {tool_name}]\nあなたの予測: {expected}\n実際の結果: {result}"
-        else:
-            result_text = f"[ツール結果: {tool_name}]\n{result}"
+            parts.append(f"あなたの予測: {expected}")
+        parts.append(f"実際の結果: {result}" if (intent or expected) else result)
+        result_text = f"[ツール結果: {tool_name}]\n" + "\n".join(parts)
 
         # DB記録
         async with async_session() as session:
@@ -699,6 +723,7 @@ class Pipeline:
                 session, conv_id, tool_name, tool_args,
                 result, action_status, exec_ms,
                 expected_result=expected,
+                intent=intent,
             )
             await session.commit()
 
@@ -708,6 +733,7 @@ class Pipeline:
             "args_summary": args_str[:80],
             "result_summary": self._summarize_result(tool_name, result, action_status),
             "expected": expected,
+            "intent": intent,
         })
 
         return result_text, action_status, had_output
@@ -771,7 +797,7 @@ class Pipeline:
 
 【書式】
   [TOOL:{tool_name} 引数A=値A 引数B=値B]
-  [TOOL:{tool_name} 引数A=値A expect=予測される結果]
+  [TOOL:{tool_name} 引数A=値A intent=この操作の目的 expect=予測される結果]
 ブロック書式:
   [TOOL:{tool_name}]
   複数行の内容
@@ -1066,7 +1092,8 @@ class Pipeline:
 
     def _build_system_base(self) -> str:
         """ペルソナ + 自己モデルのテキスト構築"""
-        self_model = _load_self_model()
+        from app.scheduler.autonomous import scheduler
+        self_model = _load_self_model() if scheduler.ablation_self_model else {}
         sm_text = ""
         if self_model:
             sm_lines = []

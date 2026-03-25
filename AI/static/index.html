@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>イク — neo-iku</title>
-    <link rel="stylesheet" href="/static/style.css?v=37">
+    <link rel="stylesheet" href="/static/style.css?v=40">
 </head>
 <body>
     <!-- ステータスバー -->
@@ -81,6 +81,7 @@
                             <button id="dev-trigger-btn" class="dev-btn trigger">今すぐ自律行動</button>
                             <button id="dev-reset-btn" class="dev-btn danger">DBリセット（過去ログ以外）</button>
                             <button id="dev-clear-selfmodel-btn" class="dev-btn danger">自己モデルクリア</button>
+                            <button id="dev-vector-reindex-btn" class="dev-btn">ベクトル再構築</button>
                         </div>
                     </div>
 
@@ -143,8 +144,38 @@
                 <div class="report-empty">「読み込む」を押すと蒸留ログが表示されます</div>
             </div>
         </details>
+
+        <!-- Ablation実験 -->
+        <details class="distillation-section">
+            <summary class="distillation-summary">Ablation実験</summary>
+            <div class="ablation-controls">
+                <p class="ablation-desc">各サブシステムのON/OFFを切り替えて比較実験を行う。OFFにすると該当機能が無効化される。</p>
+                <div class="ablation-grid">
+                    <label class="ablation-toggle">
+                        <input id="abl-energy" type="checkbox" checked>
+                        <span class="ablation-name">エネルギーシステム</span>
+                        <span class="ablation-detail">OFF: 固定インターバルで発火（蓄積/閾値/消費を無効化）</span>
+                    </label>
+                    <label class="ablation-toggle">
+                        <input id="abl-self-model" type="checkbox" checked>
+                        <span class="ablation-name">自己モデル</span>
+                        <span class="ablation-detail">OFF: read/update_self_modelが常に空を返す</span>
+                    </label>
+                    <label class="ablation-toggle">
+                        <input id="abl-prediction" type="checkbox" checked>
+                        <span class="ablation-name">予測-検証</span>
+                        <span class="ablation-detail">OFF: expect=引数を無視（予測誤差ループ無効）</span>
+                    </label>
+                    <label class="ablation-toggle">
+                        <input id="abl-distillation" type="checkbox" checked>
+                        <span class="ablation-name">蒸留</span>
+                        <span class="ablation-detail">OFF: 振り返り・原則蒸留を無効化</span>
+                    </label>
+                </div>
+            </div>
+        </details>
     </div>
 
-    <script src="/static/app.js?v=38"></script>
+    <script src="/static/app.js?v=41"></script>
 </body>
 </html>

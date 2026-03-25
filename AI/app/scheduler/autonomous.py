@@ -14,6 +14,8 @@ from config import (
     MOTIVATION_DEFAULT_ACTION_COSTS, MOTIVATION_DEFAULT_ACTION_COST_FALLBACK,
     ENV_STIMULUS_ENABLED, ENV_STIMULUS_PROBABILITY,
     DATA_DIR,
+    ABLATION_ENERGY_SYSTEM, ABLATION_SELF_MODEL,
+    ABLATION_PREDICTION, ABLATION_DISTILLATION,
 )
 import math
 
@@ -39,6 +41,13 @@ class AutonomousScheduler:
         self._last_conv_id: int | None = None  # セッション継続用
         self._last_trigger: str = "timer"  # "timer" / "energy" / "manual"
         self._pending_messages: list[dict] = []  # ユーザー入力キュー
+        self._energy_breakdown: dict[str, float] = {}  # シグナル種別ごとのエネルギー貢献度
+
+        # Ablationフラグ（ランタイムで切替可能）
+        self.ablation_energy = ABLATION_ENERGY_SYSTEM
+        self.ablation_self_model = ABLATION_SELF_MODEL
+        self.ablation_prediction = ABLATION_PREDICTION
+        self.ablation_distillation = ABLATION_DISTILLATION
 
     # --- シグナル ---
 
@@ -58,6 +67,8 @@ class AutonomousScheduler:
 
     def consume_energy(self, tool_name: str):
         """ツール実行によるエネルギー消費"""
+        if not self.ablation_energy:
+            return
         from app.tools.builtin import _load_self_model
         self_model = _load_self_model()
         rules = self_model.get("motivation_rules")
@@ -83,6 +94,7 @@ class AutonomousScheduler:
                     "type": "motivation_energy",
                     "energy": round(self._motivation_energy, 1),
                     "threshold": threshold,
+                    "breakdown": {k: round(v, 1) for k, v in self._energy_breakdown.items()},
                 })))
             except RuntimeError:
                 pass
@@ -110,6 +122,12 @@ class AutonomousScheduler:
             return
         self._is_checking = True
         try:
+            # エネルギーシステム無効時: シグナルをクリアするだけ（タイマーのみで発火）
+            if not self.ablation_energy:
+                self._signal_buffer.clear()
+                self._motivation_energy = 0.0
+                return
+
             from app.tools.builtin import _load_self_model
             self_model = _load_self_model()
             rules = self_model.get("motivation_rules")
@@ -130,6 +148,8 @@ class AutonomousScheduler:
                 weight = weights.get(sig["type"], 0)
                 if isinstance(weight, (int, float)):
                     self._motivation_energy += weight
+                    if weight > 0:
+                        self._energy_breakdown[sig["type"]] = self._energy_breakdown.get(sig["type"], 0) + weight
 
             self._motivation_energy = max(0, self._motivation_energy - decay)
 
@@ -146,6 +166,7 @@ class AutonomousScheduler:
                 "type": "motivation_energy",
                 "energy": round(self._motivation_energy, 1),
                 "threshold": threshold,
+                "breakdown": {k: round(v, 1) for k, v in self._energy_breakdown.items()},
             }))
 
             # 発火判定: 行動中でなく、閾値を超えた場合のみ
@@ -232,6 +253,7 @@ class AutonomousScheduler:
 
             try:
                 self._is_speaking = True
+                self._energy_breakdown = {}
                 await self._speak(trigger=trigger)
             except Exception as e:
                 import traceback
@@ -344,6 +366,9 @@ class AutonomousScheduler:
 
     async def _reflect(self, selected_action: dict | None, result, self_model: dict, action_goal: str = "", selected_strategy: str | None = None):
         """行動後の振り返り: 特性抽出 + 予測誤差シグナル"""
+        if not self.ablation_distillation:
+            logger.debug("蒸留無効（ablation）: 振り返りスキップ")
+            return
         try:
             if not result.step_history:
                 return
@@ -358,20 +383,36 @@ class AutonomousScheduler:
                     return
 
             result_lines = []
-            prediction_lines = []
+            metacog_lines = []
             for s in result.step_history:
                 result_lines.append(f"{s['tool']}: {s['result_summary']}")
-                if s.get('expected'):
-                    prediction_lines.append(
-                        f"{s['tool']}: 予測「{s['expected']}」→ 結果「{s['result_summary']}」"
-                    )
+                intent = s.get('intent')
+                expected = s.get('expected')
+                result_summary = s.get('result_summary', '')
+                if intent or expected:
+                    parts = []
+                    if intent: parts.append(f"意図「{intent}」")
+                    if expected: parts.append(f"予測「{expected}」")
+                    parts.append(f"結果「{result_summary}」")
+                    line = f"{s['tool']}: " + " → ".join(parts)
+                    # ペアワイズ比較（2要素以上ある場合のみ）
+                    pairs = []
+                    if intent and expected:
+                        pairs.append(f"  [意図→予測] 意図「{intent}」に対し予測「{expected}」")
+                    if intent and result_summary:
+                        pairs.append(f"  [意図→結果] 意図「{intent}」に対し結果「{result_summary}」")
+                    if expected and result_summary:
+                        pairs.append(f"  [予測→結果] 予測「{expected}」に対し結果「{result_summary}」")
+                    if pairs:
+                        line += "\n" + "\n".join(pairs)
+                    metacog_lines.append(line)
             tool_results_text = "\n".join(result_lines)
             if result.last_full_result:
                 tool_results_text += f"\n\n最後の結果:\n{result.last_full_result[:500]}"
             if not tool_results_text:
                 return
 
-            prediction_text = "\n".join(prediction_lines) if prediction_lines else ""
+            prediction_text = "\n".join(metacog_lines) if metacog_lines else ""
 
             # ツール実行エラーがあった場合のシグナル
             has_error = any(
@@ -403,6 +444,13 @@ class AutonomousScheduler:
             if principle:
                 self._save_principle(principle, self_model)
                 logger.info(f"特性抽出: {principle}")
+
+                # 二次蒸留: principlesが閾値に達したら統合
+                from app.tools.builtin import _load_self_model
+                fresh_model = _load_self_model()
+                principles = fresh_model.get("principles", [])
+                if isinstance(principles, list) and len(principles) >= 10:
+                    await self._consolidate_principles(fresh_model)
         except Exception as e:
             logger.error(f"振り返りフォールバック: {e}")
 
@@ -502,7 +550,7 @@ class AutonomousScheduler:
 
         prediction_section = ""
         if prediction_text:
-            prediction_section = f"\n予測との比較:\n{prediction_text}\n"
+            prediction_section = f"\n意図-予測-結果:\n{prediction_text}\n"
 
         drive_line = f"\n動機: {drive}" if drive else ""
         strategy_line = f"\n戦略: {strategy}" if strategy else ""
@@ -517,7 +565,7 @@ class AutonomousScheduler:
 {prediction_section}{principles_ctx}
 【手順】
 1. 行動の選択パターンを特定する（何を選び、何を選ばなかったか）
-2. 結果への反応パターンを特定する（成功/失敗にどう対処したか）
+2. 意図-予測-結果のペア関係を分析する（乖離・一致・傾向）
 3. 上記から推測できる行動主体の特性を1文で述べる
 
 【条件】
@@ -559,6 +607,71 @@ class AutonomousScheduler:
             principles = principles[-20:]
         fresh_model["principles"] = principles
         _save_self_model(fresh_model, changed_key="principles")
+
+    async def _consolidate_principles(self, self_model: dict):
+        """二次蒸留: 蓄積されたprinciplesを統合・圧縮する"""
+        from app.tools.builtin import _load_self_model, _save_self_model
+        principles = self_model.get("principles", [])
+        if not isinstance(principles, list) or len(principles) < 10:
+            return
+
+        p_texts = []
+        for p in principles:
+            text = p["text"] if isinstance(p, dict) and "text" in p else str(p)
+            created = p.get("created", "") if isinstance(p, dict) else ""
+            p_texts.append(f"- {text}" + (f" ({created[:10]})" if created else ""))
+
+        prompt = f"""以下は行動観察から抽出された特性のリストである。
+
+【特性一覧】（{len(principles)}件、古い順）
+{chr(10).join(p_texts)}
+
+【手順】
+1. 類似・重複する特性を統合する（複数→1つに圧縮）
+2. 矛盾するペアを特定する（「Aする傾向」vs「Aしない傾向」→ 変化として記述）
+3. 時系列の変化を特定する（初期→現在で変わったもの）
+4. 統合結果を出力する
+
+【条件】
+- 統合後は5件以内に圧縮する
+- 各特性は1文
+- 根拠の薄い特性（1回の観測のみ）は除外してよい
+- 矛盾は「初期はAだったが現在はB」の形式で残す
+
+形式:
+統合1: [特性]
+統合2: [特性]
+..."""
+
+        try:
+            from app.llm.manager import llm_manager
+            llm = llm_manager.get()
+            response = await llm.chat([
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": "上のリストを統合してください。"},
+            ])
+            if not response:
+                return
+
+            import re
+            clean = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
+            matches = re.findall(r"統合\d+:\s*(.+)", clean)
+            if not matches or len(matches) < 1:
+                logger.warning(f"二次蒸留: パース失敗")
+                return
+
+            # 統合結果でprinciplesを置換
+            fresh_model = _load_self_model()
+            new_principles = [
+                {"text": m.strip(), "created": datetime.now().isoformat(), "consolidated": True}
+                for m in matches
+            ]
+            fresh_model["principles"] = new_principles
+            _save_self_model(fresh_model, changed_key="principles")
+            logger.info(f"二次蒸留: {len(principles)}件 → {len(new_principles)}件に統合")
+
+        except Exception as e:
+            logger.error(f"二次蒸留エラー: {e}")
 
     # --- Phase 3: 戦略選択 ---
 

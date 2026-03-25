@@ -196,6 +196,22 @@ class LMStudioProvider(BaseLLMProvider):
             logger.error(f"モデル一覧取得エラー: {e}")
             return []
 
+    async def embed(self, texts: list[str]) -> list[list[float]] | None:
+        """LM Studio の /v1/embeddings エンドポイントでベクトル取得"""
+        try:
+            await self._resolve_model()
+            resp = await self.client.post(
+                f"{self.base_url}/embeddings",
+                json={"model": self.model, "input": texts},
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return [item["embedding"] for item in data["data"]]
+        except Exception as e:
+            logger.debug(f"Embedding取得失敗（LM Studioにembeddingモデルが未ロードの可能性）: {e}")
+            return None
+
     async def is_available(self) -> bool:
         try:
             resp = await self.client.get(f"{self.base_url}/models", timeout=5.0)

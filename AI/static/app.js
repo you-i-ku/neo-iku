@@ -201,7 +201,7 @@ function connect() {
                 break;
 
             case "motivation_energy":
-                updateMotivationEnergy(data.energy, data.threshold);
+                updateMotivationEnergy(data.energy, data.threshold, data.breakdown);
                 break;
 
             case "user_interrupt_ack":
@@ -1004,7 +1004,7 @@ function finalizeExecTerminal(data) {
 
 const statusEnergy = document.getElementById("status-energy");
 
-function updateMotivationEnergy(energy, threshold) {
+function updateMotivationEnergy(energy, threshold, breakdown) {
     const pct = threshold > 0 ? Math.min(100, Math.round(energy / threshold * 100)) : 0;
     statusEnergy.textContent = `⚡ ${energy}/${threshold}`;
     // 色で強度を表現
@@ -1014,6 +1014,15 @@ function updateMotivationEnergy(energy, threshold) {
         statusEnergy.style.color = "#d29922";
     } else {
         statusEnergy.style.color = "#8b5cf6";
+    }
+    // breakdown tooltip
+    if (breakdown && Object.keys(breakdown).length > 0) {
+        const lines = Object.entries(breakdown)
+            .sort((a, b) => b[1] - a[1])
+            .map(([t, v]) => `${t}: ${v}`);
+        statusEnergy.title = `エネルギー内訳\n${lines.join("\n")}`;
+    } else {
+        statusEnergy.title = "内発的動機エネルギー";
     }
 }
 
@@ -1073,11 +1082,43 @@ async function loadDevSettings() {
         }
         if (data.motivation_energy !== undefined) {
             statusEnergy.textContent = `⚡ ${data.motivation_energy}`;
+            if (data.energy_breakdown && Object.keys(data.energy_breakdown).length > 0) {
+                const lines = Object.entries(data.energy_breakdown)
+                    .sort((a, b) => b[1] - a[1])
+                    .map(([t, v]) => `${t}: ${v}`);
+                statusEnergy.title = `エネルギー内訳\n${lines.join("\n")}`;
+            }
+        }
+        // Ablationフラグ同期
+        if (data.ablation) {
+            const map = { energy: "abl-energy", self_model: "abl-self-model", prediction: "abl-prediction", distillation: "abl-distillation" };
+            for (const [key, id] of Object.entries(map)) {
+                const el = document.getElementById(id);
+                if (el) el.checked = !!data.ablation[key];
+            }
         }
     } catch (e) {
         console.error("開発設定取得エラー:", e);
     }
 }
+
+// --- Ablationトグル ---
+["energy", "self_model", "prediction", "distillation"].forEach(flag => {
+    const id = flag === "self_model" ? "abl-self-model" : `abl-${flag}`;
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener("change", async () => {
+        try {
+            await fetch("/api/dev/ablation", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ flag, enabled: el.checked }),
+            });
+        } catch (e) {
+            console.error(`ablation ${flag} 変更エラー:`, e);
+        }
+    });
+});
 
 devIntervalBtn.addEventListener("click", async () => {
     const sec = parseInt(devIntervalInput.value);
@@ -1139,6 +1180,27 @@ devClearSelfModelBtn.addEventListener("click", async () => {
         setTimeout(() => { devClearSelfModelBtn.textContent = "自己モデルクリア"; devClearSelfModelBtn.disabled = false; }, 2000);
     }
 });
+
+// --- ベクトル再構築 ---
+
+const devVectorReindexBtn = document.getElementById("dev-vector-reindex-btn");
+if (devVectorReindexBtn) {
+    devVectorReindexBtn.addEventListener("click", async () => {
+        if (!confirm("全メッセージ・日記のベクトルを再構築します。時間がかかる場合があります。")) return;
+        devVectorReindexBtn.disabled = true;
+        devVectorReindexBtn.textContent = "再構築中...";
+        try {
+            const resp = await fetch("/api/dev/vector-reindex", { method: "POST" });
+            const data = await resp.json();
+            const msg = data.counts ? `メッセージ:${data.counts.messages} 日記:${data.counts.memory_summaries}` : "完了";
+            devVectorReindexBtn.textContent = `✓ ${msg}`;
+            setTimeout(() => { devVectorReindexBtn.textContent = "ベクトル再構築"; devVectorReindexBtn.disabled = false; }, 4000);
+        } catch (e) {
+            devVectorReindexBtn.textContent = "エラー";
+            setTimeout(() => { devVectorReindexBtn.textContent = "ベクトル再構築"; devVectorReindexBtn.disabled = false; }, 2000);
+        }
+    });
+}
 
 // --- 自己モデル表示 ---
 
@@ -1286,8 +1348,71 @@ function renderReport(data) {
         <div class="report-stat-row"><span>現在の原則数</span><span>${pa.current_principles}</span></div>
     `);
 
+    // 8. Intent Diversity
+    if (m.intent_diversity) {
+        const id = m.intent_diversity;
+        const idPct = Math.round(id.usage_rate * 100);
+        html += renderMetricCard("意図宣言", `${idPct}%`, `
+            <div class="report-stat-row"><span>意図あり</span><span>${id.with_intent} / ${id.total_actions}</span></div>
+            <div class="report-stat-row"><span>ユニーク意図数</span><span>${id.unique_intents}</span></div>
+        `);
+    }
+
+    // 9. Tool Entropy Time-Series
+    if (m.tool_entropy_ts && m.tool_entropy_ts.days.length > 0) {
+        const te = m.tool_entropy_ts;
+        const lastE = te.days[te.days.length - 1].entropy;
+        html += renderMetricCard("エントロピー推移", `H=${lastE}`, renderSparkBars(te.days, "entropy", "#58a6ff"));
+    }
+
+    // 10. Prediction Accuracy Time-Series
+    if (m.prediction_accuracy_ts && m.prediction_accuracy_ts.days.length > 0) {
+        const pa2 = m.prediction_accuracy_ts;
+        const lastR = Math.round(pa2.days[pa2.days.length - 1].rate * 100);
+        html += renderMetricCard("予測精度推移", `${lastR}%`, renderSparkBars(pa2.days, "rate", "#3fb950"));
+    }
+
+    // 11. Energy Efficiency
+    if (m.energy_efficiency) {
+        const ee = m.energy_efficiency;
+        const eePct = Math.round(ee.avg_efficiency * 100);
+        const eeColor = eePct >= 60 ? "#3fb950" : eePct >= 30 ? "#d29922" : "#f85149";
+        html += renderMetricCard("エネルギー効率", `${eePct}%`, `
+            <div class="report-stat-row"><span>平均効率</span><span style="color:${eeColor}">${eePct}%</span></div>
+            <div class="report-stat-row"><span>セッション数</span><span>${ee.session_count}</span></div>
+            <div style="font-size:10px;color:#484f58;margin-top:4px">ユニークツール率 = 多様な行動 / 全行動</div>
+        `);
+    }
+
+    // 12. Self-Model Velocity
+    if (m.self_model_velocity && m.self_model_velocity.days.length > 0) {
+        const sv = m.self_model_velocity;
+        html += renderMetricCard("自己モデル変化速度", `${sv.avg_per_day}/日`, renderSparkBars(sv.days, "count", "#d29922"));
+    }
+
+    // 13. Session Length Trend
+    if (m.session_length_trend && m.session_length_trend.days.length > 0) {
+        const sl = m.session_length_trend;
+        html += renderMetricCard("セッション長推移", `平均${sl.avg_length}`, renderSparkBars(sl.days, "avg_actions", "#a371f7"));
+    }
+
     html += `</div>`;
     reportContent.innerHTML = html;
+}
+
+function renderSparkBars(days, valueKey, color = "#8b5cf6") {
+    if (!days || days.length === 0) return '<div class="report-metric-empty">データなし</div>';
+    const values = days.map(d => d[valueKey] || 0);
+    const maxVal = Math.max(...values, 0.001);
+    const bars = days.map((d, i) => {
+        const h = Math.max(2, Math.round(values[i] / maxVal * 36));
+        const tip = `${d.date || ""}: ${values[i]}`;
+        return `<div class="sparkline-bar" style="height:${h}px;background:${color}" data-tip="${tip}"></div>`;
+    }).join("");
+    const label = days.length > 1
+        ? `<div class="sparkline-label"><span>${days[0].date || ""}</span><span>${days[days.length - 1].date || ""}</span></div>`
+        : "";
+    return `<div class="sparkline">${bars}</div>${label}`;
 }
 
 function renderMetricCard(title, value, bodyHtml) {
@@ -1359,15 +1484,18 @@ function renderDistillationLog(data) {
                 ? (r.status === "success" ? '<span class="match-ok">○</span>' : '<span class="match-fail">×</span>')
                 : '<span class="match-none">-</span>';
             const statusClass = r.status === "error" ? "distillation-round-error" : "";
+            const intentLine = r.intent
+                ? `<div class="distillation-intent">意図: ${escapeHtml(r.intent)}</div>`
+                : "";
             const expectLine = r.expected
                 ? `<div class="distillation-expect">予測: ${escapeHtml(r.expected)}</div>`
                 : "";
             const rawLine = r.result_raw && r.result_raw !== r.result_summary
                 ? `<pre>${escapeHtml(r.result_raw)}</pre>`
                 : "";
-            const detailContent = expectLine || rawLine;
+            const detailContent = intentLine || expectLine || rawLine;
             const detailHtml = detailContent
-                ? `<details class="distillation-raw"><summary>詳細</summary>${expectLine}${rawLine}</details>`
+                ? `<details class="distillation-raw"><summary>詳細</summary>${intentLine}${expectLine}${rawLine}</details>`
                 : "";
             roundsHtml += `
                 <div class="distillation-round ${statusClass}">

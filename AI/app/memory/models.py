@@ -56,6 +56,7 @@ class ToolAction(Base):
     arguments = Column(Text, nullable=False)       # JSON文字列
     result_summary = Column(Text, nullable=False)   # 結果の先頭500文字
     expected_result = Column(Text, nullable=True)    # 実行前の予測（メタ認知用）
+    intent = Column(Text, nullable=True)              # 操作の目的（メタ認知用）
     status = Column(String(20), default="success")  # success / error
     execution_ms = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -68,6 +69,17 @@ class SelfModelSnapshot(Base):
     id = Column(Integer, primary_key=True)
     content = Column(Text, nullable=False)          # JSON全体
     changed_key = Column(String(100), nullable=True)  # 変更されたキー
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class VectorEmbedding(Base):
+    """ベクトル埋め込み（意味検索用）"""
+    __tablename__ = "vector_embeddings"
+
+    id = Column(Integer, primary_key=True)
+    source_table = Column(String(50), nullable=False)  # "messages", "memory_summaries", "iku_logs"
+    source_id = Column(Integer, nullable=False)
+    embedding = Column(Text, nullable=False)            # JSON array of floats
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

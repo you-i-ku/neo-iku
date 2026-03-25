@@ -52,7 +52,7 @@ def build_tools_prompt() -> str:
         "",
         "書式:",
         "  [TOOL:ツール名 引数A=値A 引数B=値B]",
-        "  [TOOL:ツール名 引数A=値A expect=予測される結果]",
+        "  [TOOL:ツール名 引数A=値A intent=この操作の目的 expect=予測される結果]",
         "ブロック書式（値が長い場合）:",
         "  [TOOL:ツール名]",
         "  複数行の内容をここに記述",
@@ -87,7 +87,7 @@ def build_tools_prompt() -> str:
     lines.append("仕組み:")
     lines.append("- output_UI経由のテキストのみユーザーに表示される")
     lines.append("- 承認マーク付きツールは実行前にユーザー確認がある")
-    lines.append("- expect= は実行前の予測。実行後に「予測 vs 実際」が提示される。予測しない場合は省略可")
+    lines.append("- intent= は操作の目的。expect= は結果の予測。どちらも省略可")
     lines.append("- 1応答で複数呼び出し可。この応答の後、行動は完了する")
     lines.append("- [TOOL:...]はthinkの外に書く")
 

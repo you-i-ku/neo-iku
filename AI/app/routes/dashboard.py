@@ -144,6 +144,41 @@ async def get_dev_settings():
         "autonomous_interval": scheduler._interval,
         "concurrent_mode": scheduler._concurrent_mode,
         "motivation_energy": round(scheduler._motivation_energy, 1),
+        "energy_breakdown": {k: round(v, 1) for k, v in scheduler._energy_breakdown.items()},
+        "ablation": {
+            "energy": scheduler.ablation_energy,
+            "self_model": scheduler.ablation_self_model,
+            "prediction": scheduler.ablation_prediction,
+            "distillation": scheduler.ablation_distillation,
+        },
+    }
+
+
+class AblationRequest(BaseModel):
+    flag: str  # "energy" | "self_model" | "prediction" | "distillation"
+    enabled: bool
+
+@router.post("/dev/ablation")
+async def set_ablation(req: AblationRequest):
+    """Ablationフラグの切替"""
+    flag_map = {
+        "energy": "ablation_energy",
+        "self_model": "ablation_self_model",
+        "prediction": "ablation_prediction",
+        "distillation": "ablation_distillation",
+    }
+    attr = flag_map.get(req.flag)
+    if not attr:
+        return {"error": f"Unknown flag: {req.flag}"}
+    setattr(scheduler, attr, req.enabled)
+    logger.info(f"Ablation変更: {req.flag} = {req.enabled}")
+    return {
+        "ablation": {
+            "energy": scheduler.ablation_energy,
+            "self_model": scheduler.ablation_self_model,
+            "prediction": scheduler.ablation_prediction,
+            "distillation": scheduler.ablation_distillation,
+        }
     }
 
 
@@ -183,6 +218,16 @@ async def autonomy_report(
 
         # 7. Principle Accumulation
         principles = await _calc_principle_accumulation(session, date_from, date_to)
+
+        # 8. Intent Diversity
+        intent_div = await _calc_intent_diversity(session, date_from, date_to)
+
+        # 9-13. Time-series metrics
+        tool_entropy_ts = await _calc_tool_entropy_timeseries(session, date_from, date_to)
+        prediction_ts = await _calc_prediction_accuracy_timeseries(session, date_from, date_to)
+        energy_eff = await _calc_energy_efficiency(session, date_from, date_to)
+        sm_velocity = await _calc_self_model_velocity(session, date_from, date_to)
+        session_length = await _calc_session_length_trend(session, date_from, date_to)
 
     # Summary
     total_actions = sum(diversity["distribution"].values()) if diversity["distribution"] else 0
@@ -231,6 +276,12 @@ async def autonomy_report(
             "metacognitive_accuracy": metacognition,
             "memory_utilization": memory,
             "principle_accumulation": principles,
+            "intent_diversity": intent_div,
+            "tool_entropy_ts": tool_entropy_ts,
+            "prediction_accuracy_ts": prediction_ts,
+            "energy_efficiency": energy_eff,
+            "self_model_velocity": sm_velocity,
+            "session_length_trend": session_length,
         },
     }
 
@@ -369,6 +420,186 @@ async def _calc_principle_accumulation(session, date_from: str, date_to: str) ->
     return {"distillation_count": distillation_count, "current_principles": current}
 
 
+async def _calc_intent_diversity(session, date_from: str, date_to: str) -> dict:
+    """intent使用率 + ユニーク意図数"""
+    row = (await session.execute(text(
+        "SELECT COUNT(*) as total, "
+        "SUM(CASE WHEN intent IS NOT NULL AND intent != '' THEN 1 ELSE 0 END) as with_intent "
+        "FROM tool_actions "
+        "WHERE created_at BETWEEN :f AND :t"
+    ), {"f": date_from, "t": date_to})).fetchone()
+
+    total = row[0] or 0
+    with_intent = row[1] or 0
+    usage_rate = round(with_intent / total, 3) if total > 0 else 0.0
+
+    # ユニーク意図数
+    unique_row = (await session.execute(text(
+        "SELECT COUNT(DISTINCT intent) FROM tool_actions "
+        "WHERE intent IS NOT NULL AND intent != '' AND created_at BETWEEN :f AND :t"
+    ), {"f": date_from, "t": date_to})).fetchone()
+    unique_intents = unique_row[0] if unique_row else 0
+
+    return {
+        "total_actions": total,
+        "with_intent": with_intent,
+        "usage_rate": usage_rate,
+        "unique_intents": unique_intents,
+    }
+
+
+async def _calc_tool_entropy_timeseries(session, date_from: str, date_to: str) -> dict:
+    """日別ツールエントロピー（行動多様性の推移）"""
+    rows = (await session.execute(text(
+        "SELECT DATE(created_at) as day, tool_name, COUNT(*) as cnt "
+        "FROM tool_actions WHERE created_at BETWEEN :f AND :t "
+        "GROUP BY day, tool_name ORDER BY day"
+    ), {"f": date_from, "t": date_to})).fetchall()
+
+    # 日別に集計
+    from collections import defaultdict
+    daily: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for day, tool, cnt in rows:
+        daily[str(day)][tool] = cnt
+
+    days = []
+    for day in sorted(daily.keys()):
+        dist = daily[day]
+        total = sum(dist.values())
+        entropy = 0.0
+        for count in dist.values():
+            p = count / total
+            if p > 0:
+                entropy -= p * math.log2(p)
+        days.append({"date": day, "entropy": round(entropy, 3), "tools": len(dist), "actions": total})
+
+    return {"days": days}
+
+
+async def _calc_prediction_accuracy_timeseries(session, date_from: str, date_to: str) -> dict:
+    """日別予測精度推移"""
+    rows = (await session.execute(text(
+        "SELECT DATE(created_at) as day, "
+        "COUNT(*) as total, "
+        "SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as hits "
+        "FROM tool_actions "
+        "WHERE expected_result IS NOT NULL AND expected_result != '' "
+        "AND created_at BETWEEN :f AND :t "
+        "GROUP BY day ORDER BY day"
+    ), {"f": date_from, "t": date_to})).fetchall()
+
+    days = []
+    for day, total, hits in rows:
+        rate = round(hits / total, 3) if total > 0 else 0.0
+        days.append({"date": str(day), "total": total, "hits": hits, "rate": rate})
+
+    return {"days": days}
+
+
+async def _calc_energy_efficiency(session, date_from: str, date_to: str) -> dict:
+    """エネルギー効率: セッションごとのユニークツールパターン率"""
+    rows = (await session.execute(text(
+        "SELECT conversation_id, tool_name "
+        "FROM tool_actions "
+        "WHERE created_at BETWEEN :f AND :t AND conversation_id IS NOT NULL "
+        "ORDER BY conversation_id, created_at"
+    ), {"f": date_from, "t": date_to})).fetchall()
+
+    if not rows:
+        return {"avg_efficiency": 0.0, "session_count": 0, "sessions": []}
+
+    # セッション別にツール列を集める
+    from collections import defaultdict
+    sessions: dict[int, list[str]] = defaultdict(list)
+    for conv_id, tool in rows:
+        sessions[conv_id].append(tool)
+
+    efficiencies = []
+    for conv_id, tools in sessions.items():
+        if not tools:
+            continue
+        total = len(tools)
+        unique = len(set(tools))
+        eff = round(unique / total, 3)
+        efficiencies.append({"conv_id": conv_id, "total": total, "unique": unique, "efficiency": eff})
+
+    avg = round(sum(e["efficiency"] for e in efficiencies) / len(efficiencies), 3) if efficiencies else 0.0
+    return {"avg_efficiency": avg, "session_count": len(efficiencies), "sessions": efficiencies[-20:]}
+
+
+async def _calc_self_model_velocity(session, date_from: str, date_to: str) -> dict:
+    """自己モデル変化速度（日別スナップショット数）"""
+    rows = (await session.execute(text(
+        "SELECT DATE(created_at) as day, COUNT(*) as cnt "
+        "FROM self_model_snapshots "
+        "WHERE created_at BETWEEN :f AND :t "
+        "GROUP BY day ORDER BY day"
+    ), {"f": date_from, "t": date_to})).fetchall()
+
+    days = [{"date": str(day), "count": cnt} for day, cnt in rows]
+    total = sum(d["count"] for d in days)
+    avg_per_day = round(total / len(days), 2) if days else 0.0
+
+    return {"days": days, "total": total, "avg_per_day": avg_per_day}
+
+
+async def _calc_session_length_trend(session, date_from: str, date_to: str) -> dict:
+    """セッション長推移（自律セッションごとのツール実行数）"""
+    rows = (await session.execute(text(
+        "SELECT c.id, DATE(c.started_at) as day, COUNT(t.id) as action_count "
+        "FROM conversations c "
+        "LEFT JOIN tool_actions t ON t.conversation_id = c.id "
+        "WHERE c.source = 'autonomous' AND c.is_imported = 0 "
+        "AND c.started_at BETWEEN :f AND :t "
+        "GROUP BY c.id "
+        "ORDER BY c.started_at"
+    ), {"f": date_from, "t": date_to})).fetchall()
+
+    if not rows:
+        return {"days": [], "avg_length": 0.0}
+
+    # 日別平均
+    from collections import defaultdict
+    daily: dict[str, list[int]] = defaultdict(list)
+    for _, day, cnt in rows:
+        daily[str(day)].append(cnt)
+
+    days = []
+    for day in sorted(daily.keys()):
+        counts = daily[day]
+        avg = round(sum(counts) / len(counts), 2)
+        days.append({"date": day, "avg_actions": avg, "sessions": len(counts)})
+
+    all_counts = [cnt for _, _, cnt in rows]
+    avg_length = round(sum(all_counts) / len(all_counts), 2) if all_counts else 0.0
+
+    return {"days": days, "avg_length": avg_length}
+
+
+# --- ベクトル検索 ---
+
+@router.post("/dev/vector-reindex")
+async def vector_reindex():
+    """全メッセージ・日記のベクトルを再構築"""
+    from app.memory.vector_store import reindex_all
+    result = await reindex_all()
+    return {"reindexed": True, "counts": result}
+
+
+@router.get("/dev/vector-status")
+async def vector_status():
+    """ベクトルストアの状態"""
+    from app.memory.vector_store import get_status
+    status = get_status()
+    # 件数も追加
+    async with async_session() as session:
+        row = (await session.execute(text(
+            "SELECT COUNT(*) FROM vector_embeddings"
+        ))).fetchone()
+        status["count"] = row[0] if row else 0
+    return status
+
+
 # --- 蒸留モニタリング ---
 
 @router.get("/distillation-log")
@@ -399,7 +630,7 @@ async def distillation_log(
 
             # このセッションのツール実行
             tool_rows = (await session.execute(text(
-                "SELECT tool_name, result_summary, expected_result, status "
+                "SELECT tool_name, result_summary, expected_result, status, intent "
                 "FROM tool_actions WHERE conversation_id = :cid "
                 "ORDER BY created_at"
             ), {"cid": conv_id})).fetchall()
@@ -410,6 +641,7 @@ async def distillation_log(
                 has_pred = tr[2] is not None and tr[2] != ""
                 if has_pred:
                     has_predictions = True
+                has_intent = tr[4] is not None and tr[4] != ""
                 # 生データ（DB）と短い要約の両方を返す
                 raw_result = tr[1] or ""
                 short_summary = Pipeline._summarize_result(tr[0], raw_result, tr[3] or "success")
@@ -418,8 +650,10 @@ async def distillation_log(
                     "result_summary": short_summary,
                     "result_raw": raw_result[:200] if len(raw_result) > 80 else raw_result,
                     "expected": tr[2] if has_pred else None,
+                    "intent": tr[4] if has_intent else None,
                     "status": tr[3],
                     "has_prediction": has_pred,
+                    "has_intent": has_intent,
                 })
 
             sessions.append({

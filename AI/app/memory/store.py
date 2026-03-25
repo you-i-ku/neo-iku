@@ -1,5 +1,6 @@
 """記憶CRUD操作"""
 import json
+import asyncio
 from datetime import datetime
 from sqlalchemy import select, text, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,6 +29,12 @@ async def add_message(session: AsyncSession, conversation_id: int, role: str, co
     await session.execute(text(
         "INSERT INTO messages_fts(rowid, content) VALUES (:id, :content)"
     ), {"id": msg.id, "content": content})
+    # ベクトル埋め込み（fire-and-forget）
+    try:
+        from app.memory.vector_store import store_embedding
+        asyncio.create_task(store_embedding("messages", msg.id, content))
+    except Exception:
+        pass
     return msg
 
 
@@ -73,6 +80,7 @@ async def record_tool_action(
     status: str = "success",
     execution_ms: int | None = None,
     expected_result: str | None = None,
+    intent: str | None = None,
 ) -> ToolAction:
     """ツール実行履歴を記録"""
     args_json = json.dumps(args, ensure_ascii=False)
@@ -84,6 +92,7 @@ async def record_tool_action(
         arguments=args_json,
         result_summary=result_summary,
         expected_result=expected_result,
+        intent=intent,
         status=status,
         execution_ms=execution_ms,
     )

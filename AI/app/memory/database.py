@@ -34,6 +34,12 @@ async def init_db():
         except Exception:
             await conn.execute(text("ALTER TABLE tool_actions ADD COLUMN expected_result TEXT"))
 
+        # tool_actionsにintentカラム追加（既存DBマイグレーション）
+        try:
+            await conn.execute(text("SELECT intent FROM tool_actions LIMIT 1"))
+        except Exception:
+            await conn.execute(text("ALTER TABLE tool_actions ADD COLUMN intent TEXT"))
+
         # conversationsにsourceカラム追加（既存DBマイグレーション）
         try:
             await conn.execute(text("SELECT source FROM conversations LIMIT 1"))

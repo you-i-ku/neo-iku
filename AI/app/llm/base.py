@@ -19,3 +19,7 @@ class BaseLLMProvider(ABC):
     async def stream_chat(self, messages: list[dict], temperature: float = 0.7):
         """ストリーミング応答。yieldでチャンクを返す。"""
         ...
+
+    async def embed(self, texts: list[str]) -> list[list[float]] | None:
+        """テキストの埋め込みベクトルを取得。未対応ならNone"""
+        return None
