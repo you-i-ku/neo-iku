@@ -596,11 +596,13 @@ async def _calc_autonomy_ratio(session, date_from: str, date_to: str, pid: int |
     energy = trigger_counts.get("energy", 0)
     timer = trigger_counts.get("timer", 0)
     manual = trigger_counts.get("manual", 0)
+    user_stimulus = trigger_counts.get("user_stimulus", 0)
     energy_ratio = round(energy / autonomous, 3) if autonomous > 0 else 0.0
 
     return {
         "autonomous": autonomous, "chat": chat, "ratio": ratio,
-        "trigger": {"energy": energy, "timer": timer, "manual": manual, "energy_ratio": energy_ratio},
+        "trigger": {"energy": energy, "timer": timer, "manual": manual,
+                     "user_stimulus": user_stimulus, "energy_ratio": energy_ratio},
     }
 
 

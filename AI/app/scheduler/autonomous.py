@@ -268,15 +268,14 @@ class AutonomousScheduler:
         from app.pipeline import pipeline, PipelineRequest
         from app.tools.builtin import _load_self_model
 
-        # === ユーザー入力の取り込み ===
+        # === ユーザー入力の取り込み（環境刺激として扱う） ===
         pending = list(self._pending_messages)
         self._pending_messages.clear()
-        pending_source = "autonomous"
-        pending_goal = ""
+        user_input_text = ""
         if pending:
-            # ユーザー入力がある場合、最新のメッセージをgoalに、sourceをchatに
-            pending_goal = pending[-1]["text"]
-            pending_source = "chat"
+            # ユーザー入力を環境刺激として結合（複数あれば全て含む）
+            user_input_text = "\n".join(p["text"] for p in pending)
+            trigger = "user_stimulus"
             # UI通知: お返事中です
             await pipeline._broadcast(json.dumps({
                 "type": "responding_start",
@@ -338,20 +337,16 @@ class AutonomousScheduler:
                 continue_conv_id = self._last_conv_id
                 logger.info(f"セッション継続: conv_id={continue_conv_id}")
 
-        # ユーザー入力があればそちらを優先（sourceもchatに）
-        final_source = pending_source if pending else "autonomous"
-        final_goal = pending_goal if pending_goal else action_goal
-        final_conv_id = continue_conv_id
-
         request = PipelineRequest(
-            source=final_source,
-            goal=final_goal,
-            conv_id=final_conv_id,
+            source="autonomous",
+            goal=action_goal,
+            conv_id=continue_conv_id,
             memory_context=memory_context,
             signal_summary=signal_summary,
             bootstrap_hint=bootstrap_hint,
             selected_action=selected_action,
             trigger=trigger,
+            user_input=user_input_text,
         )
         result = await pipeline.submit(request)
         self._last_conv_id = result.conv_id  # 次のアクションでの継続用に保持
@@ -363,12 +358,10 @@ class AutonomousScheduler:
             }))
 
         # 5. 振り返り (Reflect): 経験からの学び + 自己モデル更新検討 + 行動ログ出力
-        # 自律行動のみセッション番号をインクリメント（チャット応答は含めない）
-        if final_source == "autonomous":
-            self._session_count += 1
+        self._session_count += 1
         await self._reflect(
             selected_action, result, self_model, action_goal, selected_strategy,
-            session_num=self._session_count if final_source == "autonomous" else None,
+            session_num=self._session_count,
             trigger=trigger,
             env_stimulus=env_stimulus if env_stimulus else None,
         )

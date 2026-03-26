@@ -35,14 +35,15 @@ logger = logging.getLogger("iku.pipeline")
 @dataclass
 class PipelineRequest:
     """パイプラインへのリクエスト"""
-    source: str  # "chat" | "autonomous"
-    goal: str  # ユーザーメッセージ or 行動目標
+    source: str  # "autonomous"（全て自律行動として処理）
+    goal: str  # 行動目標（drivesから。空なら省略）
     conv_id: int | None = None
     memory_context: str = ""
     signal_summary: str = ""
     bootstrap_hint: str = ""
     selected_action: dict | None = None
-    trigger: str | None = None  # "timer" / "energy" / "manual" / None(chat)
+    trigger: str | None = None  # "timer" / "energy" / "manual" / "user_stimulus"
+    user_input: str = ""  # ユーザー入力（環境刺激として扱う。空なら省略）
 
 
 @dataclass
@@ -192,10 +193,7 @@ class Pipeline:
             request, future = item
             self._processing = True
             try:
-                if request.source == "autonomous" and PLAN_EXECUTE_ENABLED:
-                    result = await self._process_plan_execute(request)
-                else:
-                    result = await self._process(request)
+                result = await self._process(request)
                 if not future.done():
                     future.set_result(result)
             except Exception as e:
@@ -210,11 +208,10 @@ class Pipeline:
     # --- 統一パイプライン ---
 
     async def _process(self, req: PipelineRequest) -> PipelineResult:
-        import config as _config
+        """全リクエスト共通パイプライン: 計画→実行（フォールバック: 1ショット）"""
+        logger.info(f"パイプライン処理開始: source={req.source} trigger={req.trigger} goal={req.goal[:60]!r}")
 
-        logger.info(f"パイプライン処理開始: source={req.source} goal={req.goal[:60]!r}")
-
-        # DB会話作成
+        # === 1. セットアップ（共通） ===
         conv_id = req.conv_id
         if conv_id is None:
             async with async_session() as session:
@@ -222,444 +219,229 @@ class Pipeline:
                 conv_id = conv.id
                 await session.commit()
 
-        # セッション開始通知
-        preview = req.goal[:50] if req.source == "chat" else "自律行動"
+        preview = req.goal[:50] if req.goal else "自律行動"
         await self._broadcast(json.dumps({
             "type": "dev_session_start",
             "source": req.source,
             "preview": preview,
         }))
-        if req.source == "chat":
-            await self._broadcast(json.dumps({"type": "processing_start"}))
-        else:
-            await self._broadcast(json.dumps({"type": "autonomous_think_start"}))
+        await self._broadcast(json.dumps({"type": "autonomous_think_start"}))
 
-        action_goal = req.goal
+        # ユーザー入力をDB記録（環境刺激としての記録）
+        if req.user_input:
+            async with async_session() as session:
+                await add_message(session, conv_id, "user", req.user_input)
+                await session.commit()
+
         step_history: list[dict] = []
         last_full_result = ""
         seen_tool_calls: set[str] = set()
         had_output = False
+        plan_text = ""
+        plan_response = ""
         response = ""
 
         try:
-            # 共通コンテキスト構築
-            tool_text = build_tools_prompt()
-            logger.debug(f"tool_text 構築完了: {len(tool_text)} chars")
             system_base = self._build_system_base()
-            logger.debug(f"system_base 構築完了: {len(system_base)} chars")
-            memory_context = req.memory_context
+            action_goal = req.goal
 
-            # chat の場合、ユーザーメッセージをDB保存
-            if req.source == "chat":
-                async with async_session() as session:
-                    await add_message(session, conv_id, "user", req.goal)
-                    await session.commit()
-                self._emit_signal("user_message", req.goal[:50])
-                logger.debug("ユーザーメッセージDB保存完了")
+            # === 2. 計画フェーズ ===
+            use_plan_execute = PLAN_EXECUTE_ENABLED
+            planned_tools = None
 
-            # --- messages構築 ---
-            messages = [
-                {"role": "system", "content": system_base or ""},
-            ]
+            if use_plan_execute:
+                planning_tool_text = build_planning_prompt()
+                planning_prompt = self._build_planning_prompt(
+                    action_goal, planning_tool_text, req.signal_summary,
+                    user_input=req.user_input,
+                )
+                plan_messages = [
+                    {"role": "system", "content": system_base or ""},
+                    {"role": "user", "content": planning_prompt},
+                ]
 
-            # 会話継続 — 既存conv_idが渡された場合、過去のやり取りをロード
-            if req.conv_id is not None:
-                try:
+                logger.info("計画フェーズ: LLM呼び出し")
+                plan_response, _, _ = await self._call_llm_streaming(plan_messages, req.source, 0)
+
+                if plan_response:
+                    clean_plan = self._strip_think(plan_response)
+                    planned_tools = parse_plan(clean_plan)
+
+                if not planned_tools:
+                    logger.warning("計画パース失敗 → 1ショットにフォールバック")
+                    use_plan_execute = False
+                else:
+                    planned_tools = planned_tools[:PLAN_MAX_TOOLS]
+                    plan_text = " → ".join(planned_tools)
+                    logger.info(f"計画確定: [{plan_text}]")
                     async with async_session() as session:
-                        prev_msgs = await get_conversation_messages(session, req.conv_id)
-                    for msg in prev_msgs[-CHAT_HISTORY_MESSAGES:]:
-                        if msg.role in ("user", "assistant"):
-                            clean_content = self._strip_think(msg.content) if msg.role == "assistant" else msg.content
-                            messages.append({"role": msg.role, "content": clean_content})
-                    logger.debug(f"会話履歴ロード: {len(prev_msgs)}件中{min(len(prev_msgs), CHAT_HISTORY_MESSAGES)}件")
-                except Exception as e:
-                    logger.warning(f"会話履歴ロード失敗: {e}")
-
-            # 初回プロンプト（ツール一覧・目標・コンテキスト）
-            initial_prompt = self._build_initial_prompt(
-                action_goal=action_goal,
-                tool_text=tool_text,
-                memory_context=memory_context,
-                signal_summary=req.signal_summary,
-                bootstrap_hint=req.bootstrap_hint,
-            )
-            messages.append({"role": "user", "content": initial_prompt})
-
-            # ユーザー割り込みチェック（LLM呼び出し前に1回）
-            while not self._interrupt_queue.empty():
-                try:
-                    msg = self._interrupt_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                messages.append({"role": "user", "content": f"ユーザーからの追加メッセージ: {msg}"})
-                async with async_session() as session:
-                    await add_message(session, conv_id, "user", msg)
-                    await session.commit()
-                await self._broadcast(json.dumps({
-                    "type": "user_interrupt_ack",
-                    "content": msg,
-                }))
-
-            # コンテキストウィンドウ管理
-            trimmed = self._trim_messages(messages)
-
-            # --- 1回のLLM呼び出し ---
-            logger.info(f"LLM呼び出し: messages={len(trimmed)}")
-            response, repeat_detected, stream_had_tool_markers = await self._call_llm_streaming(trimmed, req.source, 0)
-            logger.info(f"LLM応答: response_len={len(response)} repeat={repeat_detected} markers={stream_had_tool_markers}")
-
-            if not response:
-                logger.warning("LLM応答が空 — LM Studioが応答しているか確認してください")
-            elif self._stop_event.is_set():
-                # 中断チェック
-                self._stop_event.clear()
-                stop_note = "ユーザーにより出力を中断されました。"
-                if self._stop_feedback:
-                    stop_note += f"\n理由: {self._stop_feedback}"
-                if response.strip():
-                    async with async_session() as session:
-                        await add_message(session, conv_id, "assistant", response)
-                        await add_message(session, conv_id, "user", stop_note)
+                        await add_message(session, conv_id, "assistant", plan_response)
+                        await add_message(session, conv_id, "tool", f"[計画] {plan_text}")
                         await session.commit()
-                await self._broadcast(json.dumps({"type": "stopped"}))
-            else:
-                # ループ検出時は繰り返し部分を切り落とす
-                if repeat_detected:
-                    response = self._trim_repeated(response)
 
-                clean = self._strip_think(response)
-                tool_calls = parse_tool_calls(clean) or parse_tool_calls(response)
+            # === 3. 実行フェーズ ===
+            if use_plan_execute:
+                # --- 計画-実行パス: ツールごとに1回のLLM呼び出し ---
+                execution_results: list[dict] = []
 
-                # --- ツール実行（1応答内の全ツールを実行） ---
-                all_results = []
-                for tool_name, tool_args in (tool_calls or []):
-                    # non_response → 沈黙を選択した記録
-                    if tool_name == "non_response":
-                        logger.info("non_response: 沈黙を選択")
-                        all_results.append("[non_response: 沈黙を選択]")
-                        step_history.append({"tool": "non_response", "args_summary": "", "result_summary": "沈黙を選択"})
+                for round_idx, tool_name in enumerate(planned_tools):
+                    if self._stop_event.is_set():
+                        logger.info("計画実行中断: ユーザーによる停止")
+                        break
+
+                    tool_info = get_tool(tool_name)
+                    if not tool_info:
+                        logger.warning(f"計画内の未登録ツール: {tool_name} → スキップ")
                         continue
 
-                    expected = tool_args.pop("expect", None)
-                    if expected is not None and expected.strip().lower() in ("skip", "", "-", "なし", "none"):
-                        expected = None
-                    intent = tool_args.pop("intent", None)
-                    if intent is not None and intent.strip().lower() in ("", "-", "なし", "none"):
-                        intent = None
-                    # Ablation: 予測無効時はexpect/intentを強制クリア
-                    from app.scheduler.autonomous import scheduler as _sched
-                    if not _sched.ablation_prediction:
-                        expected = None
-                        intent = None
-
-                    # 重複検出
-                    call_key = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
-                    if call_key in seen_tool_calls:
-                        logger.info(f"重複ツール呼び出しスキップ: {tool_name}")
-                        step_history.append({"tool": tool_name, "args_summary": "", "result_summary": "重複スキップ"})
-                        continue
-                    seen_tool_calls.add(call_key)
-
-                    logger.info(f"ツール: {tool_name} {tool_args}")
-                    args_str = " ".join(f"{k}={v}" for k, v in tool_args.items()) if tool_args else ""
-                    is_output = tool_name == "output_UI"
-
-                    # dev tab通知
-                    await self._broadcast(json.dumps({
-                        "type": "dev_tool_call",
-                        "content": f"{tool_name} {args_str}".strip(),
-                    }))
-                    if not is_output:
-                        tool_call_text = f"{tool_name}({', '.join(f'{k}={v}' for k, v in tool_args.items())})"
-                        await self._broadcast(json.dumps({"type": "tool_call", "content": tool_call_text}))
-                        await self._broadcast(json.dumps({
-                            "type": "autonomous_tool", "name": tool_name,
-                            "args": args_str, "status": "running",
-                        }))
-
-                    # ツール実行
-                    t0 = time.perf_counter()
-                    result = await execute_tool(tool_name, tool_args)
-                    exec_ms = int((time.perf_counter() - t0) * 1000)
-
-                    # 承認フロー（chat/autonomous共通 — 接続クライアントに承認UIを表示）
-                    result = await self._resolve_pending(tool_name, result)
-
-                    action_status = "error" if result.startswith("エラー") else "success"
-
-                    # シグナル
-                    self._emit_signal(
-                        "tool_error" if action_status == "error" else "tool_success",
-                        tool_name,
+                    exec_prompt = self._build_execution_prompt(
+                        tool_name=tool_name, tool_info=tool_info,
+                        action_goal=action_goal,
+                        previous_results=execution_results[-3:],
+                        signal_summary=req.signal_summary,
+                        round_idx=round_idx, total_rounds=len(planned_tools),
+                        user_input=req.user_input,
                     )
-                    if expected:
-                        self._emit_signal("prediction_made", f"{tool_name}: {expected[:50]}")
+                    exec_messages = [
+                        {"role": "system", "content": system_base or ""},
+                        {"role": "user", "content": exec_prompt},
+                    ]
 
-                    # エネルギー消費（ツール実行コスト）
-                    from app.scheduler.autonomous import scheduler
-                    scheduler.consume_energy(tool_name)
+                    logger.info(f"実行フェーズ {round_idx + 1}/{len(planned_tools)}: {tool_name}")
+                    exec_response, repeat_detected, _ = await self._call_llm_streaming(
+                        exec_messages, req.source, round_idx + 1
+                    )
 
-                    # dev tab結果
-                    await self._broadcast(json.dumps({
-                        "type": "dev_tool_result",
-                        "name": tool_name,
-                        "content": result[:2000] if len(result) > 2000 else result,
-                    }))
+                    if not exec_response:
+                        logger.warning(f"実行フェーズ {round_idx + 1}: LLM応答なし")
+                        continue
 
-                    # output_UI処理
-                    if is_output and action_status == "success":
-                        had_output = True
-                        await self._broadcast(json.dumps({"type": "tool_call", "content": "output_UI"}))
-                        await self._broadcast(json.dumps({
-                            "type": "output", "content": result, "source": req.source,
-                        }))
-                    elif not is_output:
-                        await self._broadcast(json.dumps({
-                            "type": "autonomous_tool", "name": tool_name,
-                            "args": args_str, "status": action_status,
-                        }))
+                    if repeat_detected:
+                        exec_response = self._trim_repeated(exec_response)
 
-                    parts = []
-                    if intent:
-                        parts.append(f"あなたの意図: {intent}")
-                    if expected:
-                        parts.append(f"あなたの予測: {expected}")
-                    parts.append(f"実際の結果: {result}" if (intent or expected) else result)
-                    all_results.append(f"[ツール結果: {tool_name}]\n" + "\n".join(parts))
+                    clean_exec = self._strip_think(exec_response)
+                    tool_calls = parse_tool_calls(clean_exec) or parse_tool_calls(exec_response)
 
-                    # DB記録
-                    async with async_session() as session:
-                        await record_tool_action(
-                            session, conv_id, tool_name, tool_args,
-                            result, action_status, exec_ms,
-                            expected_result=expected,
-                            intent=intent,
-                            persona_id=get_active_persona_id(),
+                    round_results = []
+                    for tc_name, tc_args in (tool_calls or []):
+                        allowed = (tc_name == tool_name or tc_name in ("output_UI", "non_response"))
+                        if not allowed:
+                            logger.info(f"計画外ツールスキップ: {tc_name}（計画={tool_name}）")
+                            continue
+
+                        result_text, status, tool_had_output = await self._execute_single_tool(
+                            tc_name, tc_args, conv_id, req.source, seen_tool_calls, step_history
                         )
+                        if tool_had_output:
+                            had_output = True
+                        if result_text:
+                            round_results.append(result_text)
+
+                    # stream参照
+                    for sh in step_history:
+                        if sh.get("stream") is None and sh.get("tool") == tool_name:
+                            sh["stream"] = exec_response
+                            break
+
+                    # DB記録（ラウンドごと）
+                    combined = "\n\n".join(round_results) if round_results else ""
+                    async with async_session() as session:
+                        await add_message(session, conv_id, "assistant", exec_response)
+                        if combined:
+                            await add_message(session, conv_id, "tool", combined)
                         await session.commit()
 
-                    # step_history
-                    step_history.append({
+                    last_full_result = combined
+                    summary = self._summarize_result(tool_name, combined, "success" if combined else "error") if combined else "実行なし"
+                    execution_results.append({
                         "tool": tool_name,
-                        "args_summary": args_str[:80],
-                        "result_summary": self._summarize_result(tool_name, result, action_status),
-                        "expected": expected,
-                        "intent": intent,
-                        "stream": response,
+                        "result": combined[:500],
+                        "summary": summary,
                     })
 
                 # ツール未実行検出
-                executed_tools = [s["tool"] for s in step_history if s.get("tool")]
-                if not executed_tools:
-                    if stream_had_tool_markers:
-                        # ストリーミングで[TOOLを検出したがパース/実行に至らなかった
-                        fail_msg = "ツールマーカーを検出しましたが、正しい形式で実行されませんでした。"
-                    else:
-                        fail_msg = "ツールが実行されませんでした。"
-                    all_results.append(fail_msg)
-                    step_history.append({"tool": "(tool_fail)", "args_summary": "", "result_summary": fail_msg})
-                    self._emit_signal("tool_fail", fail_msg)
-                    logger.info(f"tool_fail: {fail_msg}")
+                if not step_history:
+                    self._emit_signal("tool_fail", "計画-実行: ツール未実行")
 
-                # DB保存
-                combined_results = "\n\n".join(all_results)
-                last_full_result = combined_results
-                async with async_session() as session:
-                    await add_message(session, conv_id, "assistant", response)
-                    if combined_results:
-                        await add_message(session, conv_id, "tool", combined_results)
-                    await session.commit()
+            else:
+                # --- フォールバック: 1ショットLLM呼び出し ---
+                tool_text = build_tools_prompt()
+                messages = [{"role": "system", "content": system_base or ""}]
 
-            # action_completeシグナル発火
+                initial_prompt = self._build_initial_prompt(
+                    action_goal=action_goal,
+                    tool_text=tool_text,
+                    memory_context=req.memory_context,
+                    signal_summary=req.signal_summary,
+                    bootstrap_hint=req.bootstrap_hint,
+                    user_input=req.user_input,
+                )
+                messages.append({"role": "user", "content": initial_prompt})
+
+                trimmed = self._trim_messages(messages)
+
+                logger.info(f"フォールバック1ショットLLM呼び出し: messages={len(trimmed)}")
+                response, repeat_detected, stream_had_tool_markers = await self._call_llm_streaming(trimmed, req.source, 0)
+
+                if not response:
+                    logger.warning("LLM応答が空")
+                elif self._stop_event.is_set():
+                    self._stop_event.clear()
+                    stop_note = "ユーザーにより出力を中断されました。"
+                    if self._stop_feedback:
+                        stop_note += f"\n理由: {self._stop_feedback}"
+                    if response.strip():
+                        async with async_session() as session:
+                            await add_message(session, conv_id, "assistant", response)
+                            await add_message(session, conv_id, "user", stop_note)
+                            await session.commit()
+                    await self._broadcast(json.dumps({"type": "stopped"}))
+                else:
+                    if repeat_detected:
+                        response = self._trim_repeated(response)
+
+                    clean = self._strip_think(response)
+                    tool_calls = parse_tool_calls(clean) or parse_tool_calls(response)
+
+                    all_results = []
+                    for tool_name, tool_args in (tool_calls or []):
+                        result_text, status, tool_had_output = await self._execute_single_tool(
+                            tool_name, tool_args, conv_id, req.source, seen_tool_calls, step_history
+                        )
+                        if tool_had_output:
+                            had_output = True
+                        if result_text:
+                            all_results.append(result_text)
+
+                    # stream参照
+                    for sh in step_history:
+                        if sh.get("stream") is None:
+                            sh["stream"] = response
+
+                    # ツール未実行検出
+                    executed_tools = [s["tool"] for s in step_history if s.get("tool")]
+                    if not executed_tools:
+                        fail_msg = ("ツールマーカーを検出しましたが、正しい形式で実行されませんでした。"
+                                    if stream_had_tool_markers else "ツールが実行されませんでした。")
+                        all_results.append(fail_msg)
+                        step_history.append({"tool": "(tool_fail)", "args_summary": "", "result_summary": fail_msg})
+                        self._emit_signal("tool_fail", fail_msg)
+
+                    # DB保存
+                    combined_results = "\n\n".join(all_results)
+                    last_full_result = combined_results
+                    async with async_session() as session:
+                        await add_message(session, conv_id, "assistant", response)
+                        if combined_results:
+                            await add_message(session, conv_id, "tool", combined_results)
+                        await session.commit()
+
+            # action_completeシグナル
             self._emit_signal("action_complete", action_goal[:50] if action_goal else req.source)
 
         except Exception as e:
             import traceback
             logger.error(f"パイプライン処理エラー: {e}\n{traceback.format_exc()}")
-        finally:
-            if req.source == "chat":
-                await self._broadcast(json.dumps({"type": "processing_end"}))
-            else:
-                await self._broadcast(json.dumps({"type": "autonomous_think_end"}))
-
-        # 会話終了
-        try:
-            async with async_session() as session:
-                await end_conversation(session, conv_id)
-                await session.commit()
-        except Exception:
-            pass
-
-        # 蒸留ログ: セッション完了をWS通知
-        await self._broadcast_distillation_session(
-            conv_id, req.source, req.trigger, step_history
-        )
-
-        return PipelineResult(
-            conv_id=conv_id,
-            step_history=step_history,
-            last_full_result=last_full_result,
-            had_output=had_output,
-            last_response=response,
-        )
-
-    # --- 計画-実行分離パイプライン ---
-
-    async def _process_plan_execute(self, req: PipelineRequest) -> PipelineResult:
-        """自律行動用: 計画フェーズ → 実行フェーズ（ツールごとに1回のLLM呼び出し）"""
-        logger.info(f"計画-実行パイプライン開始: goal={req.goal[:60]!r}")
-
-        # DB会話作成
-        conv_id = req.conv_id
-        if conv_id is None:
-            async with async_session() as session:
-                conv = await create_conversation(session, source=req.source, trigger=req.trigger, persona_id=get_active_persona_id())
-                conv_id = conv.id
-                await session.commit()
-
-        await self._broadcast(json.dumps({
-            "type": "dev_session_start",
-            "source": req.source,
-            "preview": "自律行動（計画-実行）",
-        }))
-        await self._broadcast(json.dumps({"type": "autonomous_think_start"}))
-
-        step_history: list[dict] = []
-        last_full_result = ""
-        had_output = False
-        seen_tool_calls: set[str] = set()
-        plan_text = ""
-        plan_response = ""
-
-        try:
-            system_base = self._build_system_base()
-            signal_summary = req.signal_summary
-            action_goal = req.goal
-            planning_tool_text = build_planning_prompt()
-
-            # === Phase 1: 計画 ===
-            planning_prompt = self._build_planning_prompt(action_goal, planning_tool_text, signal_summary)
-            plan_messages = [
-                {"role": "system", "content": system_base or ""},
-                {"role": "user", "content": planning_prompt},
-            ]
-
-            logger.info("計画フェーズ: LLM呼び出し")
-            plan_response, _, _ = await self._call_llm_streaming(plan_messages, req.source, 0)
-
-            if not plan_response:
-                logger.warning("計画フェーズ: LLM応答なし → フォールバック")
-                return await self._process(req)
-
-            clean_plan = self._strip_think(plan_response)
-            planned_tools = parse_plan(clean_plan)
-
-            if not planned_tools:
-                logger.warning(f"計画パース失敗 → フォールバック: {clean_plan[:200]}")
-                return await self._process(req)
-
-            planned_tools = planned_tools[:PLAN_MAX_TOOLS]
-            plan_text = " → ".join(planned_tools)
-            logger.info(f"計画確定: [{plan_text}]")
-
-            # 計画をDB記録
-            async with async_session() as session:
-                await add_message(session, conv_id, "assistant", plan_response)
-                await add_message(session, conv_id, "tool", f"[計画] {plan_text}")
-                await session.commit()
-
-            # === Phase 2: 実行 ===
-            execution_results: list[dict] = []  # {"tool": name, "result": text, "summary": text}
-
-            for round_idx, tool_name in enumerate(planned_tools):
-                if self._stop_event.is_set():
-                    logger.info("計画実行中断: ユーザーによる停止")
-                    break
-
-                tool_info = get_tool(tool_name)
-                if not tool_info:
-                    logger.warning(f"計画内の未登録ツール: {tool_name} → スキップ")
-                    continue
-
-                # 実行プロンプト構築
-                exec_prompt = self._build_execution_prompt(
-                    tool_name=tool_name,
-                    tool_info=tool_info,
-                    action_goal=action_goal,
-                    previous_results=execution_results[-3:],
-                    signal_summary=signal_summary,
-                    round_idx=round_idx,
-                    total_rounds=len(planned_tools),
-                )
-                exec_messages = [
-                    {"role": "system", "content": system_base or ""},
-                    {"role": "user", "content": exec_prompt},
-                ]
-
-                logger.info(f"実行フェーズ {round_idx + 1}/{len(planned_tools)}: {tool_name}")
-                exec_response, repeat_detected, _ = await self._call_llm_streaming(
-                    exec_messages, req.source, round_idx + 1
-                )
-
-                if not exec_response:
-                    logger.warning(f"実行フェーズ {round_idx + 1}: LLM応答なし")
-                    continue
-
-                if repeat_detected:
-                    exec_response = self._trim_repeated(exec_response)
-
-                clean_exec = self._strip_think(exec_response)
-                tool_calls = parse_tool_calls(clean_exec) or parse_tool_calls(exec_response)
-
-                # ツール実行（計画内ツール + output_UI/non_response のみ許可）
-                round_results = []
-                for tc_name, tc_args in (tool_calls or []):
-                    allowed = (tc_name == tool_name or tc_name in ("output_UI", "non_response"))
-                    if not allowed:
-                        logger.info(f"計画外ツールスキップ: {tc_name}（計画={tool_name}）")
-                        continue
-
-                    result, status, tool_had_output = await self._execute_single_tool(
-                        tc_name, tc_args, conv_id, req.source, seen_tool_calls, step_history
-                    )
-                    if tool_had_output:
-                        had_output = True
-                    round_results.append(result)
-
-                # step_historyにstream追加（このラウンドで追加されたエントリに）
-                for sh in step_history:
-                    if sh.get("stream") is None and sh.get("tool") == tool_name:
-                        sh["stream"] = exec_response
-                        break
-
-                # DB記録
-                combined = "\n\n".join(round_results) if round_results else ""
-                async with async_session() as session:
-                    await add_message(session, conv_id, "assistant", exec_response)
-                    if combined:
-                        await add_message(session, conv_id, "tool", combined)
-                    await session.commit()
-
-                last_full_result = combined
-
-                # 実行結果を蓄積（次のラウンドの前提として使う）
-                summary = self._summarize_result(tool_name, combined, "success" if combined else "error") if combined else "実行なし"
-                execution_results.append({
-                    "tool": tool_name,
-                    "result": combined[:500],
-                    "summary": summary,
-                })
-
-            # ツール未実行検出
-            if not step_history:
-                self._emit_signal("tool_fail", "計画-実行: ツール未実行")
-
-            # action_completeシグナル
-            self._emit_signal("action_complete", action_goal[:50] if action_goal else "plan_execute")
-
-        except Exception as e:
-            import traceback
-            logger.error(f"計画-実行エラー: {e}\n{traceback.format_exc()}")
         finally:
             await self._broadcast(json.dumps({"type": "autonomous_think_end"}))
 
@@ -681,7 +463,7 @@ class Pipeline:
             step_history=step_history,
             last_full_result=last_full_result,
             had_output=had_output,
-            last_response="",
+            last_response=response,
             plan_text=plan_text,
             plan_stream=plan_response,
         )
@@ -807,14 +589,16 @@ class Pipeline:
 
         return result_text, action_status, had_output
 
-    def _build_planning_prompt(self, action_goal: str, tool_text: str, signal_summary: str) -> str:
+    def _build_planning_prompt(self, action_goal: str, tool_text: str, signal_summary: str,
+                               user_input: str = "") -> str:
         """計画フェーズ用プロンプト"""
         now = datetime.now().strftime('%Y年%m月%d日 %H:%M')
         goal_line = f"\n行動目標: {action_goal}" if action_goal else ""
         signal_line = f"\n{signal_summary}" if signal_summary else ""
+        user_line = f"\n\n【ユーザー入力】\n{user_input}" if user_input else ""
 
         return f"""【状況】
-日時: {now}{goal_line}{signal_line}
+日時: {now}{goal_line}{signal_line}{user_line}
 
 【利用可能ツール】
 {tool_text}
@@ -832,10 +616,12 @@ class Pipeline:
         self, tool_name: str, tool_info: dict, action_goal: str,
         previous_results: list[dict], signal_summary: str,
         round_idx: int, total_rounds: int,
+        user_input: str = "",
     ) -> str:
         """実行フェーズ用プロンプト（1ツール分）"""
         now = datetime.now().strftime('%Y年%m月%d日 %H:%M')
         goal_line = f"\n行動目標: {action_goal}" if action_goal else ""
+        user_line = f"\n\n【ユーザー入力】\n{user_input}" if user_input else ""
 
         # 前回までの結果
         prev_text = ""
@@ -855,7 +641,7 @@ class Pipeline:
             tool_desc += f"\n  引数: {args_desc}"
 
         return f"""【状況】
-日時: {now}{goal_line}
+日時: {now}{goal_line}{user_line}
 {prev_text}
 
 【タスク】
@@ -1185,9 +971,9 @@ class Pipeline:
     def _build_initial_prompt(
         self, action_goal: str, tool_text: str,
         memory_context: str = "", signal_summary: str = "",
-        bootstrap_hint: str = "",
+        bootstrap_hint: str = "", user_input: str = "",
     ) -> str:
-        """初回ラウンド用のプロンプト構築（マルチターンの起点）"""
+        """初回ラウンド用のプロンプト構築（フォールバック1ショット用）"""
         now = datetime.now().strftime('%Y年%m月%d日 %H:%M')
 
         ctx_parts = []
@@ -1202,6 +988,9 @@ class Pipeline:
         parts = [f"【状況】\n日時: {now}"]
         if action_goal:
             parts.append(f"行動目標: {action_goal}")
+
+        if user_input:
+            parts.append(f"\n【ユーザー入力】\n{user_input}")
 
         if ctx_text:
             parts.append(f"\n【コンテキスト】\n{ctx_text}")
