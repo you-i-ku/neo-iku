@@ -1162,13 +1162,8 @@ async function loadDevSettings() {
             devConcurrentToggle.checked = data.concurrent_mode;
         }
         if (data.motivation_energy !== undefined) {
-            statusEnergy.textContent = `⚡ ${data.motivation_energy}`;
-            if (data.energy_breakdown && Object.keys(data.energy_breakdown).length > 0) {
-                const lines = Object.entries(data.energy_breakdown)
-                    .sort((a, b) => b[1] - a[1])
-                    .map(([t, v]) => `${t}: ${v}`);
-                statusEnergy.title = `エネルギー内訳\n${lines.join("\n")}`;
-            }
+            const thr = data.motivation_threshold || 0;
+            updateMotivationEnergy(data.motivation_energy, thr, data.energy_breakdown);
         }
         // Ablationフラグ同期
         if (data.ablation) {
@@ -1378,7 +1373,7 @@ function renderReport(data) {
             <div class="report-bar-row"><span>タイマー</span><div class="report-bar"><div class="report-bar-fill" style="width:${ar.autonomous > 0 ? Math.round(tr.timer / ar.autonomous * 100) : 0}%;background:#6b7280"></div></div><span>${tr.timer}</span></div>
             ${tr.manual > 0 ? `<div class="report-bar-row"><span>手動</span><div class="report-bar"><div class="report-bar-fill" style="width:${ar.autonomous > 0 ? Math.round(tr.manual / ar.autonomous * 100) : 0}%;background:#8b5cf6"></div></div><span>${tr.manual}</span></div>` : ''}
         </div>
-    `);
+    `, "全行動のうち自律行動が占める割合。エネルギー駆動率は自律行動のうちタイマーではなく内発的動機で発火した割合");
 
     // 2. Tool Diversity
     const td = m.tool_diversity;
@@ -1388,30 +1383,24 @@ function renderReport(data) {
     let toolBars = topTools.map(([name, count]) =>
         `<div class="report-tool-row"><span class="report-tool-name">${escapeHtml(name)}</span><div class="report-bar"><div class="report-bar-fill tool" style="width:${Math.round(count / maxCount * 100)}%"></div></div><span>${count}</span></div>`
     ).join("");
-    html += renderMetricCard("ツール多様性", `H=${td.entropy.toFixed(2)} (${normEnt}%)`, toolBars);
+    html += renderMetricCard("ツール多様性", `H=${td.entropy.toFixed(2)} (${normEnt}%)`, toolBars, "使用ツールのシャノンエントロピー。高いほど多様なツールを使い分けている。100%は全ツール均等使用");
 
     // 3. Self-Evolution
     const se = m.self_evolution;
     let evoBars = Object.entries(se.changes_by_key).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([key, count]) =>
         `<div class="report-tool-row"><span class="report-tool-name">${escapeHtml(key)}</span><span>${count}</span></div>`
     ).join("");
-    html += renderMetricCard("自己進化", `${se.total_changes}回 / ${se.unique_keys}キー`, evoBars || '<div class="report-metric-empty">データなし</div>');
+    html += renderMetricCard("自己進化", `${se.total_changes}回 / ${se.unique_keys}キー`, evoBars || '<div class="report-metric-empty">データなし</div>', "self_modelの更新回数と変更されたキーの種類数。AIが自己理解をどれだけ更新しているか");
 
-    // 4. Error Recovery
-    const er = m.error_recovery;
-    const rrPct = Math.round(er.recovery_rate * 100);
-    html += renderMetricCard("エラー回復", `${rrPct}%`, `
-        <div class="report-stat-row"><span>総エラー</span><span>${er.total_errors}</span></div>
-        <div class="report-stat-row"><span>回復</span><span>${er.recovered}</span></div>
-    `);
-
-    // 5. Metacognitive Accuracy
+    // 4. Metacognitive Accuracy
     const mc = m.metacognitive_accuracy;
     const mcPct = Math.round(mc.success_rate * 100);
+    const avgSim = mc.avg_similarity != null ? `${Math.round(mc.avg_similarity * 100)}%` : "-";
     html += renderMetricCard("メタ認知精度", `${mcPct}%`, `
         <div class="report-stat-row"><span>予測回数</span><span>${mc.predictions_made}</span></div>
-        <div class="report-stat-row"><span>成功率</span><span>${mcPct}%</span></div>
-    `);
+        <div class="report-stat-row"><span>的中率（類似度≥0.5）</span><span>${mcPct}%</span></div>
+        <div class="report-stat-row"><span>平均類似度</span><span>${avgSim}</span></div>
+    `, "予測テキスト(expect=)と実際の結果のベクトル類似度で判定。類似度0.5以上を的中とカウント");
 
     // 6. Memory Utilization
     const mu = m.memory_utilization;
@@ -1420,14 +1409,14 @@ function renderReport(data) {
         <div class="report-stat-row"><span>記憶検索</span><span>${mu.memory_search}</span></div>
         <div class="report-stat-row"><span>日記</span><span>${mu.memory_write}</span></div>
         <div class="report-stat-row"><span>行動検索</span><span>${mu.action_search}</span></div>
-    `);
+    `, "search_memories・write_diary・search_action_logの使用回数。AIが過去の経験をどれだけ活用しているか");
 
     // 7. Principle Accumulation
     const pa = m.principle_accumulation;
     html += renderMetricCard("原則蒸留", `${pa.current_principles}個`, `
         <div class="report-stat-row"><span>蒸留回数</span><span>${pa.distillation_count}</span></div>
         <div class="report-stat-row"><span>現在の原則数</span><span>${pa.current_principles}</span></div>
-    `);
+    `, "行動の振り返りから抽出されたprinciples（特性・傾向）の数。10件蓄積で二次蒸留により統合・圧縮される");
 
     // 8. Intent Diversity
     if (m.intent_diversity) {
@@ -1436,21 +1425,21 @@ function renderReport(data) {
         html += renderMetricCard("意図宣言", `${idPct}%`, `
             <div class="report-stat-row"><span>意図あり</span><span>${id.with_intent} / ${id.total_actions}</span></div>
             <div class="report-stat-row"><span>ユニーク意図数</span><span>${id.unique_intents}</span></div>
-        `);
+        `, "ツール呼び出し時にintent=で行動意図を宣言した割合。AIが自分の行動理由を言語化しているかの指標");
     }
 
     // 9. Tool Entropy Time-Series
     if (m.tool_entropy_ts && m.tool_entropy_ts.days.length > 0) {
         const te = m.tool_entropy_ts;
         const lastE = te.days[te.days.length - 1].entropy;
-        html += renderMetricCard("エントロピー推移", `H=${lastE}`, renderSparkBars(te.days, "entropy", "#58a6ff"));
+        html += renderMetricCard("エントロピー推移", `H=${lastE}`, renderSparkBars(te.days, "entropy", "#58a6ff"), "日ごとのツール使用エントロピーの推移。上昇傾向なら行動パターンが多様化している");
     }
 
     // 10. Prediction Accuracy Time-Series
     if (m.prediction_accuracy_ts && m.prediction_accuracy_ts.days.length > 0) {
         const pa2 = m.prediction_accuracy_ts;
         const lastR = Math.round(pa2.days[pa2.days.length - 1].rate * 100);
-        html += renderMetricCard("予測精度推移", `${lastR}%`, renderSparkBars(pa2.days, "rate", "#3fb950"));
+        html += renderMetricCard("予測精度推移", `${lastR}%`, renderSparkBars(pa2.days, "rate", "#3fb950"), "日ごとの予測成功率の推移。上昇傾向ならAIの予測能力が改善している");
     }
 
     // 11. Energy Efficiency
@@ -1461,20 +1450,19 @@ function renderReport(data) {
         html += renderMetricCard("エネルギー効率", `${eePct}%`, `
             <div class="report-stat-row"><span>平均効率</span><span style="color:${eeColor}">${eePct}%</span></div>
             <div class="report-stat-row"><span>セッション数</span><span>${ee.session_count}</span></div>
-            <div style="font-size:10px;color:#484f58;margin-top:4px">ユニークツール率 = 多様な行動 / 全行動</div>
-        `);
+        `, "1セッション内でのユニークツール使用率。高いほど同じツールの繰り返しが少なく、エネルギーを効率的に使っている");
     }
 
     // 12. Self-Model Velocity
     if (m.self_model_velocity && m.self_model_velocity.days.length > 0) {
         const sv = m.self_model_velocity;
-        html += renderMetricCard("自己モデル変化速度", `${sv.avg_per_day}/日`, renderSparkBars(sv.days, "count", "#d29922"));
+        html += renderMetricCard("自己モデル変化速度", `${sv.avg_per_day}/日`, renderSparkBars(sv.days, "count", "#d29922"), "日ごとのself_model更新回数。AIがどれだけ頻繁に自己理解を書き換えているか");
     }
 
     // 13. Session Length Trend
     if (m.session_length_trend && m.session_length_trend.days.length > 0) {
         const sl = m.session_length_trend;
-        html += renderMetricCard("セッション長推移", `平均${sl.avg_length}`, renderSparkBars(sl.days, "avg_actions", "#a371f7"));
+        html += renderMetricCard("セッション長推移", `平均${sl.avg_length}`, renderSparkBars(sl.days, "avg_actions", "#a371f7"), "1セッションあたりの平均ツール実行数の推移。長いほど1回の行動が複雑になっている");
     }
 
     html += `</div>`;
@@ -1496,11 +1484,12 @@ function renderSparkBars(days, valueKey, color = "#8b5cf6") {
     return `<div class="sparkline">${bars}</div>${label}`;
 }
 
-function renderMetricCard(title, value, bodyHtml) {
+function renderMetricCard(title, value, bodyHtml, tooltip) {
+    const tip = tooltip ? `<span class="report-card-help" title="${escapeHtml(tooltip)}">?</span>` : "";
     return `
         <div class="report-card">
             <div class="report-card-header">
-                <span class="report-card-title">${title}</span>
+                <span class="report-card-title">${title}${tip}</span>
                 <span class="report-card-value">${value}</span>
             </div>
             <div class="report-card-body">${bodyHtml}</div>
@@ -1535,7 +1524,9 @@ function renderDistillationLog(data) {
         for (const p of data.current_principles) {
             const text = typeof p === "object" && p.text ? p.text : String(p);
             const date = typeof p === "object" && p.created ? p.created.slice(0, 16) : "";
-            html += `<li class="distillation-principle-item"><span>${escapeHtml(text)}</span>${date ? `<span class="distillation-principle-date">${date}</span>` : ""}</li>`;
+            const consolidated = typeof p === "object" && p.consolidated;
+            const badge = consolidated ? '<span class="badge-consolidated">統合</span>' : "";
+            html += `<li class="distillation-principle-item${consolidated ? " consolidated" : ""}"><span>${badge}${escapeHtml(text)}</span>${date ? `<span class="distillation-principle-date">${date}</span>` : ""}</li>`;
         }
         html += '</ul></div>';
     }
@@ -1594,7 +1585,7 @@ function buildDistillationSessionHtml(s) {
     }
 
     const distillHtml = s.distillation_response
-        ? `<div class="distillation-llm-response"><div class="distillation-llm-label">蒸留</div><pre>${escapeHtml(s.distillation_response)}</pre></div>`
+        ? `<details class="distillation-llm-response"><summary class="distillation-llm-label">蒸留応答</summary><pre>${escapeHtml(s.distillation_response)}</pre></details>`
         : "";
 
     return `
@@ -1644,7 +1635,7 @@ function updateDistillationResponse(convId, response, principle) {
 
     // 新しい蒸留応答を追加
     if (response) {
-        const distillHtml = `<div class="distillation-llm-response"><div class="distillation-llm-label">蒸留</div><pre>${escapeHtml(response)}</pre></div>`;
+        const distillHtml = `<details class="distillation-llm-response"><summary class="distillation-llm-label">蒸留応答</summary><pre>${escapeHtml(response)}</pre></details>`;
         wrapper.insertAdjacentHTML("beforeend", distillHtml);
     }
 }

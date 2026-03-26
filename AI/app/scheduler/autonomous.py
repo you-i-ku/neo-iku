@@ -109,6 +109,19 @@ class AutonomousScheduler:
         except RuntimeError:
             pass
 
+    def get_threshold(self) -> float:
+        """現在の発火閾値を返す（AI定義優先、なければデフォルト）"""
+        try:
+            from app.tools.builtin import _load_self_model
+            rules = _load_self_model().get("motivation_rules")
+            if isinstance(rules, dict):
+                t = rules.get("threshold")
+                if t is not None:
+                    return float(t)
+        except Exception:
+            pass
+        return self._calc_default_threshold()
+
     def _calc_default_threshold(self) -> float:
         """1回の行動に必要なエネルギー = コスト平均 × PLAN_MAX_TOOLS"""
         from config import PLAN_MAX_TOOLS

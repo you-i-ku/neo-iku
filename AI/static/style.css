@@ -1589,6 +1589,28 @@ details[open] > .dev-tool-result-summary::before {
     color: var(--text-secondary);
 }
 
+.report-card-help {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    margin-left: 5px;
+    border-radius: 50%;
+    border: 1px solid var(--border-secondary);
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--text-tertiary);
+    cursor: help;
+    vertical-align: middle;
+    flex-shrink: 0;
+}
+
+.report-card-help:hover {
+    color: var(--text-secondary);
+    border-color: var(--text-tertiary);
+}
+
 .report-card-value {
     font-size: 16px;
     font-weight: 700;
@@ -1838,6 +1860,22 @@ details.distillation-section[open] > .distillation-summary::before {
     border-bottom: none;
 }
 
+.distillation-principle-item.consolidated {
+    color: var(--accent-text, #a78bfa);
+}
+
+.badge-consolidated {
+    display: inline-block;
+    font-size: 9px;
+    padding: 1px 5px;
+    border-radius: 3px;
+    background: var(--accent, #8b5cf6);
+    color: #fff;
+    margin-right: 6px;
+    vertical-align: middle;
+    font-weight: 600;
+}
+
 .distillation-principle-date {
     font-size: 10px;
     color: var(--text-faint);
@@ -2015,10 +2053,24 @@ details.distillation-section[open] > .distillation-summary::before {
     border-left: 2px solid var(--accent);
 }
 .distillation-llm-label {
-    font-size: 10px;
+    font-size: 11px;
     color: var(--accent);
-    font-weight: bold;
-    margin-bottom: 4px;
+    font-weight: 600;
+    cursor: pointer;
+    list-style: none;
+}
+
+.distillation-llm-label::-webkit-details-marker {
+    display: none;
+}
+
+.distillation-llm-label::before {
+    content: "▶ ";
+    font-size: 9px;
+}
+
+.distillation-llm-response[open] > .distillation-llm-label::before {
+    content: "▼ ";
 }
 .distillation-llm-response pre {
     font-size: 11px;

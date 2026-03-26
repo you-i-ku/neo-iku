@@ -417,6 +417,7 @@ async def get_dev_settings():
         "autonomous_interval": scheduler._interval,
         "concurrent_mode": scheduler._concurrent_mode,
         "motivation_energy": round(scheduler._motivation_energy, 1),
+        "motivation_threshold": round(scheduler.get_threshold(), 1),
         "energy_breakdown": {k: round(v, 1) for k, v in scheduler._energy_breakdown.items()},
         "ablation": {
             "energy": scheduler.ablation_energy,
@@ -484,10 +485,7 @@ async def autonomy_report(
         # 3. Self-Evolution
         evolution = await _calc_self_evolution(session, date_from, date_to, pid)
 
-        # 4. Error Recovery
-        recovery = await _calc_error_recovery(session, date_from, date_to, pid)
-
-        # 5. Metacognitive Accuracy
+        # 4. Metacognitive Accuracy
         metacognition = await _calc_metacognition(session, date_from, date_to, pid)
 
         # 6. Memory Utilization
@@ -510,18 +508,19 @@ async def autonomy_report(
     total_actions = sum(diversity["distribution"].values()) if diversity["distribution"] else 0
     autonomy_ratio = autonomy["ratio"]
     normalized_entropy = (diversity["entropy"] / diversity["max_entropy"]) if diversity["max_entropy"] > 0 else 0
-    recovery_rate = recovery["recovery_rate"]
 
     # normalize self-evolution: cap at 50 changes
     normalized_self_evolution = min(evolution["total_changes"] / 50, 1.0) if evolution["total_changes"] > 0 else 0
     # normalize memory utilization: cap at 100 operations
     mem_total = memory["memory_search"] + memory["memory_write"] + memory["action_search"]
     normalized_memory_util = min(mem_total / 100, 1.0) if mem_total > 0 else 0
+    # normalize metacognition
+    normalized_metacognition = metacognition["success_rate"]
 
     autonomy_score = round(
         0.3 * autonomy_ratio
         + 0.2 * normalized_entropy
-        + 0.2 * recovery_rate
+        + 0.2 * normalized_metacognition
         + 0.15 * normalized_self_evolution
         + 0.15 * normalized_memory_util,
         3,
@@ -549,7 +548,6 @@ async def autonomy_report(
             "autonomy_ratio": autonomy,
             "tool_diversity": diversity,
             "self_evolution": evolution,
-            "error_recovery": recovery,
             "metacognitive_accuracy": metacognition,
             "memory_utilization": memory,
             "principle_accumulation": principles,
@@ -625,7 +623,9 @@ async def _calc_tool_diversity(session, date_from: str, date_to: str, pid: int |
         if p > 0:
             entropy -= p * math.log2(p)
 
-    max_entropy = round(math.log2(len(distribution)), 3) if len(distribution) > 1 else 0.0
+    from app.tools.registry import get_all_tools
+    total_tools = len(get_all_tools())
+    max_entropy = round(math.log2(total_tools), 3) if total_tools > 1 else 0.0
     return {"entropy": round(entropy, 3), "max_entropy": max_entropy, "distribution": distribution}
 
 
@@ -642,41 +642,42 @@ async def _calc_self_evolution(session, date_from: str, date_to: str, pid: int |
     return {"total_changes": total, "unique_keys": len(changes_by_key), "changes_by_key": changes_by_key}
 
 
-async def _calc_error_recovery(session, date_from: str, date_to: str, pid: int | None = None) -> dict:
-    pf, pp = _pid_filter("tool_actions", pid)
-    rows = (await session.execute(text(
-        "SELECT tool_name, status FROM tool_actions "
-        f"WHERE created_at BETWEEN :f AND :t{pf} "
-        "ORDER BY created_at"
-    ), {"f": date_from, "t": date_to, **pp})).fetchall()
-
-    total_errors = 0
-    recovered = 0
-
-    for i, row in enumerate(rows):
-        if row[1] == "error":
-            total_errors += 1
-            if i + 1 < len(rows):
-                next_row = rows[i + 1]
-                if next_row[1] != "error":
-                    recovered += 1
-
-    recovery_rate = round(recovered / total_errors, 3) if total_errors > 0 else 0.0
-    return {"total_errors": total_errors, "recovered": recovered, "recovery_rate": recovery_rate}
-
 
 async def _calc_metacognition(session, date_from: str, date_to: str, pid: int | None = None) -> dict:
+    """予測精度をベクトル類似度で判定（expect vs result_summary）"""
     pf, pp = _pid_filter("tool_actions", pid)
-    row = (await session.execute(text(
-        "SELECT COUNT(*) as total, "
-        "SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as success "
-        "FROM tool_actions "
-        f"WHERE expected_result IS NOT NULL AND created_at BETWEEN :f AND :t{pf}"
-    ), {"f": date_from, "t": date_to, **pp})).fetchone()
+    rows = (await session.execute(text(
+        "SELECT expected_result, result_summary FROM tool_actions "
+        f"WHERE expected_result IS NOT NULL AND result_summary IS NOT NULL AND created_at BETWEEN :f AND :t{pf}"
+    ), {"f": date_from, "t": date_to, **pp})).fetchall()
 
-    total = row[0] or 0
-    success = row[1] or 0
-    return {"predictions_made": total, "success_rate": round(success / total, 3) if total > 0 else 0.0}
+    total = len(rows)
+    if total == 0:
+        return {"predictions_made": 0, "success_rate": 0.0, "avg_similarity": 0.0}
+
+    # ベクトル類似度で判定（閾値0.5以上を「的中」）
+    from app.memory.vector_store import _embed_sync, cosine_similarity
+    success = 0
+    sim_sum = 0.0
+    for expect, result in rows:
+        vecs = _embed_sync([expect[:256], result[:256]])
+        if vecs and len(vecs) == 2:
+            sim = cosine_similarity(vecs[0], vecs[1])
+            sim_sum += sim
+            if sim >= 0.5:
+                success += 1
+        else:
+            # embedding不可時はスキップ（totalから除外）
+            total -= 1
+
+    if total == 0:
+        return {"predictions_made": len(rows), "success_rate": 0.0, "avg_similarity": 0.0}
+
+    return {
+        "predictions_made": total,
+        "success_rate": round(success / total, 3),
+        "avg_similarity": round(sim_sum / total, 3),
+    }
 
 
 async def _calc_memory_utilization(session, date_from: str, date_to: str, pid: int | None = None) -> dict:
