@@ -53,6 +53,8 @@ class PipelineResult:
     last_full_result: str = ""
     had_output: bool = False
     last_response: str = ""
+    plan_text: str = ""  # 計画フェーズのツールリスト（plan-execute時）
+    plan_stream: str = ""  # 計画フェーズのLLM生テキスト
 
 
 class Pipeline:
@@ -443,6 +445,7 @@ class Pipeline:
                         "result_summary": self._summarize_result(tool_name, result, action_status),
                         "expected": expected,
                         "intent": intent,
+                        "stream": response,
                     })
 
                 # ツール未実行検出
@@ -525,6 +528,8 @@ class Pipeline:
         last_full_result = ""
         had_output = False
         seen_tool_calls: set[str] = set()
+        plan_text = ""
+        plan_response = ""
 
         try:
             system_base = self._build_system_base()
@@ -621,6 +626,12 @@ class Pipeline:
                         had_output = True
                     round_results.append(result)
 
+                # step_historyにstream追加（このラウンドで追加されたエントリに）
+                for sh in step_history:
+                    if sh.get("stream") is None and sh.get("tool") == tool_name:
+                        sh["stream"] = exec_response
+                        break
+
                 # DB記録
                 combined = "\n\n".join(round_results) if round_results else ""
                 async with async_session() as session:
@@ -671,6 +682,8 @@ class Pipeline:
             last_full_result=last_full_result,
             had_output=had_output,
             last_response="",
+            plan_text=plan_text,
+            plan_stream=plan_response,
         )
 
     async def _execute_single_tool(

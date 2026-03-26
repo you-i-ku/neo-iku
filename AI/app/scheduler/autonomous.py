@@ -42,6 +42,7 @@ class AutonomousScheduler:
         self._last_trigger: str = "timer"  # "timer" / "energy" / "manual"
         self._pending_messages: list[dict] = []  # ユーザー入力キュー
         self._energy_breakdown: dict[str, float] = {}  # シグナル種別ごとのエネルギー貢献度
+        self._session_count: int = 0  # 自律行動セッション番号（起動ごとにリセット）
 
         # Ablationフラグ（ランタイムで切替可能）
         self.ablation_energy = ABLATION_ENERGY_SYSTEM
@@ -361,110 +362,255 @@ class AutonomousScheduler:
                 "type": "responding_end",
             }))
 
-        # 5. 振り返り (Reflect): 経験からの学び + 自己モデル更新検討
-        await self._reflect(selected_action, result, self_model, action_goal, selected_strategy)
+        # 5. 振り返り (Reflect): 経験からの学び + 自己モデル更新検討 + 行動ログ出力
+        # 自律行動のみセッション番号をインクリメント（チャット応答は含めない）
+        if final_source == "autonomous":
+            self._session_count += 1
+        await self._reflect(
+            selected_action, result, self_model, action_goal, selected_strategy,
+            session_num=self._session_count if final_source == "autonomous" else None,
+            trigger=trigger,
+            env_stimulus=env_stimulus if env_stimulus else None,
+        )
 
-    async def _reflect(self, selected_action: dict | None, result, self_model: dict, action_goal: str = "", selected_strategy: str | None = None):
-        """行動後の振り返り: 特性抽出 + 予測誤差シグナル"""
+    async def _reflect(self, selected_action: dict | None, result, self_model: dict, action_goal: str = "", selected_strategy: str | None = None,
+                       session_num: int | None = None, trigger: str = "timer", env_stimulus: str | None = None):
+        """行動後の振り返り: 特性抽出 + 予測誤差シグナル + 行動ログ出力"""
+        principle = None
+        raw_response = None
+
         if not self.ablation_distillation:
             logger.debug("蒸留無効（ablation）: 振り返りスキップ")
-            return
-        try:
-            if not result.step_history:
-                return
+        elif result.step_history:
+            try:
+                action_description = selected_action["description"] if selected_action else action_goal
+                if not action_description:
+                    tool_names = [s["tool"] for s in result.step_history if s.get("tool")]
+                    if tool_names:
+                        action_description = " → ".join(tool_names)
+                    else:
+                        action_description = ""
 
-            action_description = selected_action["description"] if selected_action else action_goal
-            if not action_description:
-                # 目標なしでもツール実行があれば、実行内容から説明を生成
-                tool_names = [s["tool"] for s in result.step_history if s.get("tool")]
-                if tool_names:
-                    action_description = " → ".join(tool_names)
+                if action_description:
+                    result_lines = []
+                    metacog_lines = []
+                    for s in result.step_history:
+                        result_lines.append(f"{s['tool']}: {s['result_summary']}")
+                        sint = s.get('intent')
+                        sexp = s.get('expected')
+                        sres = s.get('result_summary', '')
+                        if sint or sexp:
+                            parts = []
+                            if sint: parts.append(f"意図「{sint}」")
+                            if sexp: parts.append(f"予測「{sexp}」")
+                            parts.append(f"結果「{sres}」")
+                            line = f"{s['tool']}: " + " → ".join(parts)
+                            pairs = []
+                            if sint and sexp:
+                                pairs.append(f"  [意図→予測] 意図「{sint}」に対し予測「{sexp}」")
+                            if sint and sres:
+                                pairs.append(f"  [意図→結果] 意図「{sint}」に対し結果「{sres}」")
+                            if sexp and sres:
+                                pairs.append(f"  [予測→結果] 予測「{sexp}」に対し結果「{sres}」")
+                            if pairs:
+                                line += "\n" + "\n".join(pairs)
+                            metacog_lines.append(line)
+                    tool_results_text = "\n".join(result_lines)
+                    if result.last_full_result:
+                        tool_results_text += f"\n\n最後の結果:\n{result.last_full_result[:500]}"
+
+                    if tool_results_text:
+                        prediction_text = "\n".join(metacog_lines) if metacog_lines else ""
+
+                        has_error = any(
+                            s.get("result_summary", "").startswith("エラー") for s in result.step_history
+                        )
+                        if has_error:
+                            self.add_signal("tool_error", f"action={action_description[:50]}")
+
+                        drive = selected_action.get("drive", "") if selected_action else ""
+                        principle, raw_response = await self._reflect_on_action(
+                            action_description, tool_results_text, self_model, prediction_text,
+                            drive=drive, strategy=selected_strategy or ""
+                        )
+
+                        if raw_response and result.conv_id:
+                            try:
+                                from app.memory.database import async_session
+                                from sqlalchemy import text
+                                async with async_session() as session:
+                                    await session.execute(text(
+                                        "UPDATE conversations SET distillation_response = :resp WHERE id = :cid"
+                                    ), {"resp": raw_response, "cid": result.conv_id})
+                                    await session.commit()
+                            except Exception as e:
+                                logger.error(f"蒸留応答DB保存エラー: {e}")
+
+                            try:
+                                from app.pipeline import pipeline
+                                await pipeline._broadcast(json.dumps({
+                                    "type": "distillation_update",
+                                    "conv_id": result.conv_id,
+                                    "distillation_response": raw_response,
+                                    "principle": principle,
+                                }))
+                            except Exception as e:
+                                logger.error(f"蒸留更新WS通知エラー: {e}")
+
+                        if principle:
+                            self._save_principle(principle, self_model)
+                            logger.info(f"特性抽出: {principle}")
+
+                            from app.tools.builtin import _load_self_model
+                            fresh_model = _load_self_model()
+                            principles = fresh_model.get("principles", [])
+                            if isinstance(principles, list) and len(principles) >= 10:
+                                await self._consolidate_principles(fresh_model)
+            except Exception as e:
+                logger.error(f"振り返りフォールバック: {e}")
+
+        # 行動ログファイル出力（自律行動のみ）
+        if session_num is not None:
+            try:
+                from app.tools.builtin import _load_self_model as _load_sm
+                post_model = _load_sm()
+                self._write_action_log(
+                    session_num=session_num,
+                    trigger=trigger,
+                    env_stimulus=env_stimulus,
+                    self_model_before=self_model,
+                    self_model_after=post_model,
+                    result=result,
+                    principle=principle,
+                    distillation_response=raw_response,
+                )
+            except Exception as e:
+                logger.error(f"行動ログ出力エラー: {e}")
+
+    # --- 行動ログファイル出力 ---
+
+    def _write_action_log(self, session_num: int, trigger: str, env_stimulus: str | None,
+                          self_model_before: dict, self_model_after: dict,
+                          result, principle: str | None, distillation_response: str | None):
+        """自律行動の行動ログをファイルに追記（日付ごと）"""
+        from app.persona.system_prompt import get_active_persona
+        import os
+
+        log_dir = DATA_DIR / "action_logs"
+        log_dir.mkdir(exist_ok=True)
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        log_path = log_dir / f"{today}.md"
+        now = datetime.now().strftime("%H:%M:%S")
+
+        # エネルギー情報
+        threshold = self._calc_default_threshold()
+        energy_info = f"energy: {self._motivation_energy:.1f}/{threshold:.1f}"
+
+        # ペルソナ情報
+        persona = get_active_persona()
+        persona_line = f"persona: {persona['display_name']}" if persona else "persona: ノーマル"
+
+        lines = []
+        lines.append(f"=====================================")
+        lines.append(f"#{session_num} 自律行動 | {today} {now}")
+        lines.append(f"trigger: {trigger} | {energy_info}")
+        lines.append(f"{persona_line}")
+        lines.append(f"=====================================")
+        lines.append("")
+
+        # self_model（行動前）
+        lines.append("【self_model（行動前）】")
+        if self_model_before:
+            for k, v in self_model_before.items():
+                if k == "principles":
+                    plist = v if isinstance(v, list) else []
+                    lines.append(f"- principles: {len(plist)}件")
+                elif k == "__free_text__":
+                    text_preview = str(v)[:100]
+                    lines.append(f"- __free_text__: {text_preview}")
+                elif k == "motivation_rules":
+                    lines.append(f"- motivation_rules: (定義済み)")
                 else:
-                    return
+                    lines.append(f"- {k}: {v}")
+        else:
+            lines.append("(空)")
+        lines.append("")
 
-            result_lines = []
-            metacog_lines = []
-            for s in result.step_history:
-                result_lines.append(f"{s['tool']}: {s['result_summary']}")
-                intent = s.get('intent')
-                expected = s.get('expected')
-                result_summary = s.get('result_summary', '')
-                if intent or expected:
-                    parts = []
-                    if intent: parts.append(f"意図「{intent}」")
-                    if expected: parts.append(f"予測「{expected}」")
-                    parts.append(f"結果「{result_summary}」")
-                    line = f"{s['tool']}: " + " → ".join(parts)
-                    # ペアワイズ比較（2要素以上ある場合のみ）
-                    pairs = []
-                    if intent and expected:
-                        pairs.append(f"  [意図→予測] 意図「{intent}」に対し予測「{expected}」")
-                    if intent and result_summary:
-                        pairs.append(f"  [意図→結果] 意図「{intent}」に対し結果「{result_summary}」")
-                    if expected and result_summary:
-                        pairs.append(f"  [予測→結果] 予測「{expected}」に対し結果「{result_summary}」")
-                    if pairs:
-                        line += "\n" + "\n".join(pairs)
-                    metacog_lines.append(line)
-            tool_results_text = "\n".join(result_lines)
-            if result.last_full_result:
-                tool_results_text += f"\n\n最後の結果:\n{result.last_full_result[:500]}"
-            if not tool_results_text:
-                return
+        # 環境刺激
+        if env_stimulus:
+            lines.append(f"【環境刺激】")
+            lines.append(f"~ {env_stimulus}")
+            lines.append("")
 
-            prediction_text = "\n".join(metacog_lines) if metacog_lines else ""
+        # 計画
+        if result.plan_text:
+            lines.append("【計画】")
+            for i, tool in enumerate(result.plan_text.split(" → "), 1):
+                lines.append(f"{i}. {tool}")
+            if result.plan_stream:
+                lines.append("  --- plan stream ---")
+                for pl in result.plan_stream.strip().split("\n"):
+                    lines.append(f"  {pl}")
+                lines.append("  --- /plan stream ---")
+            lines.append("")
 
-            # ツール実行エラーがあった場合のシグナル
-            has_error = any(
-                s.get("result_summary", "").startswith("エラー") for s in result.step_history
-            )
-            if has_error:
-                self.add_signal("tool_error", f"action={action_description[:50]}")
+        # 実行
+        if result.step_history:
+            lines.append("【実行】")
+            for i, s in enumerate(result.step_history, 1):
+                tool = s.get("tool", "?")
+                args = s.get("args_summary", "")
+                lines.append(f"[R{i}] {tool}" + (f" {args}" if args else ""))
+                if s.get("intent"):
+                    lines.append(f"  intent: {s['intent']}")
+                if s.get("expected"):
+                    lines.append(f"  expect: {s['expected']}")
+                lines.append(f"  result: {s.get('result_summary', '')}")
+                # stream
+                stream = s.get("stream")
+                if stream:
+                    lines.append("  --- stream ---")
+                    for sl in stream.strip().split("\n"):
+                        lines.append(f"  {sl}")
+                    lines.append("  --- /stream ---")
+                lines.append("")
 
-            # 特性抽出
-            drive = selected_action.get("drive", "") if selected_action else ""
-            principle, raw_response = await self._reflect_on_action(
-                action_description, tool_results_text, self_model, prediction_text,
-                drive=drive, strategy=selected_strategy or ""
-            )
-
-            # 蒸留LLM応答をDB保存
-            if raw_response and result.conv_id:
-                try:
-                    from app.memory.database import async_session
-                    from sqlalchemy import text
-                    async with async_session() as session:
-                        await session.execute(text(
-                            "UPDATE conversations SET distillation_response = :resp WHERE id = :cid"
-                        ), {"resp": raw_response, "cid": result.conv_id})
-                        await session.commit()
-                except Exception as e:
-                    logger.error(f"蒸留応答DB保存エラー: {e}")
-
-                # 蒸留完了をWS通知
-                try:
-                    from app.pipeline import pipeline
-                    await pipeline._broadcast(json.dumps({
-                        "type": "distillation_update",
-                        "conv_id": result.conv_id,
-                        "distillation_response": raw_response,
-                        "principle": principle,
-                    }))
-                except Exception as e:
-                    logger.error(f"蒸留更新WS通知エラー: {e}")
-
+        # 蒸留
+        if principle or distillation_response:
+            lines.append("【蒸留】")
             if principle:
-                self._save_principle(principle, self_model)
-                logger.info(f"特性抽出: {principle}")
+                lines.append(f"principle: {principle}")
+            if distillation_response:
+                lines.append(f"  --- distillation response ---")
+                for dl in distillation_response.strip().split("\n"):
+                    lines.append(f"  {dl}")
+                lines.append(f"  --- /distillation response ---")
+            lines.append("")
 
-                # 二次蒸留: principlesが閾値に達したら統合
-                from app.tools.builtin import _load_self_model
-                fresh_model = _load_self_model()
-                principles = fresh_model.get("principles", [])
-                if isinstance(principles, list) and len(principles) >= 10:
-                    await self._consolidate_principles(fresh_model)
-        except Exception as e:
-            logger.error(f"振り返りフォールバック: {e}")
+        # self_model（行動後）— 変化があった場合のみ
+        if self_model_after != self_model_before:
+            lines.append("【self_model（行動後）】※変化あり")
+            for k, v in self_model_after.items():
+                if k == "principles":
+                    plist = v if isinstance(v, list) else []
+                    lines.append(f"- principles: {len(plist)}件")
+                elif k == "__free_text__":
+                    text_preview = str(v)[:100]
+                    lines.append(f"- __free_text__: {text_preview}")
+                elif k == "motivation_rules":
+                    lines.append(f"- motivation_rules: (定義済み)")
+                else:
+                    lines.append(f"- {k}: {v}")
+            lines.append("")
+
+        lines.append("")  # セッション間の空行
+
+        # ファイル追記
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        logger.info(f"行動ログ出力: #{session_num} → {log_path.name}")
 
     # --- Phase 1: 構造化意思決定 ---
 
