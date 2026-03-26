@@ -29,8 +29,8 @@ def get_all_tools() -> dict:
     return dict(_tools)
 
 
-def build_tools_prompt() -> str:
-    """システムプロンプトに追加するツール説明文を生成"""
+def build_tools_prompt(mirror_seed: int | None = None) -> str:
+    """システムプロンプトに追加するツール説明文を生成。mirror_seedでカテゴリ順序を変動"""
     if not _tools:
         return ""
 
@@ -45,6 +45,12 @@ def build_tools_prompt() -> str:
         ("出力", ["output_UI"]),
         ("待機", ["non_response"]),
     ]
+
+    # 鏡の値でカテゴリ順序をシャッフル（primacy bias活用）
+    if mirror_seed is not None:
+        import random as _rng
+        r = _rng.Random(mirror_seed)
+        r.shuffle(_categories)
 
     lines = [
         "目的に合うツールを精査して選び、呼び出してください。",
@@ -316,8 +322,8 @@ def parse_tool_calls(text: str) -> list[tuple[str, dict]]:
     return filtered
 
 
-def build_planning_prompt() -> str:
-    """計画フェーズ用のツールリスト（引数なし、ツール名+説明のみ）"""
+def build_planning_prompt(mirror_seed: int | None = None) -> str:
+    """計画フェーズ用のツールリスト（引数なし、ツール名+説明のみ）。mirror_seedでカテゴリ順序を変動"""
     if not _tools:
         return ""
 
@@ -331,6 +337,12 @@ def build_planning_prompt() -> str:
         ("出力", ["output_UI"]),
         ("待機", ["non_response"]),
     ]
+
+    # 鏡の値でカテゴリ順序をシャッフル
+    if mirror_seed is not None:
+        import random as _rng
+        r = _rng.Random(mirror_seed)
+        r.shuffle(_categories)
 
     lines = []
     categorized = set()

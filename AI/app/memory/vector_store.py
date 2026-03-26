@@ -34,7 +34,7 @@ def _load_bge_m3():
         tok_path = hf_hub_download("BAAI/bge-m3", "onnx/tokenizer.json")
 
         _onnx_tokenizer = Tokenizer.from_file(tok_path)
-        _onnx_tokenizer.enable_padding(pad_id=1, pad_token="<pad>", length=128)
+        _onnx_tokenizer.enable_padding(pad_id=1, pad_token="<pad>")
         _onnx_tokenizer.enable_truncation(max_length=512)
 
         _onnx_session = ort.InferenceSession(

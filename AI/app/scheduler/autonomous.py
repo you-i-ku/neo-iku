@@ -314,6 +314,44 @@ class AutonomousScheduler:
         bootstrap_hint = self._build_bootstrap_hint(self_model)
         memory_context = ""  # AIが自分でsearch_memoriesツールを使って取得する
 
+        # 鏡の計算（環境刺激 × 行動メトリクス × embedding）
+        mirror_display = ""
+        mirror_values = []
+        if env_stimulus:
+            try:
+                from app.tools.builtin import _save_self_model
+                env_words = [w.strip() for w in env_stimulus.split(",")]
+                mirror_data = await self._compute_mirror(env_words)
+                mirror_values = mirror_data["values"]
+                # ツール順序を再現（seedから決定的に算出）
+                tool_order = None
+                if mirror_values:
+                    mirror_seed = int(sum(abs(v) * 10000 for v in mirror_values)) % (2**31)
+                    _cat_names = ["ファイル", "記憶", "自己モデル", "外部", "実行・拡張", "システム", "出力", "待機"]
+                    r = random.Random(mirror_seed)
+                    r.shuffle(_cat_names)
+                    tool_order = _cat_names
+
+                # self_modelに保存（current → previous）
+                current_mirror = self_model.get("mirror", {})
+                self_model["mirror"] = {
+                    "previous": current_mirror.get("current"),
+                    "current": {
+                        "values": mirror_values,
+                        "words": env_words,
+                        "raw_metrics": mirror_data["raw_metrics"],
+                        "tool_order": tool_order,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                }
+                _save_self_model(self_model, changed_key="mirror")
+                # 表示文字列
+                vals_str = ", ".join(f"{v:.4f}" for v in mirror_values)
+                mirror_display = f"内部観測:\n  {env_stimulus}: [{vals_str}]"
+                logger.info(f"鏡: {env_stimulus} → [{vals_str}]")
+            except Exception as e:
+                logger.error(f"鏡の計算エラー: {e}")
+
         # 2. 方向付け (Orient): 戦略選択
         selected_strategy = None
         try:
@@ -360,6 +398,8 @@ class AutonomousScheduler:
             selected_action=selected_action,
             trigger=trigger,
             user_input=user_input_text,
+            mirror_display=mirror_display,
+            mirror_values=mirror_values,
         )
         result = await pipeline.submit(request)
         self._last_conv_id = result.conv_id  # 次のアクションでの継続用に保持
@@ -933,11 +973,8 @@ class AutonomousScheduler:
     ]
 
     def _generate_env_stimulus(self) -> str | None:
-        """1-3語をそれぞれ独立なランダムプールから引く。確率自体も毎回揺らぐ"""
+        """毎セッション1-3語をそれぞれ独立なランダムプールから引く"""
         if not ENV_STIMULUS_ENABLED:
-            return None
-        threshold = random.uniform(0, ENV_STIMULUS_PROBABILITY * 2)
-        if random.random() > threshold:
             return None
 
         n_words = random.randint(1, 3)
@@ -993,6 +1030,102 @@ class AutonomousScheduler:
     def _stim_entropy(self) -> str:
         import os
         return os.urandom(8).hex()
+
+    # --- 鏡 (Mirror): 行動統計 × 環境語embedding ---
+
+    async def _calc_behavioral_metrics(self) -> list[float]:
+        """直近行動履歴から5メトリクス: [tool_entropy, pred_accuracy, sm_delta, memory_ops, success_rate]"""
+        from app.memory.database import async_session
+        from sqlalchemy import text as sql_text
+
+        try:
+            async with async_session() as session:
+                rows = (await session.execute(sql_text(
+                    "SELECT tool_name, expected_result, status, result_summary "
+                    "FROM tool_actions ORDER BY id DESC LIMIT 50"
+                ))).fetchall()
+        except Exception as e:
+            logger.warning(f"行動メトリクス取得エラー: {e}")
+            return [0.0, 0.0, 0.0, 0.0, 0.0]
+
+        if not rows:
+            return [0.0, 0.0, 0.0, 0.0, 0.0]
+
+        total = len(rows)
+        tool_counts: dict[str, int] = {}
+        pred_count = 0
+        sm_delta = 0
+        memory_ops = 0
+        success_count = 0
+        error_count = 0
+        fail_count = 0
+
+        for row in rows:
+            name = row[0]
+            tool_counts[name] = tool_counts.get(name, 0) + 1
+            if row[1]:  # expected_result
+                pred_count += 1
+            if name == "update_self_model":
+                sm_delta += 1
+            if name in ("search_memories", "write_diary", "search_action_log"):
+                memory_ops += 1
+            # status判定
+            status = row[2] or "success"
+            result_summary = row[3] or ""
+            if result_summary.startswith("[system] tool実行不可"):
+                fail_count += 1
+            elif status == "error":
+                error_count += 1
+            else:
+                success_count += 1
+
+        # 1. Tool entropy (Shannon entropy)
+        entropy = 0.0
+        for count in tool_counts.values():
+            p = count / total
+            if p > 0:
+                entropy -= p * math.log2(p)
+
+        # 5. Success rate (成功率。エラー・失敗は含まない)
+        success_rate = success_count / total
+
+        logger.debug(
+            f"行動メトリクス: total={total} success={success_count} "
+            f"error={error_count} fail={fail_count}"
+        )
+
+        return [
+            round(entropy, 4),
+            round(pred_count / total, 4),
+            round(sm_delta / total, 4),
+            round(memory_ops / total, 4),
+            round(success_rate, 4),
+        ]
+
+    async def _compute_mirror(self, env_words: list[str]) -> dict:
+        """行動メトリクス × 環境語embedding → 鏡の値"""
+        metrics = await self._calc_behavioral_metrics()
+
+        try:
+            from app.memory.vector_store import _embed_sync
+            combined_text = ", ".join(env_words)
+            loop = asyncio.get_event_loop()
+            embeddings = await loop.run_in_executor(None, _embed_sync, [combined_text])
+
+            if embeddings and embeddings[0]:
+                emb = embeddings[0]
+                dim = len(emb)
+                # 5次元を等間隔で抽出
+                indices = [int(i * dim / 5) for i in range(5)]
+                emb_5 = [emb[idx] for idx in indices]
+                # element-wise multiply
+                mirror = [round(m * e, 4) for m, e in zip(metrics, emb_5)]
+                return {"values": mirror, "words": env_words, "raw_metrics": metrics}
+        except Exception as e:
+            logger.warning(f"鏡のembedding変換エラー: {e}")
+
+        # フォールバック: embeddingなしの生メトリクス
+        return {"values": metrics, "words": env_words, "raw_metrics": metrics}
 
     def _build_bootstrap_hint(self, self_model: dict) -> str:
         # ヒントなし: AIが自分のコードを読んで仕組みを発見する

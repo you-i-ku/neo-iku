@@ -494,8 +494,8 @@ async def autonomy_report(
         # 7. Principle Accumulation
         principles = await _calc_principle_accumulation(session, date_from, date_to, pid)
 
-        # 8. Intent Diversity
-        intent_div = await _calc_intent_diversity(session, date_from, date_to, pid)
+        # 8. Intent Coherence（意図達成度）
+        intent_coh = await _calc_intent_coherence(session, date_from, date_to, pid)
 
         # 9-13. Time-series metrics
         tool_entropy_ts = await _calc_tool_entropy_timeseries(session, date_from, date_to, pid)
@@ -551,7 +551,7 @@ async def autonomy_report(
             "metacognitive_accuracy": metacognition,
             "memory_utilization": memory,
             "principle_accumulation": principles,
-            "intent_diversity": intent_div,
+            "intent_coherence": intent_coh,
             "tool_entropy_ts": tool_entropy_ts,
             "prediction_accuracy_ts": prediction_ts,
             "energy_efficiency": energy_eff,
@@ -715,33 +715,38 @@ async def _calc_principle_accumulation(session, date_from: str, date_to: str, pi
     return {"distillation_count": distillation_count, "current_principles": current}
 
 
-async def _calc_intent_diversity(session, date_from: str, date_to: str, pid: int | None = None) -> dict:
-    """intent使用率 + ユニーク意図数"""
+async def _calc_intent_coherence(session, date_from: str, date_to: str, pid: int | None = None) -> dict:
+    """意図達成度: intent vs result_summaryのベクトル類似度"""
     pf, pp = _pid_filter("tool_actions", pid)
-    params = {"f": date_from, "t": date_to, **pp}
+    rows = (await session.execute(text(
+        "SELECT intent, result_summary FROM tool_actions "
+        f"WHERE intent IS NOT NULL AND intent != '' AND result_summary IS NOT NULL AND created_at BETWEEN :f AND :t{pf}"
+    ), {"f": date_from, "t": date_to, **pp})).fetchall()
 
-    row = (await session.execute(text(
-        "SELECT COUNT(*) as total, "
-        "SUM(CASE WHEN intent IS NOT NULL AND intent != '' THEN 1 ELSE 0 END) as with_intent "
-        "FROM tool_actions "
-        f"WHERE created_at BETWEEN :f AND :t{pf}"
-    ), params)).fetchone()
+    total = len(rows)
+    if total == 0:
+        return {"intents_made": 0, "achievement_rate": 0.0, "avg_similarity": 0.0}
 
-    total = row[0] or 0
-    with_intent = row[1] or 0
-    usage_rate = round(with_intent / total, 3) if total > 0 else 0.0
+    from app.memory.vector_store import _embed_sync, cosine_similarity
+    achieved = 0
+    sim_sum = 0.0
+    for intent_text, result in rows:
+        vecs = _embed_sync([intent_text[:256], result[:256]])
+        if vecs and len(vecs) == 2:
+            sim = cosine_similarity(vecs[0], vecs[1])
+            sim_sum += sim
+            if sim >= 0.5:
+                achieved += 1
+        else:
+            total -= 1
 
-    unique_row = (await session.execute(text(
-        "SELECT COUNT(DISTINCT intent) FROM tool_actions "
-        f"WHERE intent IS NOT NULL AND intent != '' AND created_at BETWEEN :f AND :t{pf}"
-    ), params)).fetchone()
-    unique_intents = unique_row[0] if unique_row else 0
+    if total == 0:
+        return {"intents_made": len(rows), "achievement_rate": 0.0, "avg_similarity": 0.0}
 
     return {
-        "total_actions": total,
-        "with_intent": with_intent,
-        "usage_rate": usage_rate,
-        "unique_intents": unique_intents,
+        "intents_made": total,
+        "achievement_rate": round(achieved / total, 3),
+        "avg_similarity": round(sim_sum / total, 3),
     }
 
 

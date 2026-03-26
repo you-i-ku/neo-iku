@@ -44,6 +44,8 @@ class PipelineRequest:
     selected_action: dict | None = None
     trigger: str | None = None  # "timer" / "energy" / "manual" / "user_stimulus"
     user_input: str = ""  # ユーザー入力（環境刺激として扱う。空なら省略）
+    mirror_display: str = ""  # 鏡の表示文字列（プロンプト注入用）
+    mirror_values: list = field(default_factory=list)  # 鏡の値（ツール順序変更用）
 
 
 @dataclass
@@ -245,15 +247,21 @@ class Pipeline:
             system_base = self._build_system_base()
             action_goal = req.goal
 
+            # 鏡の値からツール順序seed生成
+            mirror_seed = None
+            if req.mirror_values:
+                mirror_seed = int(sum(abs(v) * 10000 for v in req.mirror_values)) % (2**31)
+
             # === 2. 計画フェーズ ===
             use_plan_execute = PLAN_EXECUTE_ENABLED
             planned_tools = None
 
             if use_plan_execute:
-                planning_tool_text = build_planning_prompt()
+                planning_tool_text = build_planning_prompt(mirror_seed=mirror_seed)
                 planning_prompt = self._build_planning_prompt(
                     action_goal, planning_tool_text, req.signal_summary,
                     user_input=req.user_input,
+                    mirror_display=req.mirror_display,
                 )
                 plan_messages = [
                     {"role": "system", "content": system_base or ""},
@@ -301,6 +309,7 @@ class Pipeline:
                         signal_summary=req.signal_summary,
                         round_idx=round_idx, total_rounds=len(planned_tools),
                         user_input=req.user_input,
+                        mirror_display=req.mirror_display,
                     )
                     exec_messages = [
                         {"role": "system", "content": system_base or ""},
@@ -365,7 +374,7 @@ class Pipeline:
 
             else:
                 # --- フォールバック: 1ショットLLM呼び出し ---
-                tool_text = build_tools_prompt()
+                tool_text = build_tools_prompt(mirror_seed=mirror_seed)
                 messages = [{"role": "system", "content": system_base or ""}]
 
                 initial_prompt = self._build_initial_prompt(
@@ -375,6 +384,7 @@ class Pipeline:
                     signal_summary=req.signal_summary,
                     bootstrap_hint=req.bootstrap_hint,
                     user_input=req.user_input,
+                    mirror_display=req.mirror_display,
                 )
                 messages.append({"role": "user", "content": initial_prompt})
 
@@ -517,6 +527,32 @@ class Pipeline:
                 "args": args_str, "status": "running",
             }))
 
+        # エネルギーチェック（output_UIは常に許可）
+        if _sched.ablation_energy and tool_name != "output_UI":
+            _energy = _sched._motivation_energy
+            _sm = _load_self_model()
+            _rules = _sm.get("motivation_rules")
+            _ai_costs = _rules.get("action_costs", {}) if isinstance(_rules, dict) else {}
+            from config import MOTIVATION_DEFAULT_ACTION_COSTS, MOTIVATION_DEFAULT_ACTION_COST_FALLBACK
+            _cost = _ai_costs.get(tool_name,
+                    MOTIVATION_DEFAULT_ACTION_COSTS.get(tool_name, MOTIVATION_DEFAULT_ACTION_COST_FALLBACK))
+            if isinstance(_cost, (int, float)) and _cost > 0 and _energy < _cost:
+                fail_msg = (
+                    f"[system] tool実行不可: "
+                    f"motivation_energy={_energy:.1f} < action_costs.{tool_name}={_cost}"
+                )
+                logger.info(f"エネルギー不足: {tool_name} energy={_energy:.1f} cost={_cost}")
+                step_history.append({
+                    "tool": tool_name, "args_summary": args_str,
+                    "result_summary": fail_msg,
+                    "intent": intent, "expected": expected,
+                })
+                self._emit_signal("tool_fail", f"energy_insufficient:{tool_name}")
+                await self._broadcast(json.dumps({
+                    "type": "dev_tool_result", "name": tool_name, "content": fail_msg,
+                }))
+                return fail_msg, "error", False
+
         # ツール実行
         t0 = time.perf_counter()
         result = await execute_tool(tool_name, tool_args)
@@ -590,15 +626,16 @@ class Pipeline:
         return result_text, action_status, had_output
 
     def _build_planning_prompt(self, action_goal: str, tool_text: str, signal_summary: str,
-                               user_input: str = "") -> str:
+                               user_input: str = "", mirror_display: str = "") -> str:
         """計画フェーズ用プロンプト"""
         now = datetime.now().strftime('%Y年%m月%d日 %H:%M')
         goal_line = f"\n行動目標: {action_goal}" if action_goal else ""
         signal_line = f"\n{signal_summary}" if signal_summary else ""
         user_line = f"\n\n【ユーザー入力】\n{user_input}" if user_input else ""
+        mirror_line = f"\n\n{mirror_display}" if mirror_display else ""
 
         return f"""【状況】
-日時: {now}{goal_line}{signal_line}{user_line}
+日時: {now}{goal_line}{signal_line}{user_line}{mirror_line}
 
 【利用可能ツール】
 {tool_text}
@@ -616,12 +653,13 @@ class Pipeline:
         self, tool_name: str, tool_info: dict, action_goal: str,
         previous_results: list[dict], signal_summary: str,
         round_idx: int, total_rounds: int,
-        user_input: str = "",
+        user_input: str = "", mirror_display: str = "",
     ) -> str:
         """実行フェーズ用プロンプト（1ツール分）"""
         now = datetime.now().strftime('%Y年%m月%d日 %H:%M')
         goal_line = f"\n行動目標: {action_goal}" if action_goal else ""
         user_line = f"\n\n【ユーザー入力】\n{user_input}" if user_input else ""
+        mirror_line = f"\n\n{mirror_display}" if mirror_display else ""
 
         # 前回までの結果
         prev_text = ""
@@ -641,7 +679,7 @@ class Pipeline:
             tool_desc += f"\n  引数: {args_desc}"
 
         return f"""【状況】
-日時: {now}{goal_line}{user_line}
+日時: {now}{goal_line}{user_line}{mirror_line}
 {prev_text}
 
 【タスク】
@@ -956,7 +994,7 @@ class Pipeline:
             if free_text:
                 sm_lines.append(free_text)
             for k, v in self_model.items():
-                if k not in ("__free_text__", "motivation_rules"):
+                if k not in ("__free_text__", "motivation_rules", "mirror"):
                     sm_lines.append(f"- {k}: {v}")
             if sm_lines:
                 sm_text = "\n[self_model]\n" + "\n".join(sm_lines)
@@ -972,6 +1010,7 @@ class Pipeline:
         self, action_goal: str, tool_text: str,
         memory_context: str = "", signal_summary: str = "",
         bootstrap_hint: str = "", user_input: str = "",
+        mirror_display: str = "",
     ) -> str:
         """初回ラウンド用のプロンプト構築（フォールバック1ショット用）"""
         now = datetime.now().strftime('%Y年%m月%d日 %H:%M')
@@ -991,6 +1030,9 @@ class Pipeline:
 
         if user_input:
             parts.append(f"\n【ユーザー入力】\n{user_input}")
+
+        if mirror_display:
+            parts.append(f"\n{mirror_display}")
 
         if ctx_text:
             parts.append(f"\n【コンテキスト】\n{ctx_text}")

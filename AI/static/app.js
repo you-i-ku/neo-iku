@@ -1418,14 +1418,15 @@ function renderReport(data) {
         <div class="report-stat-row"><span>現在の原則数</span><span>${pa.current_principles}</span></div>
     `, "行動の振り返りから抽出されたprinciples（特性・傾向）の数。10件蓄積で二次蒸留により統合・圧縮される");
 
-    // 8. Intent Diversity
-    if (m.intent_diversity) {
-        const id = m.intent_diversity;
-        const idPct = Math.round(id.usage_rate * 100);
-        html += renderMetricCard("意図宣言", `${idPct}%`, `
-            <div class="report-stat-row"><span>意図あり</span><span>${id.with_intent} / ${id.total_actions}</span></div>
-            <div class="report-stat-row"><span>ユニーク意図数</span><span>${id.unique_intents}</span></div>
-        `, "ツール呼び出し時にintent=で行動意図を宣言した割合。AIが自分の行動理由を言語化しているかの指標");
+    // 8. Intent Coherence
+    if (m.intent_coherence) {
+        const ic = m.intent_coherence;
+        const icPct = Math.round(ic.achievement_rate * 100);
+        html += renderMetricCard("意図達成度", `${icPct}%`, `
+            <div class="report-stat-row"><span>意図宣言数</span><span>${ic.intents_made}</span></div>
+            <div class="report-stat-row"><span>達成(≥0.5)</span><span>${Math.round(ic.achievement_rate * ic.intents_made)} / ${ic.intents_made}</span></div>
+            <div class="report-stat-row"><span>平均類似度</span><span>${ic.avg_similarity}</span></div>
+        `, "intent=テキストと実行結果のベクトル類似度。行動が意図通りの結果を得たかの指標");
     }
 
     // 9. Tool Entropy Time-Series
