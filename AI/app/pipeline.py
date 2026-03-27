@@ -27,7 +27,7 @@ from app.tools.builtin import (
     execute_pending_create_tool, cancel_pending_create_tool,
 )
 from app.memory.store import get_conversation_messages
-from config import BASE_DIR, EXEC_CODE_TIMEOUT, CONTEXT_KEEP_ROUNDS, CHAT_HISTORY_MESSAGES, TOOL_MAX_CALLS_PER_RESPONSE, TOOL_SAME_NAME_LIMIT, PLAN_EXECUTE_ENABLED, PLAN_MAX_TOOLS
+from config import BASE_DIR, EXEC_CODE_TIMEOUT, CONTEXT_KEEP_ROUNDS, CHAT_HISTORY_MESSAGES, TOOL_MAX_CALLS_PER_RESPONSE, TOOL_SAME_NAME_LIMIT, PLAN_EXECUTE_ENABLED, PLAN_MAX_TOOLS, STRATEGY_CANDIDATES
 
 logger = logging.getLogger("iku.pipeline")
 
@@ -44,8 +44,7 @@ class PipelineRequest:
     selected_action: dict | None = None
     trigger: str | None = None  # "timer" / "energy" / "manual" / "user_stimulus"
     user_input: str = ""  # ユーザー入力（環境刺激として扱う。空なら省略）
-    mirror_display: str = ""  # 鏡の表示文字列（プロンプト注入用）
-    mirror_values: list = field(default_factory=list)  # 鏡の値（ツール順序変更用）
+    mirror_values: list = field(default_factory=list)  # 鏡の値（ツール順序変更・戦略選択用）
 
 
 @dataclass
@@ -58,6 +57,8 @@ class PipelineResult:
     last_response: str = ""
     plan_text: str = ""  # 計画フェーズのツールリスト（plan-execute時）
     plan_stream: str = ""  # 計画フェーズのLLM生テキスト
+    strategy_text: str = ""  # 選択された戦略テキスト
+    strategy_candidates: list = field(default_factory=list)  # 戦略候補一覧
 
 
 class Pipeline:
@@ -76,6 +77,9 @@ class Pipeline:
 
         # ユーザー割り込みキュー（処理中のチャットメッセージ）
         self._interrupt_queue: asyncio.Queue = asyncio.Queue()
+
+        # 戦略候補数（ランタイム変更可能）
+        self.strategy_candidates: int = STRATEGY_CANDIDATES
 
     # --- WebSocket管理 ---
 
@@ -248,21 +252,59 @@ class Pipeline:
             system_base = self._build_system_base()
             action_goal = req.goal
 
-            # 鏡の値からツール順序seed生成
+            # 鏡の値からツール順序seed + 表示文字列生成
             mirror_seed = None
+            mirror_display = ""
             if req.mirror_values:
                 mirror_seed = int(sum(abs(v) * 10000 for v in req.mirror_values)) % (2**31)
+                mirror_display = ", ".join(f"{v:.4f}" for v in req.mirror_values)
+
+            # === 1.5 戦略候補生成 ===
+            selected_strategy = ""
+            strategy_candidates = []
+            planning_tool_text = build_planning_prompt(mirror_seed=mirror_seed)
+
+            if PLAN_EXECUTE_ENABLED and self.strategy_candidates > 0:
+                strategy_prompt = self._build_strategy_prompt(
+                    action_goal, planning_tool_text, req.signal_summary,
+                    user_input=req.user_input,
+                    mirror_display=mirror_display,
+                )
+                strat_messages = [
+                    {"role": "system", "content": system_base or ""},
+                    {"role": "user", "content": strategy_prompt},
+                ]
+
+                logger.info("戦略候補生成: LLM呼び出し")
+                strat_response, _, _ = await self._call_llm_streaming(strat_messages, req.source, 0)
+
+                if strat_response:
+                    clean_strat = self._strip_think(strat_response)
+                    strategy_candidates = self._parse_strategy_candidates(clean_strat)
+
+                if strategy_candidates:
+                    selected_strategy = await self._select_strategy_by_mirror(
+                        strategy_candidates, req.mirror_values
+                    )
+                    logger.info(f"戦略選択: {selected_strategy} (候補{len(strategy_candidates)}件)")
+                    await self._broadcast(json.dumps({
+                        "type": "dev_strategy",
+                        "candidates": strategy_candidates,
+                        "selected": selected_strategy,
+                    }))
+                else:
+                    logger.warning("戦略候補パース失敗 → 戦略なしで計画続行")
 
             # === 2. 計画フェーズ ===
             use_plan_execute = PLAN_EXECUTE_ENABLED
             planned_tools = None
 
             if use_plan_execute:
-                planning_tool_text = build_planning_prompt(mirror_seed=mirror_seed)
                 planning_prompt = self._build_planning_prompt(
                     action_goal, planning_tool_text, req.signal_summary,
                     user_input=req.user_input,
-                    mirror_display=req.mirror_display,
+                    selected_strategy=selected_strategy,
+                    mirror_display=mirror_display,
                 )
                 plan_messages = [
                     {"role": "system", "content": system_base or ""},
@@ -308,7 +350,7 @@ class Pipeline:
                         signal_summary=req.signal_summary,
                         round_idx=round_idx, total_rounds=max_rounds,
                         user_input=req.user_input,
-                        mirror_display=req.mirror_display,
+                        mirror_display=mirror_display,
                     )
                     exec_messages = [
                         {"role": "system", "content": system_base or ""},
@@ -396,7 +438,7 @@ class Pipeline:
                     signal_summary=req.signal_summary,
                     bootstrap_hint=req.bootstrap_hint,
                     user_input=req.user_input,
-                    mirror_display=req.mirror_display,
+                    mirror_display=mirror_display,
                 )
                 messages.append({"role": "user", "content": initial_prompt})
 
@@ -489,6 +531,8 @@ class Pipeline:
             last_response=response,
             plan_text=plan_text,
             plan_stream=plan_response,
+            strategy_text=selected_strategy,
+            strategy_candidates=strategy_candidates,
         )
 
     async def _execute_single_tool(
@@ -517,13 +561,12 @@ class Pipeline:
             expected = None
             intent = None
 
-        # 重複検出
+        # 重複検出（failしたツールは除外: リトライを許可する）
         call_key = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
         if call_key in seen_tool_calls:
             logger.info(f"重複ツール呼び出しスキップ: {tool_name}")
             step_history.append({"tool": tool_name, "args_summary": "", "result_summary": "重複スキップ"})
             return "", "skipped", False
-        seen_tool_calls.add(call_key)
 
         args_str = " ".join(f"{k}={v}" for k, v in tool_args.items()) if tool_args else ""
         is_output = tool_name == "output_UI"
@@ -585,6 +628,9 @@ class Pipeline:
                     )
                     await session.commit()
                 return fail_msg, "fail", False
+
+        # エネルギーチェック通過 → 重複セットに追加（failは含めない）
+        seen_tool_calls.add(call_key)
 
         # ツール実行
         t0 = time.perf_counter()
@@ -663,17 +709,91 @@ class Pipeline:
 
         return result_text, action_status, had_output
 
-    def _build_planning_prompt(self, action_goal: str, tool_text: str, signal_summary: str,
+    def _build_strategy_prompt(self, action_goal: str, tool_text: str, signal_summary: str,
                                user_input: str = "", mirror_display: str = "") -> str:
-        """計画フェーズ用プロンプト"""
+        """戦略候補生成用プロンプト"""
         now = datetime.now().strftime('%Y年%m月%d日 %H:%M')
         goal_line = f"\n行動目標: {action_goal}" if action_goal else ""
         signal_line = f"\n{signal_summary}" if signal_summary else ""
         user_line = f"\n\n【ユーザー入力】\n{user_input}" if user_input else ""
-        mirror_line = f"\n\n{mirror_display}" if mirror_display else ""
+        mirror_line = f"\n[{mirror_display}]" if mirror_display else ""
 
         return f"""【状況】
-日時: {now}{goal_line}{signal_line}{user_line}{mirror_line}
+日時: {now}{goal_line}{signal_line}{mirror_line}{user_line}
+
+【利用可能ツール】
+{tool_text}
+
+【出力指示】
+上記ツールを使って取りうるアプローチを{self.strategy_candidates}つ、それぞれ異なる方向性で列挙する。各アプローチは1行で簡潔に記述する。
+
+形式:
+A. アプローチの説明
+B. アプローチの説明
+C. アプローチの説明"""
+
+    def _parse_strategy_candidates(self, text: str) -> list[str]:
+        """戦略候補テキストをパースしてリストで返す"""
+        candidates = []
+        for line in text.strip().split("\n"):
+            line = line.strip()
+            # "A. ...", "B. ...", "1. ...", "- ..." 等のパターン
+            m = re.match(r'^(?:[A-Z][\.\):]|[0-9]+[\.\):]|\-)\s*(.+)', line)
+            if m:
+                candidate = m.group(1).strip()
+                if candidate:
+                    candidates.append(candidate)
+        return candidates
+
+    async def _select_strategy_by_mirror(self, candidates: list[str], mirror_values: list) -> str:
+        """mirror cosine類似度で戦略候補を選択。mirrorなしならランダム"""
+        import random as _rand
+        if not mirror_values or len(mirror_values) < 5:
+            return _rand.choice(candidates)
+
+        try:
+            from app.memory.vector_store import _embed_sync
+            loop = asyncio.get_event_loop()
+            embeddings = await loop.run_in_executor(None, _embed_sync, candidates)
+            if not embeddings or not embeddings[0]:
+                return _rand.choice(candidates)
+
+            # mirrorと同じ5次元を抽出してcosine similarity
+            dim = len(embeddings[0])
+            indices = [int(i * dim / 5) for i in range(5)]
+
+            best_idx = 0
+            best_sim = -2.0
+            for i, emb in enumerate(embeddings):
+                emb_5 = [emb[idx] for idx in indices]
+                # cosine similarity
+                dot = sum(a * b for a, b in zip(mirror_values, emb_5))
+                norm_m = sum(a * a for a in mirror_values) ** 0.5
+                norm_e = sum(a * a for a in emb_5) ** 0.5
+                sim = dot / (norm_m * norm_e) if norm_m > 0 and norm_e > 0 else 0
+                if sim > best_sim:
+                    best_sim = sim
+                    best_idx = i
+
+            logger.info(f"戦略選択（mirror cosine）: idx={best_idx}, sim={best_sim:.4f}")
+            return candidates[best_idx]
+        except Exception as e:
+            logger.warning(f"mirror戦略選択エラー → ランダムフォールバック: {e}")
+            return _rand.choice(candidates)
+
+    def _build_planning_prompt(self, action_goal: str, tool_text: str, signal_summary: str,
+                               user_input: str = "",
+                               selected_strategy: str = "", mirror_display: str = "") -> str:
+        """計画フェーズ用プロンプト"""
+        now = datetime.now().strftime('%Y年%m月%d日 %H:%M')
+        goal_line = f"\n行動目標: {action_goal}" if action_goal else ""
+        strategy_line = f"\nアプローチ: {selected_strategy}" if selected_strategy else ""
+        signal_line = f"\n{signal_summary}" if signal_summary else ""
+        user_line = f"\n\n【ユーザー入力】\n{user_input}" if user_input else ""
+        mirror_line = f"\n[{mirror_display}]" if mirror_display else ""
+
+        return f"""【状況】
+日時: {now}{goal_line}{strategy_line}{signal_line}{mirror_line}{user_line}
 
 【利用可能ツール】
 {tool_text}
@@ -697,7 +817,7 @@ class Pipeline:
         now = datetime.now().strftime('%Y年%m月%d日 %H:%M')
         goal_line = f"\n行動目標: {action_goal}" if action_goal else ""
         user_line = f"\n\n【ユーザー入力】\n{user_input}" if user_input else ""
-        mirror_line = f"\n\n{mirror_display}" if mirror_display else ""
+        mirror_line = f"\n[{mirror_display}]" if mirror_display else ""
 
         # 計画
         plan_line = f"\n計画: {plan_text}" if plan_text else ""
@@ -713,8 +833,8 @@ class Pipeline:
             prev_text = "\n\n【これまでの結果】\n" + "\n".join(prev_lines)
 
         return f"""【状況】
-日時: {now}{goal_line}{plan_line}
-ラウンド {round_idx + 1}/{total_rounds}{user_line}{mirror_line}{prev_text}
+日時: {now}{goal_line}{plan_line}{mirror_line}
+ラウンド {round_idx + 1}/{total_rounds}{user_line}{prev_text}
 
 【利用可能ツール】
 {tool_text}
@@ -1050,12 +1170,11 @@ class Pipeline:
         parts = [f"【状況】\n日時: {now}"]
         if action_goal:
             parts.append(f"行動目標: {action_goal}")
+        if mirror_display:
+            parts.append(f"[{mirror_display}]")
 
         if user_input:
             parts.append(f"\n【ユーザー入力】\n{user_input}")
-
-        if mirror_display:
-            parts.append(f"\n{mirror_display}")
 
         if ctx_text:
             parts.append(f"\n【コンテキスト】\n{ctx_text}")
@@ -1107,6 +1226,8 @@ class Pipeline:
     def _summarize_result(tool_name: str, result: str, status: str) -> str:
         if status == "error":
             return f"エラー: {result[:60]}"
+        if status == "fail":
+            return f"失敗: {result[:60]}"
         match tool_name:
             case "output_UI":
                 return f"出力完了（{len(result)}文字）"
@@ -1126,12 +1247,11 @@ class Pipeline:
                 return "ファイル作成完了"
             case "overwrite_file":
                 return "ファイル上書き完了"
-            case "read_self_model":
-                return f"自己モデル取得（{len(result)}文字）"
             case "update_self_model":
                 return "自己モデル更新完了"
             case "search_action_log":
-                return f"{result.count('---')}件の行動ログ"
+                # 各行が "- [timestamp]" で始まる
+                return f"{result.count(chr(10) + '- [')}件の行動ログ"
             case _:
                 return f"{result[:80]}..." if len(result) > 80 else result
 

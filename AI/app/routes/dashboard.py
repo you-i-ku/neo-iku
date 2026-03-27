@@ -15,7 +15,7 @@ from app.persona.system_prompt import (
     get_mode, set_mode, get_active_persona, get_active_persona_id,
     activate_persona, deactivate_persona,
 )
-from config import PERSONAS_DIR
+from config import PERSONAS_DIR, MOTIVATION_PASSIVE_RATE
 
 from app.scheduler.autonomous import scheduler
 from app.pipeline import pipeline
@@ -39,7 +39,7 @@ async def get_status():
 
     return {
         "llm_available": llm_available,
-        "llm_provider": llm_manager.active_name,
+        "llm_provider": llm_manager.settings_summary.get("base_url", ""),
         "message_count": msg_count,
         "conversation_count": conv_count,
         "iku_log_count": log_count,
@@ -333,28 +333,62 @@ async def update_persona_self_model(persona_id: int, req: SelfModelUpdateRequest
     return {"ok": True}
 
 
+@router.get("/llm/settings")
+async def get_llm_settings():
+    """現在のLLM設定（API keyは含まない）"""
+    return llm_manager.settings_summary
+
+
+class LLMConfigRequest(BaseModel):
+    base_url: str
+    model: str
+    api_key: str = ""
+
+
+@router.post("/llm/configure")
+async def configure_llm(req: LLMConfigRequest):
+    """LLMを再設定し永続化。api_key空なら既存キーを維持。"""
+    api_key = req.api_key
+    if not api_key:
+        # 既存のキーを維持
+        saved = llm_manager.load_settings()
+        if saved:
+            api_key = saved.get("api_key", "")
+    llm_manager.configure(
+        base_url=req.base_url,
+        model=req.model,
+        api_key=api_key,
+    )
+    llm_manager.save_settings(
+        base_url=req.base_url,
+        model=req.model,
+        api_key=api_key,
+    )
+    return llm_manager.settings_summary
+
+
+@router.post("/llm/test")
+async def test_llm():
+    """現在のLLM設定で接続テスト（実際にchat呼び出し）"""
+    llm = llm_manager.get()
+    try:
+        reply = await llm.chat([
+            {"role": "user", "content": "Say OK"},
+        ], temperature=0.0)
+        return {"ok": True, "reply": reply[:100]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:300]}
+
+
 @router.get("/models")
 async def get_models():
-    """LM Studioのロード済みモデル一覧"""
+    """現在のプロバイダのモデル一覧"""
     llm = llm_manager.get()
     models = []
     if hasattr(llm, "list_models"):
         models = await llm.list_models()
     current = llm.model if hasattr(llm, "model") else "unknown"
     return {"models": models, "current": current}
-
-
-class ModelRequest(BaseModel):
-    model: str
-
-
-@router.post("/models/select")
-async def select_model(req: ModelRequest):
-    """使用モデルを切り替え"""
-    llm = llm_manager.get()
-    if hasattr(llm, "set_model"):
-        llm.set_model(req.model)
-    return {"model": req.model}
 
 
 # --- 開発用ツール ---
@@ -368,6 +402,16 @@ async def set_autonomous_interval(req: IntervalRequest):
     scheduler.set_interval(req.seconds)
     return {"interval": scheduler._interval}
 
+
+class StrategyCandidatesRequest(BaseModel):
+    count: int
+
+@router.post("/dev/strategy-candidates")
+async def set_strategy_candidates(req: StrategyCandidatesRequest):
+    """戦略候補数を変更（0で無効）"""
+    from app.pipeline import pipeline
+    pipeline.strategy_candidates = max(0, min(10, req.count))
+    return {"strategy_candidates": pipeline.strategy_candidates}
 
 @router.post("/dev/autonomous-trigger")
 async def trigger_autonomous():
@@ -413,11 +457,14 @@ async def set_concurrent_mode(req: ConcurrentModeRequest):
 @router.get("/dev/settings")
 async def get_dev_settings():
     """開発用設定の現在値を取得"""
+    from app.pipeline import pipeline
     return {
         "autonomous_interval": scheduler._interval,
+        "strategy_candidates": pipeline.strategy_candidates,
         "concurrent_mode": scheduler._concurrent_mode,
         "motivation_energy": round(scheduler._motivation_energy, 1),
         "motivation_threshold": round(scheduler.get_threshold(), 1),
+        "passive_rate": MOTIVATION_PASSIVE_RATE,
         "energy_breakdown": {k: round(v, 1) for k, v in scheduler._energy_breakdown.items()},
         "ablation": {
             "energy": scheduler.ablation_energy,

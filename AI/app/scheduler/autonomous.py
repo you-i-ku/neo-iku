@@ -12,6 +12,7 @@ from config import (
     MOTIVATION_DEFAULT_WEIGHTS, MOTIVATION_FLUCTUATION_SIGMA,
     MOTIVATION_SIGNAL_BUFFER_SIZE, SCORING_ENABLED,
     MOTIVATION_DEFAULT_ACTION_COSTS, MOTIVATION_DEFAULT_ACTION_COST_FALLBACK,
+    MOTIVATION_PASSIVE_RATE,
     ENV_STIMULUS_ENABLED, ENV_STIMULUS_PROBABILITY,
     DATA_DIR,
     ABLATION_ENERGY_SYSTEM, ABLATION_SELF_MODEL,
@@ -35,6 +36,7 @@ class AutonomousScheduler:
         # --- 内発的動機システム ---
         self._signal_buffer: deque[dict] = deque(maxlen=MOTIVATION_SIGNAL_BUFFER_SIZE)
         self._motivation_energy: float = 0.0
+        self._last_check_time: float = time.time()
         self._is_checking = False
         self._concurrent_mode = False
         self._is_speaking = False
@@ -64,7 +66,9 @@ class AutonomousScheduler:
             "time": time.time(),
         })
         logger.debug(f"シグナル追加: {signal_type} ({detail})")
-        self._try_check_motivation()
+        # パイプライン処理中は動機チェックを遅延（エネルギーが途中で変動するレース条件を防止）
+        if not self._is_speaking:
+            self._try_check_motivation()
 
     def consume_energy(self, tool_name: str):
         """ツール実行によるエネルギー消費"""
@@ -155,10 +159,27 @@ class AutonomousScheduler:
                 threshold = self._calc_default_threshold()
                 decay = MOTIVATION_DEFAULT_DECAY
 
+            # 受動エネルギー蓄積: 時間経過で自然回復（行動中も蓄積する）
+            now = time.time()
+            elapsed = now - self._last_check_time
+            self._last_check_time = now
+            passive_rate = MOTIVATION_PASSIVE_RATE
+            if isinstance(rules, dict):
+                passive_rate = rules.get("passive_rate", MOTIVATION_PASSIVE_RATE)
+            if passive_rate > 0 and elapsed > 0:
+                passive_gain = elapsed * passive_rate
+                self._motivation_energy += passive_gain
+
             signals = list(self._signal_buffer)
             self._signal_buffer.clear()
 
+            # 行動中に発生した自己由来シグナルはエネルギーに加算しない
+            # （行動の副産物で覚醒が無限蓄積するのを防ぐ）
+            _internal_signals = {"tool_success", "tool_error", "tool_fail",
+                                 "action_complete", "prediction_made", "self_model_update"}
             for sig in signals:
+                if self._is_speaking and sig["type"] in _internal_signals:
+                    continue
                 weight = weights.get(sig["type"], 0)
                 if isinstance(weight, (int, float)):
                     self._motivation_energy += weight
@@ -180,6 +201,7 @@ class AutonomousScheduler:
                 "type": "motivation_energy",
                 "energy": round(self._motivation_energy, 1),
                 "threshold": threshold,
+                "passive_rate": passive_rate,
                 "breakdown": {k: round(v, 1) for k, v in self._energy_breakdown.items()},
             }))
 
@@ -242,10 +264,21 @@ class AutonomousScheduler:
             }))
 
             self._trigger_event.clear()
-            try:
-                await asyncio.wait_for(self._trigger_event.wait(), timeout=interval)
+            triggered = False
+            remaining = interval
+            # 30秒ごとに動機チェック（受動蓄積UI反映+閾値判定）
+            while remaining > 0:
+                wait_time = min(30, remaining)
+                try:
+                    await asyncio.wait_for(self._trigger_event.wait(), timeout=wait_time)
+                    triggered = True
+                    break
+                except asyncio.TimeoutError:
+                    remaining -= wait_time
+                    self._try_check_motivation()
+            if triggered:
                 logger.info(f"即時実行トリガーを受信 (trigger={self._last_trigger})")
-            except asyncio.TimeoutError:
+            else:
                 self._last_trigger = "timer"
 
             if self._skip_speak:
@@ -314,18 +347,17 @@ class AutonomousScheduler:
         bootstrap_hint = self._build_bootstrap_hint(self_model)
         memory_context = ""  # AIが自分でsearch_memoriesツールを使って取得する
 
-        # 鏡の計算（環境刺激 × 行動メトリクス × embedding）
-        mirror_display = ""
+        # 鏡の計算（メトリクス + 環境embedding、ランダム比率混合）
         mirror_values = []
+        mirror_mix_ratio = None
         if env_stimulus:
             try:
                 env_words = [w.strip() for w in env_stimulus.split(",")]
                 mirror_data = await self._compute_mirror(env_words)
                 mirror_values = mirror_data["values"]
-                # 表示文字列
+                mirror_mix_ratio = mirror_data.get("mix_ratio", 1.0)
                 vals_str = ", ".join(f"{v:.4f}" for v in mirror_values)
-                mirror_display = f"内部観測:\n  {env_stimulus}: [{vals_str}]"
-                logger.info(f"鏡: {env_stimulus} → [{vals_str}]")
+                logger.info(f"鏡: {env_stimulus} → [{vals_str}] (r={mirror_mix_ratio:.1f})")
             except Exception as e:
                 logger.error(f"鏡の計算エラー: {e}")
 
@@ -375,7 +407,6 @@ class AutonomousScheduler:
             selected_action=selected_action,
             trigger=trigger,
             user_input=user_input_text,
-            mirror_display=mirror_display,
             mirror_values=mirror_values,
         )
         result = await pipeline.submit(request)
@@ -395,10 +426,12 @@ class AutonomousScheduler:
             trigger=trigger,
             env_stimulus=env_stimulus if env_stimulus else None,
             mirror_values=mirror_values or None,
+            mirror_mix_ratio=mirror_mix_ratio,
         )
 
     async def _reflect(self, selected_action: dict | None, result, self_model: dict, action_goal: str = "", selected_strategy: str | None = None,
-                       session_num: int | None = None, trigger: str = "timer", env_stimulus: str | None = None, mirror_values: list | None = None):
+                       session_num: int | None = None, trigger: str = "timer", env_stimulus: str | None = None, mirror_values: list | None = None,
+                       mirror_mix_ratio: float | None = None):
         """行動後の振り返り: 特性抽出 + 予測誤差シグナル + 行動ログ出力"""
         principle = None
         raw_response = None
@@ -510,6 +543,7 @@ class AutonomousScheduler:
                     principle=principle,
                     distillation_response=raw_response,
                     mirror_values=mirror_values or None,
+                    mirror_mix_ratio=mirror_mix_ratio if mirror_values else None,
                 )
             except Exception as e:
                 logger.error(f"行動ログ出力エラー: {e}")
@@ -519,7 +553,7 @@ class AutonomousScheduler:
     def _write_action_log(self, session_num: int, trigger: str, env_stimulus: str | None,
                           self_model_before: dict, self_model_after: dict,
                           result, principle: str | None, distillation_response: str | None,
-                          mirror_values: list | None = None):
+                          mirror_values: list | None = None, mirror_mix_ratio: float | None = None):
         """自律行動の行動ログをファイルに追記（日付ごと）"""
         from app.persona.system_prompt import get_active_persona
         import os
@@ -574,8 +608,17 @@ class AutonomousScheduler:
         # 鏡
         if mirror_values:
             vals_str = ", ".join(f"{v:.4f}" for v in mirror_values)
+            ratio_str = f" (r={mirror_mix_ratio:.1f})" if mirror_mix_ratio is not None else ""
             lines.append(f"【mirror】")
-            lines.append(f"[{vals_str}]")
+            lines.append(f"[{vals_str}]{ratio_str}")
+            lines.append("")
+
+        # 戦略
+        if result.strategy_candidates:
+            lines.append("【戦略候補】")
+            for i, c in enumerate(result.strategy_candidates):
+                marker = "→ " if c == result.strategy_text else "  "
+                lines.append(f"{marker}{chr(65+i)}. {c}")
             lines.append("")
 
         # 計画
@@ -883,7 +926,7 @@ class AutonomousScheduler:
 {strategy_list}
 
 【状況】
-{signal_summary if signal_summary else "（特筆すべき刺激なし）"}
+{signal_summary}
 
 【出力指示】
 状況に最も適合する戦略名を1つだけ出力する。説明不要。"""
@@ -912,7 +955,7 @@ class AutonomousScheduler:
     # --- ユーティリティ ---
 
     # LLMに見せるシグナル種別（行動判断に有意味なもののみ）
-    _SUMMARY_SIGNALS = {"user_message", "user_connect", "tool_success", "tool_error", "self_model_update", "approval_denied", "env_stimulus"}
+    _SUMMARY_SIGNALS = {"user_message", "user_connect", "tool_success", "tool_error", "self_model_update", "approval_denied"}
 
     def _build_signal_summary(self, signals: list[dict] | None = None) -> str:
         source = signals if signals is not None else list(self._signal_buffer)
@@ -939,7 +982,7 @@ class AutonomousScheduler:
         summary = idle_text
         if parts:
             summary += f", {', '.join(parts)}"
-        return f"\n最近の刺激: {summary}\n"
+        return f"\n{summary}\n"
 
     # --- 環境刺激: 5プール × 1-3語クロス ---
 
@@ -1097,8 +1140,13 @@ class AutonomousScheduler:
         ]
 
     async def _compute_mirror(self, env_words: list[str]) -> dict:
-        """行動メトリクス × 環境語embedding → 鏡の値"""
+        """行動メトリクス + 環境語embedding → 鏡の値（ランダム比率混合）"""
+        import random as _rand
         metrics = await self._calc_behavioral_metrics()
+
+        # メトリクスを正規化（L2ノルム=1）
+        norm_m = sum(v * v for v in metrics) ** 0.5
+        metrics_n = [v / norm_m if norm_m > 0 else 0.0 for v in metrics]
 
         try:
             from app.memory.vector_store import _embed_sync
@@ -1112,14 +1160,20 @@ class AutonomousScheduler:
                 # 5次元を等間隔で抽出
                 indices = [int(i * dim / 5) for i in range(5)]
                 emb_5 = [emb[idx] for idx in indices]
-                # element-wise multiply
-                mirror = [round(m * e, 4) for m, e in zip(metrics, emb_5)]
-                return {"values": mirror, "words": env_words, "raw_metrics": metrics}
+                # 環境成分も正規化
+                norm_e = sum(v * v for v in emb_5) ** 0.5
+                env_n = [v / norm_e if norm_e > 0 else 0.0 for v in emb_5]
+
+                # ランダム比率で混合
+                r = _rand.choice([i / 10 for i in range(11)])  # 0.0〜1.0, 0.1刻み
+                mirror = [round(r * m + (1 - r) * e, 4) for m, e in zip(metrics_n, env_n)]
+                logger.info(f"鏡: r={r:.1f} (metrics={r:.0%}, env={1-r:.0%})")
+                return {"values": mirror, "words": env_words, "raw_metrics": metrics, "mix_ratio": r}
         except Exception as e:
             logger.warning(f"鏡のembedding変換エラー: {e}")
 
-        # フォールバック: embeddingなしの生メトリクス
-        return {"values": metrics, "words": env_words, "raw_metrics": metrics}
+        # フォールバック: 正規化メトリクスのみ
+        return {"values": metrics_n, "words": env_words, "raw_metrics": metrics, "mix_ratio": 1.0}
 
     def _build_bootstrap_hint(self, self_model: dict) -> str:
         # ヒントなし: AIが自分のコードを読んで仕組みを発見する

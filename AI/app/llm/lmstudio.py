@@ -12,11 +12,15 @@ logger = logging.getLogger("iku.lmstudio")
 
 
 class LMStudioProvider(BaseLLMProvider):
-    def __init__(self, base_url: str = LLM_BASE_URL, model: str = LLM_MODEL):
+    def __init__(self, base_url: str = LLM_BASE_URL, model: str = LLM_MODEL, api_key: str = ""):
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.api_key = api_key
         self._model_resolved = False
-        self.client = httpx.AsyncClient(timeout=LLM_TIMEOUT)
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        self.client = httpx.AsyncClient(timeout=LLM_TIMEOUT, headers=headers)
         self.last_repeat_detected = False  # 直近のstream_chatでループ検出したか
 
     async def _resolve_model(self):
@@ -34,19 +38,35 @@ class LMStudioProvider(BaseLLMProvider):
         except Exception as e:
             logger.warning(f"モデル自動検出失敗: {e}")
 
+    def _build_payload(self, messages: list[dict], temperature: float, stream: bool = False) -> dict:
+        # クラウドAPI向け: 空contentのsystemメッセージを除去（Gemini等が400を返す）
+        cleaned = [m for m in messages if not (m.get("role") == "system" and not m.get("content", "").strip())]
+        payload = {
+            "model": self.model,
+            "messages": cleaned,
+            "temperature": temperature,
+            "max_tokens": LLM_MAX_TOKENS,
+        }
+        if not self.api_key:
+            # ローカルLLM向けパラメータ（クラウドAPIでは非対応の場合がある）
+            payload["frequency_penalty"] = LLM_FREQUENCY_PENALTY
+            payload["presence_penalty"] = LLM_PRESENCE_PENALTY
+        if stream:
+            payload["stream"] = True
+        return payload
+
     async def chat(self, messages: list[dict], temperature: float = 0.7) -> str:
         await self._resolve_model()
+        payload = self._build_payload(messages, temperature)
+        logger.debug(f"chat payload: model={payload.get('model')} msg_count={len(messages)} "
+                     f"roles={[m.get('role') for m in messages]} "
+                     f"keys={[k for k in payload if k != 'messages']}")
         resp = await self.client.post(
             f"{self.base_url}/chat/completions",
-            json={
-                "model": self.model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": LLM_MAX_TOKENS,
-                "frequency_penalty": LLM_FREQUENCY_PENALTY,
-                "presence_penalty": LLM_PRESENCE_PENALTY,
-            },
+            json=payload,
         )
+        if resp.status_code >= 400:
+            logger.error(f"LLM API エラー {resp.status_code}: {resp.text[:500]}")
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"]
@@ -138,19 +158,18 @@ class LMStudioProvider(BaseLLMProvider):
         await self._resolve_model()
         self.last_repeat_detected = False
         import json
+        payload = self._build_payload(messages, temperature, stream=True)
+        logger.debug(f"stream_chat payload: model={payload.get('model')} msg_count={len(messages)} "
+                     f"roles={[m.get('role') for m in messages]} "
+                     f"keys={[k for k in payload if k != 'messages']}")
         async with self.client.stream(
             "POST",
             f"{self.base_url}/chat/completions",
-            json={
-                "model": self.model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": LLM_MAX_TOKENS,
-                "frequency_penalty": LLM_FREQUENCY_PENALTY,
-                "presence_penalty": LLM_PRESENCE_PENALTY,
-                "stream": True,
-            },
+            json=payload,
         ) as resp:
+            if resp.status_code >= 400:
+                body = await resp.aread()
+                logger.error(f"LLM stream API エラー {resp.status_code}: {body[:500]}")
             resp.raise_for_status()
             logger.debug(f"stream_chat status={resp.status_code} headers={dict(resp.headers)}")
             line_count = 0

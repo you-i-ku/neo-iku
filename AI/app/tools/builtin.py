@@ -24,13 +24,30 @@ async def read_file(path: str = "", offset: str = "0") -> str:
         return "エラー: pathを指定してください。"
 
     target = (BASE_DIR / path).resolve()
+    base_resolved = str(BASE_DIR.resolve())
 
     # セキュリティ: BASE_DIRの外へのアクセス禁止
-    if not str(target).startswith(str(BASE_DIR.resolve())):
+    if not str(target).startswith(base_resolved):
         return "エラー: プロジェクト外のファイルは読めません。"
 
+    # ファジーパス解決: 直接パスが見つからなければファイル名でプロジェクト内を探索
     if not target.exists():
-        return f"エラー: ファイルが見つかりません: {path}"
+        found = None
+        filename = Path(path).name
+        for root, _dirs, files in os.walk(BASE_DIR):
+            # .venv, __pycache__, .git は除外
+            root_path = Path(root)
+            if any(part.startswith(('.venv', '__pycache__', '.git')) for part in root_path.relative_to(BASE_DIR).parts):
+                continue
+            if filename in files:
+                candidate = (root_path / filename).resolve()
+                if str(candidate).startswith(base_resolved):
+                    found = candidate
+                    break
+        if found:
+            target = found
+        else:
+            return f"エラー: ファイルが見つかりません: {path}"
 
     if not target.is_file():
         return f"エラー: '{path}' はファイルではありません。list_filesを使ってください。"
@@ -734,20 +751,6 @@ async def _record_snapshot(content_json: str, changed_key: str):
         pass
 
 
-async def read_self_model() -> str:
-    """現在の自己モデルを読む"""
-    from app.scheduler.autonomous import scheduler
-    if not scheduler.ablation_self_model:
-        return "自己モデルは未定義です。"
-    model = _load_self_model()
-    if not model:
-        return "自己モデルは未定義です。"
-
-    lines = ["【現在の自己モデル】"]
-    for key, value in model.items():
-        lines.append(f"- {key}: {value}")
-    return "\n".join(lines)
-
 
 async def update_self_model(key: str = "", value: str = "", text: str = "") -> str:
     """自己モデルを更新する。key+valueでキーバリュー更新、textで自由テキスト更新"""
@@ -915,55 +918,55 @@ def register_all():
     """全組み込みツールを登録"""
     register_tool(
         "read_file",
-        "指定パスのファイル内容をテキストで返す。自分のコードも読める",
-        "path=ファイルパス offset=開始行（省略時は先頭から）",
+        "ファイル名またはパスを指定し、中身をテキストで返す。ソースコード・設定・ログ等すべて読める。ファイル名だけでも自動検索する",
+        "path=ファイル名またはパス offset=読み開始位置（省略時は先頭から、1回2000文字）",
         read_file,
         required_args=["path"],
     )
     register_tool(
         "list_files",
-        "指定ディレクトリのファイル・フォルダ構成をツリー形式で返す",
+        "ディレクトリ内のファイル・フォルダ一覧をツリー形式で返す。省略時はプロジェクト全体の構成を返す",
         "path=ディレクトリパス（省略時はプロジェクトルート）",
         list_files,
     )
     register_tool(
         "search_files",
-        "ファイル名の部分一致で検索し、マッチしたパス一覧を返す",
+        "ファイル名の部分一致で検索し、マッチしたファイルパス一覧を返す",
         "query=検索文字列 path=検索開始ディレクトリ（省略時はプロジェクト全体）",
         search_files,
         required_args=["query"],
     )
     register_tool(
         "create_file",
-        "新規ファイルを作成する。既に存在する場合はエラーを返す",
+        "新規ファイルを作成し、指定した内容を書き込む。既に存在する場合はエラーを返す",
         "path=ファイルパス content=書き込む内容",
         create_file,
         required_args=["path", "content"],
     )
     register_tool(
         "overwrite_file",
-        "既存ファイルの内容を上書きする。承認が必要",
+        "既存ファイルの内容を全て上書きする。承認が必要。差分ではなく全内容を渡す",
         "path=ファイルパス content=上書き後の全内容",
         overwrite_file,
         required_args=["path", "content"],
     )
     register_tool(
         "search_memories",
-        "過去の会話・過去ログ・日記・行動ログを全文検索し、マッチした記録を返す",
+        "過去の会話・過去ログ・日記・行動ログを全文検索+ベクトル類似検索し、マッチした記録を返す",
         "query=検索キーワード",
         search_memories,
         required_args=["query"],
     )
     register_tool(
         "write_diary",
-        "日記や内省メモをDBに保存する。保存後は検索対象になる",
-        "content=日記の内容",
+        "日記や内省メモをDBに保存する。保存した内容はsearch_memoriesで検索・想起できる",
+        "content=日記の内容 keywords=タグ（省略時は日付）",
         write_diary,
         required_args=["content"],
     )
     register_tool(
         "search_action_log",
-        "過去のツール実行履歴を検索し、ツール名・引数・結果・日時を返す",
+        "過去のツール実行履歴を検索し、ツール名・引数・結果・日時を返す。引数なしで直近10件を返す",
         "query=検索キーワード（省略可） tool_name=ツール名でフィルタ（省略可）",
         search_action_log,
     )
@@ -983,7 +986,7 @@ def register_all():
     )
     register_tool(
         "output_UI",
-        "ユーザーのチャット画面にテキストを表示する唯一の手段。呼ばなければ何も表示されない",
+        "ユーザーのチャット画面にテキストを表示する唯一の手段。呼ばなければユーザーには何も見えない",
         "content=表示するテキスト to=出力先（デフォルト: chat）",
         output_UI,
         required_args=["content"],
@@ -996,14 +999,8 @@ def register_all():
         required_args=["name", "code"],
     )
     register_tool(
-        "read_self_model",
-        "自己モデル（data/self_model.json）の現在の内容をJSON文字列で返す。引数なし",
-        "（引数なし）",
-        read_self_model,
-    )
-    register_tool(
         "update_self_model",
-        "自己モデルのキーを追加・更新・削除する。変更はJSONファイルに永続化される",
+        "自己モデルのキーを追加・更新・削除する。変更はJSONファイルに永続化され、毎回のシステムプロンプトに反映される",
         "key=更新する項目名 value=新しい値（省略でそのキーを削除） text=自由テキストで全体を記述（key/valueの代わり）",
         update_self_model,
     )
@@ -1015,13 +1012,13 @@ def register_all():
     )
     register_tool(
         "get_system_metrics",
-        "自プロセス・データサイズ・動機状態の数値をテキストで返す。引数なし",
+        "自プロセスのPID・メモリ・CPU・稼働時間、DB・self_modelのサイズ、動機状態のエネルギー・閾値・シグナル数を返す。引数なし",
         "（引数なし）",
         get_system_metrics,
     )
     register_tool(
         "fetch_raw_resource",
-        "指定URLのHTTP GETを実行し、レスポンス本文（HTML・JSON・テキスト等）を返す",
+        "指定URLのHTTP GETを実行し、レスポンス本文（HTML・JSON・テキスト等）をテキストで返す",
         "url=取得するURL（http://またはhttps://） max_size=最大取得バイト数（デフォルト100000、最大500000）",
         fetch_raw_resource,
         required_args=["url"],

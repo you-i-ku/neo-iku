@@ -38,7 +38,7 @@ def build_tools_prompt(mirror_seed: int | None = None) -> str:
     _categories = [
         ("ファイル", ["read_file", "list_files", "search_files", "create_file", "overwrite_file"]),
         ("記憶", ["search_memories", "write_diary", "search_action_log"]),
-        ("自己モデル", ["read_self_model", "update_self_model"]),
+        ("自己モデル", ["update_self_model"]),
         ("外部", ["web_search", "fetch_raw_resource"]),
         ("実行・拡張", ["exec_code", "create_tool"]),
         ("システム", ["get_system_metrics"]),
@@ -254,13 +254,19 @@ def _parse_args(args_str: str) -> dict:
                 if k not in args:
                     args[k] = part.group(2).strip()
         else:
-            # クォートなし: まず複数引数パターン (key=value key=value) を試す
-            multi = list(re.finditer(r'(\w+)=([^\s]+)', args_str))
-            if len(multi) >= 2:
-                # 複数引数: それぞれ個別に取る
-                for part in multi:
-                    args[part.group(1)] = part.group(2)
-            elif multi:
+            # クォートなし: key=value パターンの位置を検出し、値は次のkey=の手前まで
+            key_positions = list(re.finditer(r'(?:^|\s)(\w+)=', args_str))
+            if len(key_positions) >= 2:
+                for i, kp in enumerate(key_positions):
+                    key = kp.group(1)
+                    val_start = kp.end()
+                    if i + 1 < len(key_positions):
+                        # 次のkey=の手前（空白を除く）まで
+                        val_end = key_positions[i + 1].start()
+                    else:
+                        val_end = len(args_str)
+                    args[key] = args_str[val_start:val_end].strip()
+            elif key_positions:
                 # 1つだけ: key= の後ろ全部を値として取る（スペース含むかもしれない）
                 single = re.match(r'(\w+)=(.*)', args_str, re.DOTALL)
                 if single:
@@ -375,7 +381,7 @@ def build_planning_prompt(mirror_seed: int | None = None) -> str:
     _categories = [
         ("ファイル", ["read_file", "list_files", "search_files", "create_file", "overwrite_file"]),
         ("記憶", ["search_memories", "write_diary", "search_action_log"]),
-        ("自己モデル", ["read_self_model", "update_self_model"]),
+        ("自己モデル", ["update_self_model"]),
         ("外部", ["web_search", "fetch_raw_resource"]),
         ("実行・拡張", ["exec_code", "create_tool"]),
         ("システム", ["get_system_metrics"]),

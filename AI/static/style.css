@@ -999,6 +999,17 @@ body.theme-pink { --accent: #ec4899; --accent-bg: #1f0818; --accent-border: #db2
     opacity: 0.8;
 }
 
+.dev-strategy {
+    font-size: 11px;
+    color: #c9a840;
+    font-family: "Consolas", "Courier New", monospace;
+    padding: 3px 8px;
+    margin: 2px 0;
+    border-left: 2px solid #c9a840;
+    opacity: 0.8;
+    white-space: pre-line;
+}
+
 .dev-tool-call {
     font-size: 12px;
     color: var(--text-secondary);
@@ -1150,9 +1161,32 @@ details[open] > .dev-tool-result-summary::before {
     border-color: #1f6feb;
 }
 
+.dev-input {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    border: 1px solid var(--border-secondary);
+    border-radius: 4px;
+    padding: 6px 8px;
+    font-size: 12px;
+    width: 100%;
+    outline: none;
+    box-sizing: border-box;
+}
+
+.dev-input:focus {
+    border-color: #1f6feb;
+}
+
+.llm-status {
+    font-size: 11px;
+    line-height: 28px;
+    white-space: nowrap;
+}
+
 .dev-row {
     display: flex;
     gap: 6px;
+    align-items: center;
 }
 
 .dev-row input {

@@ -148,11 +148,14 @@ function connect() {
             case "dev_tool_result":
                 appendDevToolResult(data.name, data.content);
                 loadMemories(memorySearch.value.trim());
-                if (data.name === "update_self_model" || data.name === "read_self_model") loadSelfModel();
+                if (data.name === "update_self_model") loadSelfModel();
                 break;
 
             case "dev_env_stimulus":
                 appendDevEnvStimulus(data.content);
+                break;
+            case "dev_strategy":
+                appendDevStrategy(data.candidates, data.selected);
                 break;
 
             case "write_approval":
@@ -203,7 +206,7 @@ function connect() {
                 break;
 
             case "motivation_energy":
-                updateMotivationEnergy(data.energy, data.threshold, data.breakdown);
+                updateMotivationEnergy(data.energy, data.threshold, data.breakdown, data.passive_rate);
                 break;
 
             case "user_interrupt_ack":
@@ -325,6 +328,21 @@ function appendDevEnvStimulus(content) {
     const el = document.createElement("div");
     el.className = "dev-env-stimulus";
     el.textContent = "~ " + content;
+    s.sessionEl.appendChild(el);
+    devScrollToBottom();
+}
+
+function appendDevStrategy(candidates, selected) {
+    const s = devS();
+    if (!s.sessionEl) return;
+    const el = document.createElement("div");
+    el.className = "dev-strategy";
+    const lines = candidates.map((c, i) => {
+        const letter = String.fromCharCode(65 + i);
+        const marker = c === selected ? "→ " : "  ";
+        return `${marker}${letter}. ${c}`;
+    });
+    el.textContent = lines.join("\n");
     s.sessionEl.appendChild(el);
     devScrollToBottom();
 }
@@ -642,45 +660,171 @@ document.getElementById('persona-create-btn').addEventListener('click', async ()
     }
 });
 
-// --- モデル選択 ---
+// --- LLM設定 ---
 
-const modelSelect = document.getElementById("model-select");
+const LLM_PRESETS = {
+    lmstudio: {
+        label: "LM Studio（ローカル）",
+        base_url: "http://localhost:1234/v1",
+        needs_key: false,
+        models: [
+            { id: "default", label: "自動検出" },
+        ],
+    },
+    gemini: {
+        label: "Gemini",
+        base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+        needs_key: true,
+        models: [
+            { id: "gemini-2.5-flash",      label: "2.5 Flash（無料枠あり・おすすめ）" },
+            { id: "gemini-3.1-flash",       label: "3.1 Flash（高性能）" },
+            { id: "gemini-3.1-flash-lite",  label: "3.1 Flash-Lite（最安）" },
+            { id: "gemini-2.5-pro",         label: "2.5 Pro（無料枠あり）" },
+            { id: "gemini-3.1-pro",         label: "3.1 Pro（最高性能）" },
+        ],
+    },
+    openai: {
+        label: "ChatGPT（OpenAI）",
+        base_url: "https://api.openai.com/v1",
+        needs_key: true,
+        models: [
+            { id: "gpt-4.1-nano",  label: "GPT-4.1 nano（最安）" },
+            { id: "gpt-4.1-mini",  label: "GPT-4.1 mini" },
+            { id: "gpt-4.1",       label: "GPT-4.1" },
+            { id: "gpt-4o-mini",   label: "GPT-4o mini" },
+            { id: "gpt-4o",        label: "GPT-4o" },
+            { id: "o3-mini",       label: "o3-mini（推論特化）" },
+            { id: "gpt-5.4-nano",  label: "GPT-5.4 nano" },
+            { id: "gpt-5.4-mini",  label: "GPT-5.4 mini" },
+            { id: "gpt-5.4",       label: "GPT-5.4（最新最高性能）" },
+        ],
+    },
+    openrouter: {
+        label: "OpenRouter（多数モデル対応）",
+        base_url: "https://openrouter.ai/api/v1",
+        needs_key: true,
+        models: [
+            { id: "google/gemini-2.5-flash",        label: "Gemini 2.5 Flash" },
+            { id: "anthropic/claude-sonnet-4",       label: "Claude Sonnet 4" },
+            { id: "openai/gpt-4.1-mini",             label: "GPT-4.1 mini" },
+            { id: "meta-llama/llama-4-scout",        label: "Llama 4 Scout" },
+            { id: "deepseek/deepseek-chat-v3-0324",  label: "DeepSeek V3" },
+        ],
+    },
+};
 
-async function loadModels() {
-    try {
-        const resp = await fetch("/api/models");
-        const data = await resp.json();
-        modelSelect.innerHTML = "";
+const llmService = document.getElementById("llm-service");
+const llmKeyRow = document.getElementById("llm-key-row");
+const llmApiKey = document.getElementById("llm-api-key");
+const llmModel = document.getElementById("llm-model");
+const llmSaveBtn = document.getElementById("llm-save-btn");
+const llmTestBtn = document.getElementById("llm-test-btn");
+const llmStatus = document.getElementById("llm-status");
 
-        if (data.models.length === 0) {
-            modelSelect.innerHTML = '<option value="">モデルなし</option>';
-            return;
-        }
+// ドロップダウン生成
+for (const [key, p] of Object.entries(LLM_PRESETS)) {
+    const opt = document.createElement("option");
+    opt.value = key;
+    opt.textContent = p.label;
+    llmService.appendChild(opt);
+}
 
-        for (const model of data.models) {
-            const opt = document.createElement("option");
-            opt.value = model;
-            opt.textContent = model.length > 30 ? model.slice(0, 30) + "…" : model;
-            opt.title = model;
-            if (model === data.current) opt.selected = true;
-            modelSelect.appendChild(opt);
-        }
-    } catch (e) {
-        console.error("モデル一覧取得エラー:", e);
+function applyPreset(key, currentModel) {
+    const p = LLM_PRESETS[key];
+    if (!p) return;
+    llmKeyRow.style.display = p.needs_key ? "" : "none";
+    // モデルドロップダウンを再構築
+    llmModel.innerHTML = "";
+    for (const m of p.models) {
+        const opt = document.createElement("option");
+        opt.value = m.id;
+        opt.textContent = m.label;
+        if (currentModel && m.id === currentModel) opt.selected = true;
+        llmModel.appendChild(opt);
+    }
+    // 現在のモデルがプリセットにない場合は先頭に追加
+    if (currentModel && !p.models.some(m => m.id === currentModel)) {
+        const opt = document.createElement("option");
+        opt.value = currentModel;
+        opt.textContent = currentModel;
+        opt.selected = true;
+        llmModel.prepend(opt);
     }
 }
 
-modelSelect.addEventListener("change", async () => {
-    const model = modelSelect.value;
-    if (!model) return;
+llmService.addEventListener("change", () => applyPreset(llmService.value, null));
+
+async function loadLLMSettings() {
     try {
-        await fetch("/api/models/select", {
+        const resp = await fetch("/api/llm/settings");
+        const data = await resp.json();
+        // base_urlからサービスを逆引き
+        let matched = "lmstudio";
+        for (const [key, p] of Object.entries(LLM_PRESETS)) {
+            if (data.base_url && data.base_url.includes(new URL(p.base_url).hostname)) {
+                matched = key;
+                break;
+            }
+        }
+        llmService.value = matched;
+        applyPreset(matched, data.model || null);
+        llmApiKey.value = "";
+        llmApiKey.placeholder = data.has_api_key ? "（設定済み）" : "APIキーを入力";
+    } catch (e) {
+        console.error("LLM設定取得エラー:", e);
+        applyPreset("lmstudio", null);
+    }
+}
+
+llmSaveBtn.addEventListener("click", async () => {
+    const preset = LLM_PRESETS[llmService.value];
+    if (!preset) return;
+    const body = {
+        base_url: preset.base_url,
+        model: llmModel.value || preset.models[0].id,
+    };
+    if (llmApiKey.value) {
+        body.api_key = llmApiKey.value;
+    }
+    try {
+        llmStatus.textContent = "保存中...";
+        llmStatus.style.color = "var(--text-secondary)";
+        const resp = await fetch("/api/llm/configure", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ model }),
+            body: JSON.stringify(body),
         });
+        if (resp.ok) {
+            llmStatus.textContent = "✓ 保存完了";
+            llmStatus.style.color = "#3fb950";
+            llmApiKey.value = "";
+            await loadLLMSettings();
+        } else {
+            llmStatus.textContent = "✗ エラー";
+            llmStatus.style.color = "#f85149";
+        }
     } catch (e) {
-        console.error("モデル切替エラー:", e);
+        llmStatus.textContent = "✗ 通信エラー";
+        llmStatus.style.color = "#f85149";
+    }
+});
+
+llmTestBtn.addEventListener("click", async () => {
+    try {
+        llmStatus.textContent = "テスト中...";
+        llmStatus.style.color = "var(--text-secondary)";
+        const resp = await fetch("/api/llm/test", { method: "POST" });
+        const data = await resp.json();
+        if (data.ok) {
+            llmStatus.textContent = "✓ 接続OK";
+            llmStatus.style.color = "#3fb950";
+        } else {
+            llmStatus.textContent = "✗ 接続失敗";
+            llmStatus.style.color = "#f85149";
+        }
+    } catch (e) {
+        llmStatus.textContent = "✗ 通信エラー";
+        llmStatus.style.color = "#f85149";
     }
 });
 
@@ -1084,11 +1228,11 @@ function finalizeExecTerminal(data) {
 // --- 動機エネルギー ---
 
 const statusEnergy = document.getElementById("status-energy");
+let energyInterpolation = { base: 0, threshold: 0, passiveRate: 0, startTime: 0, breakdown: null, interval: null };
 
-function updateMotivationEnergy(energy, threshold, breakdown) {
+function renderEnergy(energy, threshold, breakdown) {
     const pct = threshold > 0 ? Math.min(100, Math.round(energy / threshold * 100)) : 0;
-    statusEnergy.textContent = `⚡ ${energy}/${threshold}`;
-    // 色で強度を表現
+    statusEnergy.textContent = `⚡ ${Math.round(energy * 10) / 10}/${threshold}`;
     if (pct >= 80) {
         statusEnergy.style.color = "#f06030";
     } else if (pct >= 50) {
@@ -1096,7 +1240,6 @@ function updateMotivationEnergy(energy, threshold, breakdown) {
     } else {
         statusEnergy.style.color = "#8b5cf6";
     }
-    // breakdown tooltip
     if (breakdown && Object.keys(breakdown).length > 0) {
         const lines = Object.entries(breakdown)
             .sort((a, b) => b[1] - a[1])
@@ -1104,6 +1247,25 @@ function updateMotivationEnergy(energy, threshold, breakdown) {
         statusEnergy.title = `エネルギー内訳\n${lines.join("\n")}`;
     } else {
         statusEnergy.title = "内発的動機エネルギー";
+    }
+}
+
+function updateMotivationEnergy(energy, threshold, breakdown, passiveRate) {
+    energyInterpolation.base = energy;
+    energyInterpolation.threshold = threshold;
+    energyInterpolation.passiveRate = passiveRate || 0;
+    energyInterpolation.startTime = Date.now();
+    energyInterpolation.breakdown = breakdown;
+    renderEnergy(energy, threshold, breakdown);
+
+    // 受動蓄積があればリアルタイム補間開始
+    if (energyInterpolation.interval) clearInterval(energyInterpolation.interval);
+    if (passiveRate > 0) {
+        energyInterpolation.interval = setInterval(() => {
+            const elapsed = (Date.now() - energyInterpolation.startTime) / 1000;
+            const current = energyInterpolation.base + elapsed * energyInterpolation.passiveRate;
+            renderEnergy(current, energyInterpolation.threshold, energyInterpolation.breakdown);
+        }, 1000);
     }
 }
 
@@ -1149,6 +1311,8 @@ devConcurrentToggle.addEventListener("change", async () => {
 
 const devIntervalInput = document.getElementById("dev-interval");
 const devIntervalBtn = document.getElementById("dev-interval-btn");
+const devStrategyInput = document.getElementById("dev-strategy-count");
+const devStrategyBtn = document.getElementById("dev-strategy-btn");
 const devTriggerBtn = document.getElementById("dev-trigger-btn");
 const devResetBtn = document.getElementById("dev-reset-btn");
 const devClearSelfModelBtn = document.getElementById("dev-clear-selfmodel-btn");
@@ -1158,12 +1322,15 @@ async function loadDevSettings() {
         const resp = await fetch("/api/dev/settings");
         const data = await resp.json();
         devIntervalInput.value = data.autonomous_interval;
+        if (data.strategy_candidates !== undefined) {
+            devStrategyInput.value = data.strategy_candidates;
+        }
         if (data.concurrent_mode !== undefined) {
             devConcurrentToggle.checked = data.concurrent_mode;
         }
         if (data.motivation_energy !== undefined) {
             const thr = data.motivation_threshold || 0;
-            updateMotivationEnergy(data.motivation_energy, thr, data.energy_breakdown);
+            updateMotivationEnergy(data.motivation_energy, thr, data.energy_breakdown, data.passive_rate || 0);
         }
         // Ablationフラグ同期
         if (data.ablation) {
@@ -1214,6 +1381,23 @@ devIntervalBtn.addEventListener("click", async () => {
 });
 
 
+
+devStrategyBtn.addEventListener("click", async () => {
+    const count = parseInt(devStrategyInput.value);
+    if (isNaN(count) || count < 0) return;
+    devStrategyBtn.disabled = true;
+    try {
+        await fetch("/api/dev/strategy-candidates", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ count }),
+        });
+        devStrategyBtn.textContent = "✓";
+        setTimeout(() => { devStrategyBtn.textContent = "設定"; devStrategyBtn.disabled = false; }, 1000);
+    } catch (e) {
+        devStrategyBtn.disabled = false;
+    }
+});
 
 devTriggerBtn.addEventListener("click", async () => {
     devTriggerBtn.disabled = true;
@@ -1779,7 +1963,7 @@ document.getElementById('persona-episodes-clear-btn').addEventListener('click', 
 
 connect();
 updateStatus();
-loadModels();
+loadLLMSettings();
 loadMemories();
 loadDevSettings();
 loadSelfModel();
