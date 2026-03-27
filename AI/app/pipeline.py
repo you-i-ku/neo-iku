@@ -122,14 +122,15 @@ class Pipeline:
                 has_intent = intent is not None and intent != ""
                 if has_pred:
                     has_predictions = True
-                short_summary = self._summarize_result(tool_name, result_summary, "success")
+                step_status = s.get("status", "success")
+                short_summary = self._summarize_result(tool_name, result_summary, step_status)
                 rounds.append({
                     "tool_name": tool_name,
                     "result_summary": short_summary,
                     "result_raw": result_summary[:200] if len(result_summary) > 80 else result_summary,
                     "expected": expected if has_pred else None,
                     "intent": intent if has_intent else None,
-                    "status": "success",
+                    "status": step_status,
                     "has_prediction": has_pred,
                     "has_intent": has_intent,
                 })
@@ -289,25 +290,23 @@ class Pipeline:
 
             # === 3. 実行フェーズ ===
             if use_plan_execute:
-                # --- 計画-実行パス: ツールごとに1回のLLM呼び出し ---
+                # --- 計画-実行パス: 毎ラウンド自由選択 ---
                 execution_results: list[dict] = []
+                exec_tool_text = build_tools_prompt(mirror_seed=mirror_seed)
+                max_rounds = len(planned_tools)
 
-                for round_idx, tool_name in enumerate(planned_tools):
+                for round_idx in range(max_rounds):
                     if self._stop_event.is_set():
                         logger.info("計画実行中断: ユーザーによる停止")
                         break
 
-                    tool_info = get_tool(tool_name)
-                    if not tool_info:
-                        logger.warning(f"計画内の未登録ツール: {tool_name} → スキップ")
-                        continue
-
                     exec_prompt = self._build_execution_prompt(
-                        tool_name=tool_name, tool_info=tool_info,
                         action_goal=action_goal,
-                        previous_results=execution_results[-3:],
+                        tool_text=exec_tool_text,
+                        plan_text=plan_text,
+                        previous_results=execution_results,
                         signal_summary=req.signal_summary,
-                        round_idx=round_idx, total_rounds=len(planned_tools),
+                        round_idx=round_idx, total_rounds=max_rounds,
                         user_input=req.user_input,
                         mirror_display=req.mirror_display,
                     )
@@ -316,13 +315,17 @@ class Pipeline:
                         {"role": "user", "content": exec_prompt},
                     ]
 
-                    logger.info(f"実行フェーズ {round_idx + 1}/{len(planned_tools)}: {tool_name}")
+                    logger.info(f"実行フェーズ {round_idx + 1}/{max_rounds}")
                     exec_response, repeat_detected, _ = await self._call_llm_streaming(
                         exec_messages, req.source, round_idx + 1
                     )
 
                     if not exec_response:
                         logger.warning(f"実行フェーズ {round_idx + 1}: LLM応答なし")
+                        await self._broadcast(json.dumps({
+                            "type": "dev_tool_result", "name": "(empty)",
+                            "content": "（LLM応答なし — このラウンドはスキップ）",
+                        }))
                         continue
 
                     if repeat_detected:
@@ -332,14 +335,17 @@ class Pipeline:
                     tool_calls = parse_tool_calls(clean_exec) or parse_tool_calls(exec_response)
 
                     round_results = []
+                    round_tool_name = None
+                    hit_non_response = False
                     for tc_name, tc_args in (tool_calls or []):
-                        allowed = (tc_name == tool_name or tc_name in ("output_UI", "non_response"))
-                        if not allowed:
-                            logger.info(f"計画外ツールスキップ: {tc_name}（計画={tool_name}）")
-                            continue
+                        if tc_name == "non_response":
+                            hit_non_response = True
+                        if round_tool_name is None:
+                            round_tool_name = tc_name
 
                         result_text, status, tool_had_output = await self._execute_single_tool(
-                            tc_name, tc_args, conv_id, req.source, seen_tool_calls, step_history
+                            tc_name, tc_args, conv_id, req.source, seen_tool_calls, step_history,
+                            mirror_values=req.mirror_values or None,
                         )
                         if tool_had_output:
                             had_output = True
@@ -348,7 +354,7 @@ class Pipeline:
 
                     # stream参照
                     for sh in step_history:
-                        if sh.get("stream") is None and sh.get("tool") == tool_name:
+                        if sh.get("stream") is None:
                             sh["stream"] = exec_response
                             break
 
@@ -361,12 +367,18 @@ class Pipeline:
                         await session.commit()
 
                     last_full_result = combined
-                    summary = self._summarize_result(tool_name, combined, "success" if combined else "error") if combined else "実行なし"
+                    actual_tool = round_tool_name or "(none)"
+                    summary = self._summarize_result(actual_tool, combined, "success" if combined else "error") if combined else "実行なし"
                     execution_results.append({
-                        "tool": tool_name,
+                        "tool": actual_tool,
                         "result": combined[:500],
                         "summary": summary,
                     })
+
+                    # non_responseで即終了
+                    if hit_non_response:
+                        logger.info("non_response検出: 実行ループ終了")
+                        break
 
                 # ツール未実行検出
                 if not step_history:
@@ -416,7 +428,8 @@ class Pipeline:
                     all_results = []
                     for tool_name, tool_args in (tool_calls or []):
                         result_text, status, tool_had_output = await self._execute_single_tool(
-                            tool_name, tool_args, conv_id, req.source, seen_tool_calls, step_history
+                            tool_name, tool_args, conv_id, req.source, seen_tool_calls, step_history,
+                            mirror_values=req.mirror_values or None,
                         )
                         if tool_had_output:
                             had_output = True
@@ -480,7 +493,8 @@ class Pipeline:
 
     async def _execute_single_tool(
         self, tool_name: str, tool_args: dict, conv_id: int,
-        req_source: str, seen_tool_calls: set, step_history: list
+        req_source: str, seen_tool_calls: set, step_history: list,
+        mirror_values: list | None = None,
     ) -> tuple[str, str, bool]:
         """単一ツール実行。(result_text, status, had_output) を返す"""
         had_output = False
@@ -546,12 +560,31 @@ class Pipeline:
                     "tool": tool_name, "args_summary": args_str,
                     "result_summary": fail_msg,
                     "intent": intent, "expected": expected,
+                    "status": "fail",
                 })
                 self._emit_signal("tool_fail", f"energy_insufficient:{tool_name}")
                 await self._broadcast(json.dumps({
                     "type": "dev_tool_result", "name": tool_name, "content": fail_msg,
                 }))
-                return fail_msg, "error", False
+                await self._broadcast(json.dumps({
+                    "type": "autonomous_tool", "name": tool_name,
+                    "args": args_str, "status": "error",
+                }))
+                # DB記録（エネルギー不足）
+                mirror_json = None
+                if mirror_values:
+                    mirror_json = json.dumps(mirror_values)
+                async with async_session() as session:
+                    await record_tool_action(
+                        session, conv_id, tool_name, tool_args,
+                        fail_msg, "fail", None,
+                        expected_result=expected,
+                        intent=intent,
+                        persona_id=get_active_persona_id(),
+                        mirror=mirror_json,
+                    )
+                    await session.commit()
+                return fail_msg, "fail", False
 
         # ツール実行
         t0 = time.perf_counter()
@@ -604,6 +637,9 @@ class Pipeline:
         result_text = f"[ツール結果: {tool_name}]\n" + "\n".join(parts)
 
         # DB記録
+        mirror_json = None
+        if mirror_values:
+            mirror_json = json.dumps(mirror_values)
         async with async_session() as session:
             await record_tool_action(
                 session, conv_id, tool_name, tool_args,
@@ -611,6 +647,7 @@ class Pipeline:
                 expected_result=expected,
                 intent=intent,
                 persona_id=get_active_persona_id(),
+                mirror=mirror_json,
             )
             await session.commit()
 
@@ -621,6 +658,7 @@ class Pipeline:
             "result_summary": self._summarize_result(tool_name, result, action_status),
             "expected": expected,
             "intent": intent,
+            "status": action_status,
         })
 
         return result_text, action_status, had_output
@@ -650,54 +688,39 @@ class Pipeline:
 ツール呼び出し（[TOOL:...]）は不要。計画のみ出力。"""
 
     def _build_execution_prompt(
-        self, tool_name: str, tool_info: dict, action_goal: str,
+        self, action_goal: str, tool_text: str, plan_text: str,
         previous_results: list[dict], signal_summary: str,
         round_idx: int, total_rounds: int,
         user_input: str = "", mirror_display: str = "",
     ) -> str:
-        """実行フェーズ用プロンプト（1ツール分）"""
+        """実行フェーズ用プロンプト（自由選択）"""
         now = datetime.now().strftime('%Y年%m月%d日 %H:%M')
         goal_line = f"\n行動目標: {action_goal}" if action_goal else ""
         user_line = f"\n\n【ユーザー入力】\n{user_input}" if user_input else ""
         mirror_line = f"\n\n{mirror_display}" if mirror_display else ""
 
-        # 前回までの結果
+        # 計画
+        plan_line = f"\n計画: {plan_text}" if plan_text else ""
+
+        # これまでの結果
         prev_text = ""
         if previous_results:
             prev_lines = []
-            for pr in previous_results:
-                prev_lines.append(f"- {pr['tool']}: {pr['summary']}")
+            for i, pr in enumerate(previous_results):
+                prev_lines.append(f"- R{i + 1} {pr['tool']}: {pr['summary']}")
                 if pr.get("result"):
                     prev_lines.append(f"  結果: {pr['result'][:300]}")
-            prev_text = "\n前のステップの結果:\n" + "\n".join(prev_lines)
-
-        # ツール説明
-        desc = tool_info["description"]
-        args_desc = tool_info.get("args_desc", "")
-        tool_desc = f"{tool_name}: {desc}"
-        if args_desc:
-            tool_desc += f"\n  引数: {args_desc}"
+            prev_text = "\n\n【これまでの結果】\n" + "\n".join(prev_lines)
 
         return f"""【状況】
-日時: {now}{goal_line}{user_line}{mirror_line}
-{prev_text}
+日時: {now}{goal_line}{plan_line}
+ラウンド {round_idx + 1}/{total_rounds}{user_line}{mirror_line}{prev_text}
 
-【タスク】
-ステップ {round_idx + 1}/{total_rounds}: {tool_name}
-
-ツール情報:
-  {tool_desc}
-
-【書式】
-  [TOOL:{tool_name} 引数A=値A 引数B=値B]
-  [TOOL:{tool_name} 引数A=値A intent=この操作の目的 expect=予測される結果]
-ブロック書式:
-  [TOOL:{tool_name}]
-  複数行の内容
-  [/TOOL]
+【利用可能ツール】
+{tool_text}
 
 【出力指示】
-上記ツールを1つだけ呼び出す。output_UIで発言も可。expect=に結果の予測を記述すること。
+ツールを1つ選んで呼び出す。expect=に結果の予測を記述すること。
 ツールの結果はシステムが返す。結果を自分で生成しない。[TOOL:...]マーカーだけ出力する。"""
 
     # --- ストリーミングLLM ---
@@ -994,7 +1017,7 @@ class Pipeline:
             if free_text:
                 sm_lines.append(free_text)
             for k, v in self_model.items():
-                if k not in ("__free_text__", "motivation_rules", "mirror"):
+                if k not in ("__free_text__", "motivation_rules"):
                     sm_lines.append(f"- {k}: {v}")
             if sm_lines:
                 sm_text = "\n[self_model]\n" + "\n".join(sm_lines)

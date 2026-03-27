@@ -1560,7 +1560,7 @@ function buildDistillationSessionHtml(s) {
         const matchIcon = r.has_prediction
             ? (r.status === "success" ? '<span class="match-ok">○</span>' : '<span class="match-fail">×</span>')
             : '<span class="match-none">-</span>';
-        const statusClass = r.status === "error" ? "distillation-round-error" : "";
+        const statusClass = (r.status === "error" || r.status === "fail") ? "distillation-round-error" : "";
         const intentLine = r.intent
             ? `<div class="distillation-intent">意図: ${escapeHtml(r.intent)}</div>`
             : "";

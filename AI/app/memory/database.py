@@ -48,6 +48,8 @@ async def init_db():
         await _migrate_column(conn, "conversations", "trigger")
         await _migrate_column(conn, "conversations", "distillation_response")
         await _migrate_column(conn, "conversations", "persona_id", "INTEGER")
+        await _migrate_column(conn, "conversations", "distillation_principle")
+        await _migrate_column(conn, "tool_actions", "mirror")
         await _migrate_column(conn, "memory_summaries", "persona_id", "INTEGER")
         await _migrate_column(conn, "self_model_snapshots", "persona_id", "INTEGER")
 

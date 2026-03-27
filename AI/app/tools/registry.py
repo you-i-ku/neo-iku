@@ -54,7 +54,6 @@ def build_tools_prompt(mirror_seed: int | None = None) -> str:
 
     lines = [
         "目的に合うツールを精査して選び、呼び出してください。",
-        "ツールを呼ばないテキストはどこにも届きません。output_UIで発言するか、non_responseで沈黙を選んでください。",
         "",
         "書式:",
         "  [TOOL:ツール名 引数A=値A 引数B=値B]",
@@ -109,6 +108,45 @@ def _invalidate_pattern_cache():
     global _registry_pattern_cache, _registry_pattern_keys
     _registry_pattern_cache = None
     _registry_pattern_keys = frozenset()
+
+
+def _fix_unclosed_quotes_in_tools(text: str) -> str:
+    """[TOOL:...] 内の未閉じクォートを修復する。
+    LLMがcontent="...を閉じずに改行→引数続行するケースへの対応。
+    最後の ] をTOOLマーカー終端とみなし、その直前に閉じ " を挿入。"""
+    names = sorted(_tools.keys(), key=len, reverse=True)
+    if not names:
+        return text
+    tool_start_pat = re.compile(r'\[TOOL:\s*(?:' + '|'.join(re.escape(n) for n in names) + r')')
+    all_starts = [m.start() for m in tool_start_pat.finditer(text)]
+    result = text
+    offset = 0
+    for idx, start_pos in enumerate(all_starts):
+        m = tool_start_pat.search(text, start_pos)
+        rest_start = m.end()
+        # 走査範囲: 次の[TOOL:マーカーまで（なければテキスト末尾）
+        scan_end = all_starts[idx + 1] if idx + 1 < len(all_starts) else len(text)
+        rest = text[rest_start:scan_end]
+        # クォートの開閉を追跡
+        in_quote = False
+        last_bracket = -1
+        for ci, ch in enumerate(rest):
+            if ch == '"' and (ci == 0 or rest[ci - 1] != '\\'):
+                in_quote = not in_quote
+            elif ch == ']' and not in_quote:
+                # 正常にクォート外で ] が見つかった → 修復不要
+                last_bracket = -1
+                break
+            elif ch == ']':
+                # クォート内の ] → 位置を記録（最後のものを使う）
+                last_bracket = ci
+        if in_quote and last_bracket >= 0:
+            # 最後の ] の直前に " を挿入して修復
+            abs_pos = rest_start + last_bracket + offset
+            result = result[:abs_pos] + '"' + result[abs_pos:]
+            offset += 1
+            logger.debug(f"クォート修復: pos={abs_pos}")
+    return result
 
 
 def _get_registry_pattern() -> re.Pattern | None:
@@ -259,7 +297,14 @@ def parse_tool_calls(text: str) -> list[tuple[str, dict]]:
 
     matches = list(pattern.finditer(text))
     if not matches:
-        return []
+        # フォールバック: クォート未閉じ等でメインパターンが失敗した場合
+        # テキストの未閉じクォートを修復してから再パース
+        fixed = _fix_unclosed_quotes_in_tools(text)
+        if fixed != text:
+            matches = list(pattern.finditer(fixed))
+            if matches:
+                text = fixed  # ブロック検出等で使うtextも修復版に
+                logger.info(f"ツールパース: クォート修復で{len(matches)}件検出")
 
     raw_results = []
     for i, m in enumerate(matches):

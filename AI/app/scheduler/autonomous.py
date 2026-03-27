@@ -319,32 +319,9 @@ class AutonomousScheduler:
         mirror_values = []
         if env_stimulus:
             try:
-                from app.tools.builtin import _save_self_model
                 env_words = [w.strip() for w in env_stimulus.split(",")]
                 mirror_data = await self._compute_mirror(env_words)
                 mirror_values = mirror_data["values"]
-                # ツール順序を再現（seedから決定的に算出）
-                tool_order = None
-                if mirror_values:
-                    mirror_seed = int(sum(abs(v) * 10000 for v in mirror_values)) % (2**31)
-                    _cat_names = ["ファイル", "記憶", "自己モデル", "外部", "実行・拡張", "システム", "出力", "待機"]
-                    r = random.Random(mirror_seed)
-                    r.shuffle(_cat_names)
-                    tool_order = _cat_names
-
-                # self_modelに保存（current → previous）
-                current_mirror = self_model.get("mirror", {})
-                self_model["mirror"] = {
-                    "previous": current_mirror.get("current"),
-                    "current": {
-                        "values": mirror_values,
-                        "words": env_words,
-                        "raw_metrics": mirror_data["raw_metrics"],
-                        "tool_order": tool_order,
-                        "timestamp": datetime.now().isoformat(),
-                    }
-                }
-                _save_self_model(self_model, changed_key="mirror")
                 # 表示文字列
                 vals_str = ", ".join(f"{v:.4f}" for v in mirror_values)
                 mirror_display = f"内部観測:\n  {env_stimulus}: [{vals_str}]"
@@ -417,10 +394,11 @@ class AutonomousScheduler:
             session_num=self._session_count,
             trigger=trigger,
             env_stimulus=env_stimulus if env_stimulus else None,
+            mirror_values=mirror_values or None,
         )
 
     async def _reflect(self, selected_action: dict | None, result, self_model: dict, action_goal: str = "", selected_strategy: str | None = None,
-                       session_num: int | None = None, trigger: str = "timer", env_stimulus: str | None = None):
+                       session_num: int | None = None, trigger: str = "timer", env_stimulus: str | None = None, mirror_values: list | None = None):
         """行動後の振り返り: 特性抽出 + 予測誤差シグナル + 行動ログ出力"""
         principle = None
         raw_response = None
@@ -477,20 +455,22 @@ class AutonomousScheduler:
                         drive = selected_action.get("drive", "") if selected_action else ""
                         principle, raw_response = await self._reflect_on_action(
                             action_description, tool_results_text, self_model, prediction_text,
-                            drive=drive, strategy=selected_strategy or ""
+                            drive=drive, strategy=selected_strategy or "",
+                            mirror_values=mirror_values or None,
                         )
 
-                        if raw_response and result.conv_id:
+                        if result.conv_id and (raw_response or principle):
                             try:
                                 from app.memory.database import async_session
                                 from sqlalchemy import text
                                 async with async_session() as session:
                                     await session.execute(text(
-                                        "UPDATE conversations SET distillation_response = :resp WHERE id = :cid"
-                                    ), {"resp": raw_response, "cid": result.conv_id})
+                                        "UPDATE conversations SET distillation_response = :resp, "
+                                        "distillation_principle = :prin WHERE id = :cid"
+                                    ), {"resp": raw_response, "prin": principle, "cid": result.conv_id})
                                     await session.commit()
                             except Exception as e:
-                                logger.error(f"蒸留応答DB保存エラー: {e}")
+                                logger.error(f"蒸留DB保存エラー: {e}")
 
                             try:
                                 from app.pipeline import pipeline
@@ -529,6 +509,7 @@ class AutonomousScheduler:
                     result=result,
                     principle=principle,
                     distillation_response=raw_response,
+                    mirror_values=mirror_values or None,
                 )
             except Exception as e:
                 logger.error(f"行動ログ出力エラー: {e}")
@@ -537,7 +518,8 @@ class AutonomousScheduler:
 
     def _write_action_log(self, session_num: int, trigger: str, env_stimulus: str | None,
                           self_model_before: dict, self_model_after: dict,
-                          result, principle: str | None, distillation_response: str | None):
+                          result, principle: str | None, distillation_response: str | None,
+                          mirror_values: list | None = None):
         """自律行動の行動ログをファイルに追記（日付ごと）"""
         from app.persona.system_prompt import get_active_persona
         import os
@@ -587,6 +569,13 @@ class AutonomousScheduler:
         if env_stimulus:
             lines.append(f"【環境刺激】")
             lines.append(f"~ {env_stimulus}")
+            lines.append("")
+
+        # 鏡
+        if mirror_values:
+            vals_str = ", ".join(f"{v:.4f}" for v in mirror_values)
+            lines.append(f"【mirror】")
+            lines.append(f"[{vals_str}]")
             lines.append("")
 
         # 計画
@@ -744,7 +733,8 @@ class AutonomousScheduler:
 
     async def _reflect_on_action(self, action_description: str, tool_results: str,
                                    self_model: dict, prediction_text: str = "",
-                                   drive: str = "", strategy: str = "") -> tuple[str | None, str | None]:
+                                   drive: str = "", strategy: str = "",
+                                   mirror_values: list | None = None) -> tuple[str | None, str | None]:
         principles = self_model.get("principles", [])
         principles_ctx = ""
         if isinstance(principles, list) and principles:
@@ -758,11 +748,15 @@ class AutonomousScheduler:
 
         drive_line = f"\n動機: {drive}" if drive else ""
         strategy_line = f"\n戦略: {strategy}" if strategy else ""
+        mirror_line = ""
+        if mirror_values:
+            vals_str = ", ".join(f"{v:.4f}" for v in mirror_values)
+            mirror_line = f"\nmirror: [{vals_str}]"
 
         reflect_prompt = f"""以下の行動記録を分析し、行動主体の特性を抽出してください。
 
 【記録】
-行動: {action_description}{drive_line}{strategy_line}
+行動: {action_description}{drive_line}{strategy_line}{mirror_line}
 
 状況と結果:
 {tool_results[:1500]}

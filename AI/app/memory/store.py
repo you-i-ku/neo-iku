@@ -109,6 +109,7 @@ async def record_tool_action(
     expected_result: str | None = None,
     intent: str | None = None,
     persona_id: int | None = None,
+    mirror: str | None = None,
 ) -> ToolAction:
     """ツール実行履歴を記録"""
     args_json = json.dumps(args, ensure_ascii=False)
@@ -124,6 +125,7 @@ async def record_tool_action(
         intent=intent,
         status=status,
         execution_ms=execution_ms,
+        mirror=mirror,
     )
     session.add(action)
     await session.flush()

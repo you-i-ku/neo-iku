@@ -43,6 +43,7 @@ class Conversation(Base):
     source = Column(String(20), default="chat")  # "chat" or "autonomous"
     trigger = Column(String(20), nullable=True)   # "timer" / "energy" / "manual" / None(chat)
     distillation_response = Column(Text, nullable=True)  # 蒸留LLMの生応答
+    distillation_principle = Column(Text, nullable=True)  # 蒸留で抽出された特性（1文）
     persona_id = Column(Integer, ForeignKey("personas.id"), nullable=True)  # NULLならノーマルモード
 
     messages = relationship("Message", back_populates="conversation", order_by="Message.created_at")
@@ -85,6 +86,7 @@ class ToolAction(Base):
     intent = Column(Text, nullable=True)              # 操作の目的（メタ認知用）
     status = Column(String(20), default="success")  # success / error
     execution_ms = Column(Integer, nullable=True)
+    mirror = Column(Text, nullable=True)              # 鏡の値（JSON配列）
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
