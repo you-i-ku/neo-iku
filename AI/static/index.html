@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>イク — neo-iku</title>
-    <link rel="stylesheet" href="/static/style.css?v=50">
+    <link rel="stylesheet" href="/static/style.css?v=56">
 </head>
 <body>
     <!-- ステータスバー -->
@@ -64,10 +64,6 @@
                                 <label>LLM</label>
                                 <select id="llm-service" class="model-select"></select>
                             </div>
-                            <div class="dev-item" id="llm-key-row" style="display:none">
-                                <label>API Key</label>
-                                <input id="llm-api-key" type="password" class="dev-input">
-                            </div>
                             <div class="dev-item">
                                 <label>モデル</label>
                                 <select id="llm-model" class="model-select"></select>
@@ -76,6 +72,7 @@
                                 <div class="dev-row">
                                     <button id="llm-save-btn" class="dev-btn">保存</button>
                                     <button id="llm-test-btn" class="dev-btn">接続テスト</button>
+                                    <button id="env-keys-btn" class="dev-btn">APIキー設定</button>
                                     <span id="llm-status" class="llm-status"></span>
                                 </div>
                             </div>
@@ -304,6 +301,17 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=50"></script>
+    <!-- APIキー設定ポップアップ -->
+    <div id="envkeys-popup" class="envkeys-popup" style="display:none">
+        <div class="envkeys-popup-content">
+            <div class="envkeys-popup-header">
+                <h3>APIキー設定</h3>
+                <button class="envkeys-popup-close">&times;</button>
+            </div>
+            <div id="envkeys-list" class="envkeys-list"></div>
+        </div>
+    </div>
+
+    <script src="/static/app.js?v=56"></script>
 </body>
 </html>

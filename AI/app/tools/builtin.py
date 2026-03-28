@@ -235,7 +235,7 @@ async def search_memories(query: str = "") -> str:
                 if unique_similar:
                     enriched = await fetch_content_for_results(unique_similar)
                     if enriched:
-                        lines.append("【意味的に近い記憶】")
+                        vec_lines = []
                         for e in enriched:
                             content = _clean_memory_content(e.get("content", ""))[:200]
                             if content:
@@ -243,7 +243,10 @@ async def search_memories(query: str = "") -> str:
                                 role_prefix = ""
                                 if e.get("role"):
                                     role_prefix = ("ユーザー" if e["role"] == "user" else "AI") + ": "
-                                lines.append(f"- {role_prefix}{content} {sim}")
+                                vec_lines.append(f"- {role_prefix}{content} {sim}")
+                        if vec_lines:
+                            lines.append("【意味的に近い記憶】")
+                            lines.extend(vec_lines)
     except Exception:
         pass  # ベクトル検索失敗時はFTS5結果のみ
 
@@ -518,20 +521,47 @@ async def search_action_log(query: str = "", tool_name: str = "") -> str:
 
 
 async def web_search(query: str = "", max_results: str = "5") -> str:
-    """DuckDuckGoでWeb検索する"""
+    """Web検索する（Brave優先、DDGフォールバック）"""
     if not query:
         return "エラー: queryを指定してください。"
 
     import asyncio
     n = min(int(max_results), 10)
 
-    def _search():
+    # --- Brave Search API ---
+    from config import BRAVE_API_KEY
+    if BRAVE_API_KEY:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    "https://api.search.brave.com/res/v1/web/search",
+                    params={"q": query, "count": n},
+                    headers={"X-Subscription-Token": BRAVE_API_KEY, "Accept": "application/json"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                results = data.get("web", {}).get("results", [])
+                if results:
+                    lines = [f"「{query}」の検索結果（{len(results)}件）:"]
+                    for i, r in enumerate(results, 1):
+                        lines.append(f"\n{i}. {r.get('title', '')}")
+                        lines.append(f"   URL: {r.get('url', '')}")
+                        lines.append(f"   {r.get('description', '')}")
+                    return "\n".join(lines)
+                # Brave が 0件 → DDGフォールバック
+        except Exception as e:
+            import logging
+            logging.getLogger("iku.tools").warning(f"Brave Search失敗、DDGにフォールバック: {e}")
+
+    # --- DuckDuckGo フォールバック ---
+    def _search_ddg():
         from duckduckgo_search import DDGS
         with DDGS() as ddgs:
             return list(ddgs.text(query, max_results=n))
 
     try:
-        results = await asyncio.get_event_loop().run_in_executor(None, _search)
+        results = await asyncio.get_event_loop().run_in_executor(None, _search_ddg)
     except Exception as e:
         return f"検索エラー: {e}"
 
@@ -864,8 +894,8 @@ async def get_system_metrics() -> str:
     return "\n".join(lines)
 
 
-async def fetch_raw_resource(url: str = "", max_size: str = "100000") -> str:
-    """URLから生データを取得する（テキスト/HTML/JSON等）"""
+async def fetch_raw_resource(url: str = "") -> str:
+    """URLのページ内容をMarkdownで取得する"""
     if not url:
         return "エラー: urlを指定してください。"
 
@@ -873,32 +903,22 @@ async def fetch_raw_resource(url: str = "", max_size: str = "100000") -> str:
         return "エラー: http:// または https:// で始まるURLを指定してください。"
 
     import httpx
+    TEXT_LIMIT = 5000  # Markdown変換後の上限（文字数）
 
     try:
-        limit = min(int(max_size), 500000)  # 最大500KB
-    except ValueError:
-        limit = 100000
-
-    try:
+        jina_url = f"https://r.jina.ai/{url}"
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            resp = await client.get(url, headers={
-                "User-Agent": "neo-iku/1.0 (autonomous AI agent)",
+            resp = await client.get(jina_url, headers={
+                "Accept": "text/markdown",
             })
 
-            content_type = resp.headers.get("content-type", "")
-            size = len(resp.content)
+            if resp.status_code != 200:
+                return f"エラー: 取得失敗（HTTP {resp.status_code}）: {url}"
 
-            if size > limit:
-                return f"エラー: レスポンスが大きすぎます（{size}バイト、上限{limit}バイト）。max_sizeを増やすか、別の方法を検討してください。"
-
-            # テキスト系ならデコードして返す
-            if any(t in content_type for t in ("text/", "json", "xml", "javascript")):
-                text = resp.text
-                if len(text) > limit:
-                    text = text[:limit] + f"\n...（{len(resp.text)}文字中{limit}文字まで表示）"
-                return f"[{resp.status_code}] Content-Type: {content_type}\nサイズ: {size}バイト\n\n{text}"
-            else:
-                return f"[{resp.status_code}] Content-Type: {content_type}\nサイズ: {size}バイト\n（バイナリデータのためテキスト表示不可）"
+            text = resp.text
+            if len(text) > TEXT_LIMIT:
+                text = text[:TEXT_LIMIT] + f"\n\n...（{len(resp.text)}文字中{TEXT_LIMIT}文字まで表示）"
+            return text
 
     except httpx.TimeoutException:
         return f"エラー: タイムアウト（30秒）: {url}"
@@ -979,7 +999,7 @@ def register_all():
     )
     register_tool(
         "web_search",
-        "DuckDuckGoでWeb検索し、タイトル・URL・スニペットの一覧を返す",
+        "Web検索し、タイトル・URL・スニペットの一覧を返す",
         "query=検索キーワード max_results=最大件数（デフォルト5、最大10）",
         web_search,
         required_args=["query"],
@@ -1018,8 +1038,8 @@ def register_all():
     )
     register_tool(
         "fetch_raw_resource",
-        "指定URLのHTTP GETを実行し、レスポンス本文（HTML・JSON・テキスト等）をテキストで返す",
-        "url=取得するURL（http://またはhttps://） max_size=最大取得バイト数（デフォルト100000、最大500000）",
+        "指定URLのページ内容をMarkdown形式で取得して返す（Jina Reader経由）",
+        "url=取得するURL（http://またはhttps://）",
         fetch_raw_resource,
         required_args=["url"],
     )

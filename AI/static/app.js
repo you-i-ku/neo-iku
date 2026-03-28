@@ -714,8 +714,6 @@ const LLM_PRESETS = {
 };
 
 const llmService = document.getElementById("llm-service");
-const llmKeyRow = document.getElementById("llm-key-row");
-const llmApiKey = document.getElementById("llm-api-key");
 const llmModel = document.getElementById("llm-model");
 const llmSaveBtn = document.getElementById("llm-save-btn");
 const llmTestBtn = document.getElementById("llm-test-btn");
@@ -732,7 +730,6 @@ for (const [key, p] of Object.entries(LLM_PRESETS)) {
 function applyPreset(key, currentModel) {
     const p = LLM_PRESETS[key];
     if (!p) return;
-    llmKeyRow.style.display = p.needs_key ? "" : "none";
     // モデルドロップダウンを再構築
     llmModel.innerHTML = "";
     for (const m of p.models) {
@@ -768,8 +765,6 @@ async function loadLLMSettings() {
         }
         llmService.value = matched;
         applyPreset(matched, data.model || null);
-        llmApiKey.value = "";
-        llmApiKey.placeholder = data.has_api_key ? "（設定済み）" : "APIキーを入力";
     } catch (e) {
         console.error("LLM設定取得エラー:", e);
         applyPreset("lmstudio", null);
@@ -783,9 +778,6 @@ llmSaveBtn.addEventListener("click", async () => {
         base_url: preset.base_url,
         model: llmModel.value || preset.models[0].id,
     };
-    if (llmApiKey.value) {
-        body.api_key = llmApiKey.value;
-    }
     try {
         llmStatus.textContent = "保存中...";
         llmStatus.style.color = "var(--text-secondary)";
@@ -797,7 +789,6 @@ llmSaveBtn.addEventListener("click", async () => {
         if (resp.ok) {
             llmStatus.textContent = "✓ 保存完了";
             llmStatus.style.color = "#3fb950";
-            llmApiKey.value = "";
             await loadLLMSettings();
         } else {
             llmStatus.textContent = "✗ エラー";
@@ -1957,6 +1948,77 @@ document.getElementById('persona-episodes-clear-btn').addEventListener('click', 
     if (!confirm('全エピソードを削除しますか？')) return;
     await fetch(`/api/personas/${activePersona.id}/episodes`, { method: 'DELETE' });
     loadPersonaTab(activePersona.id);
+});
+
+// --- APIキー設定ポップアップ ---
+
+const envKeysPopup = document.getElementById("envkeys-popup");
+const envKeysList = document.getElementById("envkeys-list");
+const envKeysCloseBtn = document.querySelector(".envkeys-popup-close");
+const envKeysBtn = document.getElementById("env-keys-btn");
+
+async function loadEnvKeys() {
+    try {
+        const resp = await fetch("/api/dev/env-keys");
+        const data = await resp.json();
+        envKeysList.innerHTML = "";
+        for (const item of data) {
+            const div = document.createElement("div");
+            div.className = "envkeys-item";
+            div.innerHTML = `
+                <div class="envkeys-item-header">
+                    <span class="envkeys-item-label">${item.label}</span>
+                    <span class="envkeys-item-current">${item.masked || "未設定"}</span>
+                </div>
+                <div class="envkeys-item-row">
+                    <input type="password" placeholder="新しいキーを入力..." data-key="${item.key}">
+                    <button data-key="${item.key}">保存</button>
+                </div>
+                <div class="envkeys-item-status" data-status-key="${item.key}"></div>
+            `;
+            div.querySelector("button").addEventListener("click", async (e) => {
+                const key = e.target.dataset.key;
+                const input = div.querySelector("input");
+                const status = div.querySelector(`[data-status-key="${key}"]`);
+                const value = input.value.trim();
+                if (!value) { status.textContent = "キーを入力してください"; status.style.color = "#f85149"; return; }
+                status.textContent = "保存中...";
+                status.style.color = "var(--text-secondary)";
+                try {
+                    const resp = await fetch("/api/dev/env-keys", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ key, value }),
+                    });
+                    if (resp.ok) {
+                        status.textContent = "✓ 保存完了";
+                        status.style.color = "#3fb950";
+                        input.value = "";
+                        await loadEnvKeys();
+                    } else {
+                        const err = await resp.json().catch(() => ({}));
+                        status.textContent = "✗ " + (err.detail || "エラー");
+                        status.style.color = "#f85149";
+                    }
+                } catch (e) {
+                    status.textContent = "✗ 通信エラー";
+                    status.style.color = "#f85149";
+                }
+            });
+            envKeysList.appendChild(div);
+        }
+    } catch (e) {
+        envKeysList.innerHTML = '<div style="color:var(--text-secondary)">読み込みエラー</div>';
+    }
+}
+
+envKeysBtn.addEventListener("click", () => {
+    envKeysPopup.style.display = "flex";
+    loadEnvKeys();
+});
+envKeysCloseBtn.addEventListener("click", () => { envKeysPopup.style.display = "none"; });
+envKeysPopup.addEventListener("click", (e) => {
+    if (e.target === envKeysPopup) envKeysPopup.style.display = "none";
 });
 
 // --- 初期化 ---

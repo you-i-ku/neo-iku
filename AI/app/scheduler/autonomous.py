@@ -45,6 +45,7 @@ class AutonomousScheduler:
         self._pending_messages: list[dict] = []  # ユーザー入力キュー
         self._energy_breakdown: dict[str, float] = {}  # シグナル種別ごとのエネルギー貢献度
         self._session_count: int = 0  # 自律行動セッション番号（起動ごとにリセット）
+        self._tool_usage_window: deque[dict] = deque(maxlen=50)  # 退屈乗数・習熟検出用
 
         # Ablationフラグ（ランタイムで切替可能）
         self.ablation_energy = ABLATION_ENERGY_SYSTEM
@@ -59,11 +60,12 @@ class AutonomousScheduler:
         self._pending_messages.append({"text": text})
         self.add_signal("user_message", text[:100])
 
-    def add_signal(self, signal_type: str, detail: str = ""):
+    def add_signal(self, signal_type: str, detail: str = "", weight_override: float | None = None):
         self._signal_buffer.append({
             "type": signal_type,
             "detail": detail,
             "time": time.time(),
+            "weight_override": weight_override,
         })
         logger.debug(f"シグナル追加: {signal_type} ({detail})")
         # パイプライン処理中は動機チェックを遅延（エネルギーが途中で変動するレース条件を防止）
@@ -85,11 +87,13 @@ class AutonomousScheduler:
             costs = {}
             threshold = self._calc_default_threshold()
         # AI定義のコスト → デフォルトコスト → フォールバック値
-        cost = costs.get(tool_name,
+        base_cost = costs.get(tool_name,
                 MOTIVATION_DEFAULT_ACTION_COSTS.get(tool_name, MOTIVATION_DEFAULT_ACTION_COST_FALLBACK))
-        if isinstance(cost, (int, float)) and cost > 0:
+        if isinstance(base_cost, (int, float)) and base_cost > 0:
+            boredom = self._calc_boredom_multiplier(tool_name)
+            cost = base_cost * boredom
             self._motivation_energy = max(0, self._motivation_energy - cost)
-            logger.info(f"エネルギー消費: {tool_name} cost={cost} → energy={self._motivation_energy:.1f}")
+            logger.info(f"エネルギー消費: {tool_name} cost={cost:.1f} (base={base_cost} boredom={boredom:.2f}x) → energy={self._motivation_energy:.1f}")
             # UI更新
             try:
                 import json
@@ -103,6 +107,52 @@ class AutonomousScheduler:
                 })))
             except RuntimeError:
                 pass
+
+    def record_tool_usage(self, tool_name: str, pred_accuracy: float | None = None):
+        """ツール使用を記録（退屈乗数・習熟検出用）"""
+        self._tool_usage_window.append({
+            "tool": tool_name,
+            "time": time.time(),
+            "pred_accuracy": pred_accuracy,
+        })
+
+    def _calc_boredom_multiplier(self, tool_name: str) -> float:
+        """退屈乗数: 直近使用頻度と予測精度に基づくコスト増加"""
+        recent = [e for e in self._tool_usage_window if e["tool"] == tool_name]
+        if not recent:
+            return 1.0
+
+        # 頻度ペナルティ: 直近50件中の使用率（最大3.0倍）
+        freq_ratio = len(recent) / max(len(self._tool_usage_window), 1)
+        freq_penalty = 1.0 + freq_ratio * 2.0
+
+        # 予測精度ペナルティ: 予測が当たりすぎるツールは退屈（最大2.0倍）
+        accuracies = [e["pred_accuracy"] for e in recent if e["pred_accuracy"] is not None]
+        if accuracies:
+            avg_accuracy = sum(accuracies) / len(accuracies)
+            pred_penalty = 1.0 + avg_accuracy
+        else:
+            pred_penalty = 1.0
+
+        return freq_penalty * pred_penalty
+
+    def _check_mastery(self):
+        """習熟検出: 予測精度が高い状態が続いたら探索シグナルを発火"""
+        from config import MASTERY_THRESHOLD, MASTERY_ENERGY
+        recent = list(self._tool_usage_window)
+        accuracies = [e["pred_accuracy"] for e in recent[-20:] if e.get("pred_accuracy") is not None]
+        if len(accuracies) < 5:
+            return
+
+        avg = sum(accuracies) / len(accuracies)
+        if avg > MASTERY_THRESHOLD:
+            self._signal_buffer.append({
+                "type": "mastery_detected",
+                "detail": f"avg_accuracy={avg:.2f} over {len(accuracies)} predictions",
+                "time": time.time(),
+                "weight_override": MASTERY_ENERGY,
+            })
+            logger.info(f"習熟検出: avg_accuracy={avg:.2f}")
 
     def _try_check_motivation(self):
         if self._is_checking:
@@ -180,7 +230,8 @@ class AutonomousScheduler:
             for sig in signals:
                 if self._is_speaking and sig["type"] in _internal_signals:
                     continue
-                weight = weights.get(sig["type"], 0)
+                wo = sig.get("weight_override")
+                weight = wo if wo is not None else weights.get(sig["type"], 0)
                 if isinstance(weight, (int, float)):
                     self._motivation_energy += weight
                     if weight > 0:
@@ -192,6 +243,9 @@ class AutonomousScheduler:
             if MOTIVATION_FLUCTUATION_SIGMA > 0:
                 fluctuation = random.gauss(0, MOTIVATION_FLUCTUATION_SIGMA)
                 self._motivation_energy = max(0, self._motivation_energy + fluctuation)
+
+            # 習熟検出: 予測精度が高い状態が続いたら探索シグナルを発火
+            self._check_mastery()
 
             logger.info(f"動機チェック: energy={self._motivation_energy:.1f} threshold={threshold} signals={len(signals)} speaking={self._is_speaking}")
 
@@ -439,94 +493,20 @@ class AutonomousScheduler:
         if not self.ablation_distillation:
             logger.debug("蒸留無効（ablation）: 振り返りスキップ")
         elif result.step_history:
+            # 強制蒸留停止: LLM呼び出し（_reflect_on_action/_save_principle/_consolidate_principles）を削除
+            # ツールエラーのシグナル発火のみ残す
             try:
-                action_description = selected_action["description"] if selected_action else action_goal
-                if not action_description:
-                    tool_names = [s["tool"] for s in result.step_history if s.get("tool")]
-                    if tool_names:
-                        action_description = " → ".join(tool_names)
-                    else:
-                        action_description = ""
-
-                if action_description:
-                    result_lines = []
-                    metacog_lines = []
-                    for s in result.step_history:
-                        result_lines.append(f"{s['tool']}: {s['result_summary']}")
-                        sint = s.get('intent')
-                        sexp = s.get('expected')
-                        sres = s.get('result_summary', '')
-                        if sint or sexp:
-                            parts = []
-                            if sint: parts.append(f"意図「{sint}」")
-                            if sexp: parts.append(f"予測「{sexp}」")
-                            parts.append(f"結果「{sres}」")
-                            line = f"{s['tool']}: " + " → ".join(parts)
-                            pairs = []
-                            if sint and sexp:
-                                pairs.append(f"  [意図→予測] 意図「{sint}」に対し予測「{sexp}」")
-                            if sint and sres:
-                                pairs.append(f"  [意図→結果] 意図「{sint}」に対し結果「{sres}」")
-                            if sexp and sres:
-                                pairs.append(f"  [予測→結果] 予測「{sexp}」に対し結果「{sres}」")
-                            if pairs:
-                                line += "\n" + "\n".join(pairs)
-                            metacog_lines.append(line)
-                    tool_results_text = "\n".join(result_lines)
-                    if result.last_full_result:
-                        tool_results_text += f"\n\n最後の結果:\n{result.last_full_result[:500]}"
-
-                    if tool_results_text:
-                        prediction_text = "\n".join(metacog_lines) if metacog_lines else ""
-
-                        has_error = any(
-                            s.get("result_summary", "").startswith("エラー") for s in result.step_history
-                        )
-                        if has_error:
-                            self.add_signal("tool_error", f"action={action_description[:50]}")
-
-                        drive = selected_action.get("drive", "") if selected_action else ""
-                        principle, raw_response = await self._reflect_on_action(
-                            action_description, tool_results_text, self_model, prediction_text,
-                            drive=drive, strategy=selected_strategy or "",
-                            mirror_values=mirror_values or None,
-                        )
-
-                        if result.conv_id and (raw_response or principle):
-                            try:
-                                from app.memory.database import async_session
-                                from sqlalchemy import text
-                                async with async_session() as session:
-                                    await session.execute(text(
-                                        "UPDATE conversations SET distillation_response = :resp, "
-                                        "distillation_principle = :prin WHERE id = :cid"
-                                    ), {"resp": raw_response, "prin": principle, "cid": result.conv_id})
-                                    await session.commit()
-                            except Exception as e:
-                                logger.error(f"蒸留DB保存エラー: {e}")
-
-                            try:
-                                from app.pipeline import pipeline
-                                await pipeline._broadcast(json.dumps({
-                                    "type": "distillation_update",
-                                    "conv_id": result.conv_id,
-                                    "distillation_response": raw_response,
-                                    "principle": principle,
-                                }))
-                            except Exception as e:
-                                logger.error(f"蒸留更新WS通知エラー: {e}")
-
-                        if principle:
-                            self._save_principle(principle, self_model)
-                            logger.info(f"特性抽出: {principle}")
-
-                            from app.tools.builtin import _load_self_model
-                            fresh_model = _load_self_model()
-                            principles = fresh_model.get("principles", [])
-                            if isinstance(principles, list) and len(principles) >= 10:
-                                await self._consolidate_principles(fresh_model)
+                has_error = any(
+                    s.get("result_summary", "").startswith("エラー") for s in result.step_history
+                )
+                if has_error:
+                    action_description = selected_action["description"] if selected_action else action_goal
+                    if not action_description:
+                        tool_names = [s["tool"] for s in result.step_history if s.get("tool")]
+                        action_description = " → ".join(tool_names) if tool_names else "unknown"
+                    self.add_signal("tool_error", f"action={action_description[:50]}")
             except Exception as e:
-                logger.error(f"振り返りフォールバック: {e}")
+                logger.error(f"振り返りエラーチェック: {e}")
 
         # 行動ログファイル出力（自律行動のみ）
         if session_num is not None:
@@ -967,7 +947,7 @@ class AutonomousScheduler:
         if non_idle:
             last_activity = max(s["time"] for s in non_idle)
             elapsed_min = int((time.time() - last_activity) / 60)
-            idle_text = f"最後の活動から{elapsed_min}分経過" if elapsed_min > 0 else "直前に活動あり"
+            idle_text = f"最後の活動から{elapsed_min}分経過" if elapsed_min > 0 else ""
         else:
             idle_text = f"idle状態（{len(source)}tick）"
 

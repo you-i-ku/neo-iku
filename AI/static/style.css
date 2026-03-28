@@ -2440,3 +2440,81 @@ details.distillation-section[open] > .distillation-summary::before {
     color: #fff;
     border-color: var(--accent);
 }
+
+/* --- APIキー設定ポップアップ --- */
+.envkeys-popup {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.6);
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.envkeys-popup-content {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-secondary);
+    border-radius: 10px;
+    width: 480px;
+    max-width: 90vw;
+    padding: 24px;
+}
+.envkeys-popup-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+}
+.envkeys-popup-header h3 { font-size: 16px; color: var(--text-primary); margin: 0; }
+.envkeys-popup-close {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 22px;
+    cursor: pointer;
+}
+.envkeys-list { display: flex; flex-direction: column; gap: 12px; }
+.envkeys-item {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px;
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    background: var(--bg-tertiary);
+}
+.envkeys-item-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.envkeys-item-label { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+.envkeys-item-current { font-size: 11px; color: var(--text-secondary); font-family: monospace; }
+.envkeys-item-row {
+    display: flex;
+    gap: 6px;
+}
+.envkeys-item-row input {
+    flex: 1;
+    padding: 5px 8px;
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: 13px;
+    font-family: monospace;
+}
+.envkeys-item-row button {
+    padding: 5px 12px;
+    border: 1px solid var(--border-secondary);
+    border-radius: 4px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 12px;
+    cursor: pointer;
+}
+.envkeys-item-row button:hover { opacity: 0.85; }
+.envkeys-item-status {
+    font-size: 11px;
+    min-height: 14px;
+}

@@ -6,6 +6,10 @@ __pycache__/
 venv/
 .venv/
 
+# Secrets
+.env
+AI/.env
+
 # Data (auto-generated)
 data/
 

@@ -1,9 +1,26 @@
 """neo-iku 設定"""
+import os
 from pathlib import Path
 
 # パス
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
+
+# .env読み込み（python-dotenvがあれば使う、なければos.environから直接）
+_env_path = BASE_DIR / ".env"
+try:
+    from dotenv import load_dotenv
+    load_dotenv(_env_path)
+except ImportError:
+    # python-dotenvなし: .envを手動パース
+    if _env_path.exists():
+        for line in _env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if k and k not in os.environ:
+                    os.environ[k] = v
 PERSONAS_DIR = DATA_DIR / "personas"
 STATIC_DIR = BASE_DIR / "static"
 
@@ -11,8 +28,10 @@ STATIC_DIR = BASE_DIR / "static"
 DATABASE_URL = f"sqlite+aiosqlite:///{DATA_DIR / 'iku.db'}"
 
 # LLM（デフォルト: LM Studio。UIから変更可、data/llm_settings.jsonに永続化）
-LLM_BASE_URL = "http://localhost:1234/v1"
-LLM_MODEL = "default"
+# .envのLLM_BASE_URL/LLM_API_KEY/LLM_MODELがあればそちらを優先
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:1234/v1")
+LLM_MODEL = os.environ.get("LLM_MODEL", "default")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")  # .envまたは環境変数から取得
 LLM_TIMEOUT = 300.0  # 5分（ツール結果含むとコンテキストが大きくなるため）
 LLM_MAX_TOKENS = 8192  # 応答の最大トークン数（think+ツール呼び出し含む）
 LLM_FREQUENCY_PENALTY = 0.5  # 繰り返しペナルティ（0.0〜2.0、高いほど同じトークンを避ける）
@@ -58,6 +77,8 @@ MOTIVATION_DEFAULT_WEIGHTS = {
     "self_model_update": 8,   # 自己が変化した
     "prediction_made": 5,     # 予測を行った
     "env_stimulus": 5,         # 環境刺激（ランダム注入）
+    "intent_result": 5,        # 意図達成度シグナル（動的weight_overrideで上書きされることが多い）
+    "mastery_detected": 30,    # 習熟検出（高エネルギー → 探索行動を促す）
 }
 
 # デフォルト行動コスト（神経系）: ツール実行ごとのエネルギー消費量
@@ -111,6 +132,16 @@ STRATEGY_CANDIDATES = 3  # 戦略候補生成数（0で無効）
 # ベクトル検索
 VECTOR_SEARCH_ENABLED = True
 VECTOR_SEARCH_LIMIT = 5
+
+# Web検索
+BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "")  # Brave Search API（無料2000/月）
+
+# 情報的実存: 予測誤差エネルギー（逆U字カーブ）
+PREDICTION_ENERGY_PEAK = 20.0   # 予測誤差エネルギーの最大値（similarity=0.5でピーク）
+
+# 情報的実存: 習熟検出
+MASTERY_THRESHOLD = 0.7         # 習熟検出の予測精度閾値（直近の平均accuracy）
+MASTERY_ENERGY = 30.0           # 習熟検出時のエネルギー（高い → 探索行動を促す）
 
 ABLATION_ENERGY_SYSTEM = True    # False: エネルギー蓄積/閾値/消費を無効化（固定インターバルで発火）
 ABLATION_SELF_MODEL = True       # False: self_model読み書きを無効化（常に空を返す）

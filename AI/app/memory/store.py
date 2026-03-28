@@ -113,7 +113,12 @@ async def record_tool_action(
 ) -> ToolAction:
     """ツール実行履歴を記録"""
     args_json = json.dumps(args, ensure_ascii=False)
-    result_summary = result[:500]
+    # search_action_logは自己参照で入れ子膨張するため、DB記録は短縮
+    if tool_name == "search_action_log":
+        count = result.count("\n- [")
+        result_summary = f"行動履歴{count}件取得"
+    else:
+        result_summary = result[:500]
 
     action = ToolAction(
         conversation_id=conversation_id,

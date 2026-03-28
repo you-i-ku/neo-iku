@@ -342,18 +342,13 @@ async def get_llm_settings():
 class LLMConfigRequest(BaseModel):
     base_url: str
     model: str
-    api_key: str = ""
 
 
 @router.post("/llm/configure")
 async def configure_llm(req: LLMConfigRequest):
-    """LLMを再設定し永続化。api_key空なら既存キーを維持。"""
-    api_key = req.api_key
-    if not api_key:
-        # 既存のキーを維持
-        saved = llm_manager.load_settings()
-        if saved:
-            api_key = saved.get("api_key", "")
+    """LLMを再設定し永続化。APIキーは.envから取得。"""
+    import os
+    api_key = os.environ.get("LLM_API_KEY", "")
     llm_manager.configure(
         base_url=req.base_url,
         model=req.model,
@@ -378,6 +373,89 @@ async def test_llm():
         return {"ok": True, "reply": reply[:100]}
     except Exception as e:
         return {"ok": False, "error": str(e)[:300]}
+
+
+# --- APIキー管理（.env） ---
+
+# .envで管理するキー一覧（表示名付き）
+_ENV_KEYS = [
+    {"key": "BRAVE_API_KEY", "label": "Brave Search API"},
+    {"key": "LLM_API_KEY", "label": "LLM API Key (Gemini/OpenAI等)"},
+]
+
+
+@router.get("/dev/env-keys")
+async def get_env_keys():
+    """".envのAPIキー一覧（マスク済み）"""
+    import os
+    result = []
+    for item in _ENV_KEYS:
+        val = os.environ.get(item["key"], "")
+        if val:
+            # マスク表示: 先頭4文字 + ****
+            masked = val[:4] + "****" if len(val) > 4 else "****"
+        else:
+            masked = ""
+        result.append({
+            "key": item["key"],
+            "label": item["label"],
+            "masked": masked,
+            "has_value": bool(val),
+        })
+    return result
+
+
+class EnvKeySaveRequest(BaseModel):
+    key: str
+    value: str
+
+
+@router.post("/dev/env-keys")
+async def save_env_key(req: EnvKeySaveRequest):
+    """.envにAPIキーを保存し、os.environも即時更新"""
+    import os
+    from config import BASE_DIR
+
+    # 許可されたキーのみ
+    allowed = {item["key"] for item in _ENV_KEYS}
+    if req.key not in allowed:
+        return {"ok": False, "error": f"不明なキー: {req.key}"}
+
+    env_path = BASE_DIR / ".env"
+
+    # .envを読み込み、該当行を更新
+    lines = []
+    found = False
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                k = stripped.split("=", 1)[0].strip()
+                if k == req.key:
+                    lines.append(f"{req.key}={req.value}")
+                    found = True
+                    continue
+            lines.append(line)
+
+    if not found:
+        lines.append(f"{req.key}={req.value}")
+
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # os.environに即時反映
+    os.environ[req.key] = req.value
+
+    # LLM_API_KEYが変更されたらプロバイダも再設定
+    if req.key == "LLM_API_KEY":
+        saved = llm_manager.load_settings()
+        if saved:
+            llm_manager.configure(
+                base_url=saved.get("base_url", "http://localhost:1234/v1"),
+                model=saved.get("model", "default"),
+                api_key=req.value,
+            )
+
+    return {"ok": True}
 
 
 @router.get("/models")

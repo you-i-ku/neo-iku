@@ -3,7 +3,7 @@ import json
 import logging
 from app.llm.base import BaseLLMProvider
 from app.llm.lmstudio import LMStudioProvider
-from config import LLM_BASE_URL, LLM_MODEL, LLM_SETTINGS_FILE
+from config import LLM_BASE_URL, LLM_MODEL, LLM_API_KEY, LLM_SETTINGS_FILE
 
 logger = logging.getLogger("iku.llm")
 
@@ -86,4 +86,4 @@ def setup_llm():
             api_key=saved.get("api_key", ""),
         )
     else:
-        llm_manager.configure(base_url=LLM_BASE_URL, model=LLM_MODEL)
+        llm_manager.configure(base_url=LLM_BASE_URL, model=LLM_MODEL, api_key=LLM_API_KEY)

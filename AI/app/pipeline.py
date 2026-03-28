@@ -647,12 +647,46 @@ class Pipeline:
             "tool_error" if action_status == "error" else "tool_success",
             tool_name,
         )
-        if expected:
+
+        # 予測誤差 → エネルギー変調（逆U字カーブ）
+        pred_accuracy = None
+        if expected and action_status == "success":
+            try:
+                from app.memory.vector_store import _embed_sync, cosine_similarity
+                embs = _embed_sync([expected, result[:500]])
+                if embs and len(embs) == 2:
+                    sim = cosine_similarity(embs[0], embs[1])
+                    pred_accuracy = sim
+                    pred_energy = self._compute_prediction_energy(sim)
+                    self._emit_signal("prediction_made", f"{tool_name}: sim={sim:.2f}", weight_override=pred_energy)
+                    logger.info(f"予測誤差エネルギー: {tool_name} sim={sim:.2f} → energy={pred_energy:.1f}")
+                else:
+                    self._emit_signal("prediction_made", f"{tool_name}: {expected[:50]}")
+            except Exception as e:
+                logger.debug(f"予測誤差embedding失敗: {e}")
+                self._emit_signal("prediction_made", f"{tool_name}: {expected[:50]}")
+        elif expected:
             self._emit_signal("prediction_made", f"{tool_name}: {expected[:50]}")
 
-        # エネルギー消費
+        # 意図達成度 → エネルギー変調
+        if intent and action_status == "success":
+            try:
+                from app.memory.vector_store import _embed_sync, cosine_similarity
+                embs = _embed_sync([intent, result[:500]])
+                if embs and len(embs) == 2:
+                    sim = cosine_similarity(embs[0], embs[1])
+                    intent_energy = self._compute_intent_energy(sim)
+                    self._emit_signal("intent_result", f"{tool_name}: sim={sim:.2f}", weight_override=intent_energy)
+                    logger.info(f"意図達成度エネルギー: {tool_name} sim={sim:.2f} → energy={intent_energy:.1f}")
+            except Exception as e:
+                logger.debug(f"意図達成度embedding失敗: {e}")
+
+        # エネルギー消費（退屈乗数統合済み）
         from app.scheduler.autonomous import scheduler
         scheduler.consume_energy(tool_name)
+
+        # ツール使用記録（退屈乗数・習熟検出用）
+        scheduler.record_tool_usage(tool_name, pred_accuracy)
 
         # dev tab結果
         await self._broadcast(json.dumps({
@@ -1117,12 +1151,27 @@ C. アプローチの説明"""
 
     # --- シグナル送信 ---
 
-    def _emit_signal(self, signal_type: str, detail: str = ""):
+    def _emit_signal(self, signal_type: str, detail: str = "", weight_override: float | None = None):
         try:
             from app.scheduler.autonomous import scheduler
-            scheduler.add_signal(signal_type, detail)
+            scheduler.add_signal(signal_type, detail, weight_override=weight_override)
         except Exception:
             pass
+
+    # --- 情報的実存: エネルギー変調 ---
+
+    @staticmethod
+    def _compute_prediction_energy(similarity: float) -> float:
+        """逆U字カーブ: 中程度の予測誤差で最大エネルギー"""
+        from config import PREDICTION_ENERGY_PEAK
+        return PREDICTION_ENERGY_PEAK * 4 * similarity * (1 - similarity)
+
+    @staticmethod
+    def _compute_intent_energy(similarity: float) -> float:
+        """意図達成度: 未達成で高エネルギー（再行動促進）、達成で適度"""
+        INTENT_BASE = 5.0
+        INTENT_UNFULFILLED_BONUS = 15.0
+        return INTENT_BASE + INTENT_UNFULFILLED_BONUS * (1 - similarity)
 
     # --- プロンプト構築（非LLMコア） ---
 
