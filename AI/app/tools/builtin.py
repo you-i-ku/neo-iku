@@ -585,10 +585,14 @@ PENDING_CREATE_TOOL_MARKER = "__PENDING_CREATE_TOOL__"
 CUSTOM_TOOLS_DIR = BASE_DIR / "app" / "tools" / "custom"
 
 
-async def create_tool(name: str = "", description: str = "", args_desc: str = "", code: str = "") -> str:
+async def create_tool(name: str = "", description: str = "", args_desc: str = "", code: str = "", content: str = "") -> str:
     """新しいツールを作成する（ユーザー承認が必要）"""
     global _pending_create_tool
     import re as _re
+
+    # ブロック形式でコードが渡された場合（[TOOL:create_tool ...]コード[/TOOL]）はcontentをcodeとして使う
+    if not code and content:
+        code = content
 
     if not name or not code:
         return "エラー: nameとcodeは必須です。"

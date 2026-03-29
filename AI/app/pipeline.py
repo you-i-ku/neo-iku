@@ -322,10 +322,11 @@ class Pipeline:
                         await add_message(session, conv_id, "assistant", plan_response)
                         await add_message(session, conv_id, "tool", f"[計画] {plan_text}")
                         await session.commit()
-                    # dev tab通知
+                    # dev tab通知（専用タイプ）
                     await self._broadcast(json.dumps({
-                        "type": "dev_stream",
-                        "content": f"[bandit計画] {plan_text}\n",
+                        "type": "dev_bandit_plan",
+                        "tools": planned_tools,
+                        "energy": scheduler._motivation_energy,
                     }))
 
             # === 3. 実行フェーズ ===
@@ -563,9 +564,14 @@ class Pipeline:
         # 重複検出（failしたツールは除外: リトライを許可する）
         call_key = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
         if call_key in seen_tool_calls:
-            logger.info(f"重複ツール呼び出しスキップ: {tool_name}")
-            step_history.append({"tool": tool_name, "args_summary": "", "result_summary": "重複スキップ"})
-            return "", "skipped", False
+            logger.info(f"重複ツール呼び出し: {tool_name}")
+            msg = f"[system] {tool_name} は既に全く同じ引数で実行済みです。結果は前回と同一になります。"
+            step_history.append({"tool": tool_name, "args_summary": "", "result_summary": "重複（同一引数で実行済み）"})
+            await self._broadcast(json.dumps({
+                "type": "autonomous_tool", "name": tool_name,
+                "args": "", "status": "skipped",
+            }))
+            return msg, "skipped", False
 
         args_str = " ".join(f"{k}={v}" for k, v in tool_args.items()) if tool_args else ""
         is_output = tool_name == "output_UI"

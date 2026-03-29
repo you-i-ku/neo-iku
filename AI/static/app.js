@@ -157,6 +157,9 @@ function connect() {
             case "dev_strategy":
                 appendDevStrategy(data.candidates, data.selected);
                 break;
+            case "dev_bandit_plan":
+                appendDevBanditPlan(data.tools, data.energy);
+                break;
 
             case "write_approval":
                 showWriteApproval(data);
@@ -343,6 +346,17 @@ function appendDevStrategy(candidates, selected) {
         return `${marker}${letter}. ${c}`;
     });
     el.textContent = lines.join("\n");
+    s.sessionEl.appendChild(el);
+    devScrollToBottom();
+}
+
+function appendDevBanditPlan(tools, energy) {
+    const s = devS();
+    if (!s.sessionEl) return;
+    const el = document.createElement("div");
+    el.className = "dev-strategy";
+    el.style.borderColor = "#5588aa";
+    el.textContent = `[bandit] ${tools.join(" → ")}  (energy: ${Math.round(energy)})`;
     s.sessionEl.appendChild(el);
     devScrollToBottom();
 }
