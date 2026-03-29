@@ -498,6 +498,44 @@ async def trigger_autonomous():
     return {"triggered": True}
 
 
+@router.get("/dev/custom-tools")
+async def list_custom_tools():
+    """AI作成カスタムツール一覧"""
+    from app.tools.builtin import CUSTOM_TOOLS_DIR
+    from app.tools.registry import get_all_tools
+    tools = []
+    if CUSTOM_TOOLS_DIR.exists():
+        for py_file in sorted(CUSTOM_TOOLS_DIR.glob("*.py")):
+            if py_file.name.startswith("_"):
+                continue
+            name = py_file.stem
+            registered = get_all_tools().get(name)
+            tools.append({
+                "name": name,
+                "file": py_file.name,
+                "description": registered["description"] if registered else "(未登録)",
+            })
+    return {"tools": tools}
+
+
+@router.delete("/dev/custom-tools/{tool_name}")
+async def delete_custom_tool(tool_name: str):
+    """AI作成カスタムツールを削除（ファイル削除 + レジストリ登録解除）"""
+    from app.tools.builtin import CUSTOM_TOOLS_DIR
+    from app.tools.registry import unregister_tool
+    import re
+    if not re.match(r'^[a-z][a-z0-9_]*$', tool_name):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="無効なツール名")
+    file_path = CUSTOM_TOOLS_DIR / f"{tool_name}.py"
+    if not file_path.exists():
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="ツールが見つかりません")
+    file_path.unlink()
+    unregister_tool(tool_name)
+    return {"deleted": tool_name}
+
+
 
 @router.post("/dev/reset-db")
 async def reset_db():
