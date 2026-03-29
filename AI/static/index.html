@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>イク — neo-iku</title>
-    <link rel="stylesheet" href="/static/style.css?v=57">
+    <link rel="stylesheet" href="/static/style.css?v=59">
 </head>
 <body>
     <!-- ステータスバー -->
@@ -190,14 +190,9 @@
                         <span class="ablation-detail">OFF: expect=引数を無視（予測誤差ループ無効）</span>
                     </label>
                     <label class="ablation-toggle">
-                        <input id="abl-distillation" type="checkbox" checked>
-                        <span class="ablation-name">蒸留</span>
-                        <span class="ablation-detail">OFF: 振り返り・原則蒸留を無効化</span>
-                    </label>
-                    <label class="ablation-toggle">
                         <input id="abl-bandit" type="checkbox">
                         <span class="ablation-name">バンディット計画</span>
-                        <span class="ablation-detail">ON: バンディットアルゴリズムで計画フェーズを代替（デフォルトはLLM計画）</span>
+                        <span class="ablation-detail">OFF: LLM計画フェーズを使用（バンディット無効）</span>
                     </label>
                 </div>
             </div>
@@ -323,6 +318,6 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=57"></script>
+    <script src="/static/app.js?v=59"></script>
 </body>
 </html>

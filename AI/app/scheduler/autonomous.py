@@ -16,7 +16,7 @@ from config import (
     ENV_STIMULUS_ENABLED, ENV_STIMULUS_PROBABILITY,
     DATA_DIR,
     ABLATION_ENERGY_SYSTEM, ABLATION_SELF_MODEL,
-    ABLATION_PREDICTION, ABLATION_DISTILLATION, ABLATION_BANDIT,
+    ABLATION_PREDICTION, ABLATION_BANDIT,
 )
 import math
 
@@ -51,7 +51,6 @@ class AutonomousScheduler:
         self.ablation_energy = ABLATION_ENERGY_SYSTEM
         self.ablation_self_model = ABLATION_SELF_MODEL
         self.ablation_prediction = ABLATION_PREDICTION
-        self.ablation_distillation = ABLATION_DISTILLATION
         self.ablation_bandit = ABLATION_BANDIT
 
     # --- シグナル ---
@@ -494,9 +493,7 @@ class AutonomousScheduler:
         principle = None
         raw_response = None
 
-        if not self.ablation_distillation:
-            logger.debug("蒸留無効（ablation）: 振り返りスキップ")
-        elif result.step_history:
+        if result.step_history:
             # 強制蒸留停止: LLM呼び出し（_reflect_on_action/_save_principle/_consolidate_principles）を削除
             # ツールエラーのシグナル発火のみ残す
             try:
