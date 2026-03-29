@@ -143,6 +143,11 @@ PREDICTION_ENERGY_PEAK = 20.0   # 予測誤差エネルギーの最大値（simi
 MASTERY_THRESHOLD = 0.7         # 習熟検出の予測精度閾値（直近の平均accuracy）
 MASTERY_ENERGY = 30.0           # 習熟検出時のエネルギー（高い → 探索行動を促す）
 
+# バンディット計画選択
+BANDIT_DEFAULT_REWARD = 10.0     # expect=なし時のデフォルト報酬（逆U字ピーク20の半分）
+BANDIT_NOISE_SIGMA = 3.0         # 通常時の探索ノイズ標準偏差
+BANDIT_COLD_NOISE_SIGMA = 5.0    # コールドスタート時のノイズ（やや大きめ）
+
 ABLATION_ENERGY_SYSTEM = True    # False: エネルギー蓄積/閾値/消費を無効化（固定インターバルで発火）
 ABLATION_SELF_MODEL = True       # False: self_model読み書きを無効化（常に空を返す）
 ABLATION_PREDICTION = True       # False: expect=引数を無視（予測-検証ループ無効）

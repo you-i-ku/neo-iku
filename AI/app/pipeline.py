@@ -28,6 +28,7 @@ from app.tools.builtin import (
 )
 from app.memory.store import get_conversation_messages
 from config import BASE_DIR, EXEC_CODE_TIMEOUT, CONTEXT_KEEP_ROUNDS, CHAT_HISTORY_MESSAGES, TOOL_MAX_CALLS_PER_RESPONSE, TOOL_SAME_NAME_LIMIT, PLAN_EXECUTE_ENABLED, PLAN_MAX_TOOLS, STRATEGY_CANDIDATES
+from app.bandit import bandit_select_tools, compute_reward, update_reward
 
 logger = logging.getLogger("iku.pipeline")
 
@@ -262,11 +263,9 @@ class Pipeline:
             # === 1.5 戦略候補生成 ===
             selected_strategy = ""
             strategy_candidates = []
-            planning_tool_text = build_planning_prompt(mirror_seed=mirror_seed)
-
             if PLAN_EXECUTE_ENABLED and self.strategy_candidates > 0:
                 strategy_prompt = self._build_strategy_prompt(
-                    action_goal, planning_tool_text, req.signal_summary,
+                    action_goal, req.signal_summary,
                     user_input=req.user_input,
                     mirror_display=mirror_display,
                 )
@@ -295,40 +294,39 @@ class Pipeline:
                 else:
                     logger.warning("戦略候補パース失敗 → 戦略なしで計画続行")
 
-            # === 2. 計画フェーズ ===
+            # === 2. 計画フェーズ（バンディット） ===
             use_plan_execute = PLAN_EXECUTE_ENABLED
             planned_tools = None
 
             if use_plan_execute:
-                planning_prompt = self._build_planning_prompt(
-                    action_goal, planning_tool_text, req.signal_summary,
-                    user_input=req.user_input,
-                    selected_strategy=selected_strategy,
-                    mirror_display=mirror_display,
+                from app.scheduler.autonomous import scheduler
+                bandit_rewards = self._load_bandit_rewards()
+                all_tool_names = list(get_all_tools().keys())
+
+                planned_tools = bandit_select_tools(
+                    all_tool_names=all_tool_names,
+                    bandit_rewards=bandit_rewards,
+                    available_energy=scheduler._motivation_energy,
+                    action_costs_fn=lambda name: scheduler._get_action_cost_with_boredom(name),
+                    max_tools=PLAN_MAX_TOOLS,
                 )
-                plan_messages = [
-                    {"role": "system", "content": system_base or ""},
-                    {"role": "user", "content": planning_prompt},
-                ]
-
-                logger.info("計画フェーズ: LLM呼び出し")
-                plan_response, _, _ = await self._call_llm_streaming(plan_messages, req.source, 0)
-
-                if plan_response:
-                    clean_plan = self._strip_think(plan_response)
-                    planned_tools = parse_plan(clean_plan)
 
                 if not planned_tools:
-                    logger.warning("計画パース失敗 → 1ショットにフォールバック")
+                    logger.warning(f"バンディット計画: ツール選択なし（energy={scheduler._motivation_energy:.1f}） → 1ショットにフォールバック")
                     use_plan_execute = False
                 else:
-                    planned_tools = planned_tools[:PLAN_MAX_TOOLS]
                     plan_text = " → ".join(planned_tools)
-                    logger.info(f"計画確定: [{plan_text}]")
+                    plan_response = f"[bandit] {plan_text}"
+                    logger.info(f"バンディット計画: [{plan_text}]")
                     async with async_session() as session:
                         await add_message(session, conv_id, "assistant", plan_response)
                         await add_message(session, conv_id, "tool", f"[計画] {plan_text}")
                         await session.commit()
+                    # dev tab通知
+                    await self._broadcast(json.dumps({
+                        "type": "dev_stream",
+                        "content": f"[bandit計画] {plan_text}\n",
+                    }))
 
             # === 3. 実行フェーズ ===
             if use_plan_execute:
@@ -351,6 +349,7 @@ class Pipeline:
                         round_idx=round_idx, total_rounds=max_rounds,
                         user_input=req.user_input,
                         mirror_display=mirror_display,
+                        selected_strategy=selected_strategy,
                     )
                     exec_messages = [
                         {"role": "system", "content": system_base or ""},
@@ -688,6 +687,12 @@ class Pipeline:
         # ツール使用記録（退屈乗数・習熟検出用）
         scheduler.record_tool_usage(tool_name, pred_accuracy)
 
+        # バンディット報酬更新
+        reward_val = compute_reward(pred_accuracy)
+        bandit_rw = self._load_bandit_rewards()
+        update_reward(bandit_rw, tool_name, reward_val)
+        self._save_bandit_rewards(bandit_rw)
+
         # dev tab結果
         await self._broadcast(json.dumps({
             "type": "dev_tool_result",
@@ -743,9 +748,9 @@ class Pipeline:
 
         return result_text, action_status, had_output
 
-    def _build_strategy_prompt(self, action_goal: str, tool_text: str, signal_summary: str,
+    def _build_strategy_prompt(self, action_goal: str, signal_summary: str,
                                user_input: str = "", mirror_display: str = "") -> str:
-        """戦略候補生成用プロンプト"""
+        """戦略候補生成用プロンプト（ツール名を含めない — ツール選択はバンディットの役割）"""
         now = datetime.now().strftime('%Y年%m月%d日 %H:%M')
         goal_line = f"\n行動目標: {action_goal}" if action_goal else ""
         signal_line = f"\n{signal_summary}" if signal_summary else ""
@@ -755,11 +760,11 @@ class Pipeline:
         return f"""【状況】
 日時: {now}{goal_line}{signal_line}{mirror_line}{user_line}
 
-【利用可能ツール】
-{tool_text}
+【能力カテゴリ】
+ファイル読み書き、記憶の検索と記録、自己モデルの更新、Web検索と情報取得、コード実行と拡張、システム状態の確認、発言と沈黙
 
 【出力指示】
-上記ツールを使って取りうるアプローチを{self.strategy_candidates}つ、それぞれ異なる方向性で列挙する。各アプローチは1行で簡潔に記述する。
+上記の能力を使って取りうるアプローチを{self.strategy_candidates}つ、それぞれ異なる方向性で列挙する。具体的なツール名は使わず、方針・意図・目的を記述する。各アプローチは1行で簡潔に。
 
 形式:
 A. アプローチの説明
@@ -846,10 +851,12 @@ C. アプローチの説明"""
         previous_results: list[dict], signal_summary: str,
         round_idx: int, total_rounds: int,
         user_input: str = "", mirror_display: str = "",
+        selected_strategy: str = "",
     ) -> str:
         """実行フェーズ用プロンプト（自由選択）"""
         now = datetime.now().strftime('%Y年%m月%d日 %H:%M')
         goal_line = f"\n行動目標: {action_goal}" if action_goal else ""
+        strategy_line = f"\nアプローチ: {selected_strategy}" if selected_strategy else ""
         user_line = f"\n\n【ユーザー入力】\n{user_input}" if user_input else ""
         mirror_line = f"\n[{mirror_display}]" if mirror_display else ""
 
@@ -867,7 +874,7 @@ C. アプローチの説明"""
             prev_text = "\n\n【これまでの結果】\n" + "\n".join(prev_lines)
 
         return f"""【状況】
-日時: {now}{goal_line}{plan_line}{mirror_line}
+日時: {now}{goal_line}{strategy_line}{plan_line}{mirror_line}
 ラウンド {round_idx + 1}/{total_rounds}{user_line}{prev_text}
 
 【利用可能ツール】
@@ -1157,6 +1164,19 @@ C. アプローチの説明"""
             scheduler.add_signal(signal_type, detail, weight_override=weight_override)
         except Exception:
             pass
+
+    # --- バンディット報酬永続化 ---
+
+    def _load_bandit_rewards(self) -> dict:
+        sm = _load_self_model()
+        r = sm.get("bandit_rewards", {})
+        return r if isinstance(r, dict) else {}
+
+    def _save_bandit_rewards(self, rewards: dict):
+        sm = _load_self_model()
+        sm["bandit_rewards"] = rewards
+        from app.tools.builtin import _save_self_model
+        _save_self_model(sm, changed_key="bandit_rewards")
 
     # --- 情報的実存: エネルギー変調 ---
 

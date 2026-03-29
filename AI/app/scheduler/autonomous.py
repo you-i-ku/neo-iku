@@ -72,29 +72,32 @@ class AutonomousScheduler:
         if not self._is_speaking:
             self._try_check_motivation()
 
-    def consume_energy(self, tool_name: str):
-        """ツール実行によるエネルギー消費"""
-        if not self.ablation_energy:
-            return
+    def _get_action_cost_with_boredom(self, tool_name: str) -> float:
+        """ツールの実効コスト（退屈乗数込み）を返す。バンディットのcost_fnとしても使用"""
         from app.tools.builtin import _load_self_model
         self_model = _load_self_model()
         rules = self_model.get("motivation_rules")
         if isinstance(rules, dict):
             costs = rules.get("action_costs", {})
-            ai_threshold = rules.get("threshold")
-            threshold = ai_threshold if ai_threshold is not None else self._calc_default_threshold()
         else:
             costs = {}
-            threshold = self._calc_default_threshold()
-        # AI定義のコスト → デフォルトコスト → フォールバック値
         base_cost = costs.get(tool_name,
                 MOTIVATION_DEFAULT_ACTION_COSTS.get(tool_name, MOTIVATION_DEFAULT_ACTION_COST_FALLBACK))
         if isinstance(base_cost, (int, float)) and base_cost > 0:
             boredom = self._calc_boredom_multiplier(tool_name)
-            cost = base_cost * boredom
+            return base_cost * boredom
+        return 0.0
+
+    def consume_energy(self, tool_name: str):
+        """ツール実行によるエネルギー消費"""
+        if not self.ablation_energy:
+            return
+        cost = self._get_action_cost_with_boredom(tool_name)
+        if cost > 0:
             self._motivation_energy = max(0, self._motivation_energy - cost)
-            logger.info(f"エネルギー消費: {tool_name} cost={cost:.1f} (base={base_cost} boredom={boredom:.2f}x) → energy={self._motivation_energy:.1f}")
+            logger.info(f"エネルギー消費: {tool_name} cost={cost:.1f} → energy={self._motivation_energy:.1f}")
             # UI更新
+            threshold = self.get_threshold()
             try:
                 import json
                 from app.pipeline import pipeline
