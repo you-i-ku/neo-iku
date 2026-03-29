@@ -294,40 +294,72 @@ class Pipeline:
                 else:
                     logger.warning("戦略候補パース失敗 → 戦略なしで計画続行")
 
-            # === 2. 計画フェーズ（バンディット） ===
+            # === 2. 計画フェーズ ===
             use_plan_execute = PLAN_EXECUTE_ENABLED
             planned_tools = None
 
             if use_plan_execute:
                 from app.scheduler.autonomous import scheduler
-                bandit_rewards = self._load_bandit_rewards()
-                all_tool_names = list(get_all_tools().keys())
+                if scheduler.ablation_bandit:
+                    # --- バンディット計画 ---
+                    bandit_rewards = self._load_bandit_rewards()
+                    all_tool_names = list(get_all_tools().keys())
 
-                planned_tools = bandit_select_tools(
-                    all_tool_names=all_tool_names,
-                    bandit_rewards=bandit_rewards,
-                    available_energy=scheduler._motivation_energy,
-                    action_costs_fn=lambda name: scheduler._get_action_cost_with_boredom(name),
-                    max_tools=PLAN_MAX_TOOLS,
-                )
+                    planned_tools = bandit_select_tools(
+                        all_tool_names=all_tool_names,
+                        bandit_rewards=bandit_rewards,
+                        available_energy=scheduler._motivation_energy,
+                        action_costs_fn=lambda name: scheduler._get_action_cost_with_boredom(name),
+                        max_tools=PLAN_MAX_TOOLS,
+                    )
 
-                if not planned_tools:
-                    logger.warning(f"バンディット計画: ツール選択なし（energy={scheduler._motivation_energy:.1f}） → 1ショットにフォールバック")
-                    use_plan_execute = False
+                    if not planned_tools:
+                        logger.info(f"バンディット計画: ツール選択なし（energy={scheduler._motivation_energy:.1f}） → 1ショットにフォールバック")
+                        use_plan_execute = False
+                    else:
+                        plan_text = " → ".join(planned_tools)
+                        plan_response = f"[bandit] {plan_text}"
+                        logger.info(f"バンディット計画: [{plan_text}]")
+                        async with async_session() as session:
+                            await add_message(session, conv_id, "assistant", plan_response)
+                            await add_message(session, conv_id, "tool", f"[計画] {plan_text}")
+                            await session.commit()
+                        await self._broadcast(json.dumps({
+                            "type": "dev_bandit_plan",
+                            "tools": planned_tools,
+                            "energy": scheduler._motivation_energy,
+                        }))
                 else:
-                    plan_text = " → ".join(planned_tools)
-                    plan_response = f"[bandit] {plan_text}"
-                    logger.info(f"バンディット計画: [{plan_text}]")
-                    async with async_session() as session:
-                        await add_message(session, conv_id, "assistant", plan_response)
-                        await add_message(session, conv_id, "tool", f"[計画] {plan_text}")
-                        await session.commit()
-                    # dev tab通知（専用タイプ）
-                    await self._broadcast(json.dumps({
-                        "type": "dev_bandit_plan",
-                        "tools": planned_tools,
-                        "energy": scheduler._motivation_energy,
-                    }))
+                    # --- LLM計画 ---
+                    planning_tool_text = build_planning_prompt(mirror_seed=mirror_seed)
+                    planning_prompt = self._build_planning_prompt(
+                        action_goal, planning_tool_text, req.signal_summary,
+                        user_input=req.user_input,
+                        selected_strategy=selected_strategy,
+                        mirror_display=mirror_display,
+                    )
+                    plan_messages = [
+                        {"role": "system", "content": system_base or ""},
+                        {"role": "user", "content": planning_prompt},
+                    ]
+                    logger.info("計画フェーズ: LLM呼び出し")
+                    plan_response, _, _ = await self._call_llm_streaming(plan_messages, req.source, 0)
+
+                    if plan_response:
+                        clean_plan = self._strip_think(plan_response)
+                        planned_tools = parse_plan(clean_plan)
+
+                    if not planned_tools:
+                        logger.warning("計画パース失敗 → 1ショットにフォールバック")
+                        use_plan_execute = False
+                    else:
+                        planned_tools = planned_tools[:PLAN_MAX_TOOLS]
+                        plan_text = " → ".join(planned_tools)
+                        logger.info(f"計画確定: [{plan_text}]")
+                        async with async_session() as session:
+                            await add_message(session, conv_id, "assistant", plan_response)
+                            await add_message(session, conv_id, "tool", f"[計画] {plan_text}")
+                            await session.commit()
 
             # === 3. 実行フェーズ ===
             if use_plan_execute:

@@ -1339,7 +1339,7 @@ async function loadDevSettings() {
         }
         // Ablationフラグ同期
         if (data.ablation) {
-            const map = { energy: "abl-energy", self_model: "abl-self-model", prediction: "abl-prediction", distillation: "abl-distillation" };
+            const map = { energy: "abl-energy", self_model: "abl-self-model", prediction: "abl-prediction", distillation: "abl-distillation", bandit: "abl-bandit" };
             for (const [key, id] of Object.entries(map)) {
                 const el = document.getElementById(id);
                 if (el) el.checked = !!data.ablation[key];
@@ -1351,7 +1351,7 @@ async function loadDevSettings() {
 }
 
 // --- Ablationトグル ---
-["energy", "self_model", "prediction", "distillation"].forEach(flag => {
+["energy", "self_model", "prediction", "distillation", "bandit"].forEach(flag => {
     const id = flag === "self_model" ? "abl-self-model" : `abl-${flag}`;
     const el = document.getElementById(id);
     if (!el) return;
@@ -1445,6 +1445,53 @@ devClearSelfModelBtn.addEventListener("click", async () => {
         setTimeout(() => { devClearSelfModelBtn.textContent = "自己モデルクリア"; devClearSelfModelBtn.disabled = false; }, 2000);
     }
 });
+
+// --- AI作成ツール ---
+
+async function loadCustomTools() {
+    const el = document.getElementById("custom-tools-list");
+    if (!el) return;
+    try {
+        const resp = await fetch("/api/dev/custom-tools");
+        const data = await resp.json();
+        if (!data.tools || data.tools.length === 0) {
+            el.innerHTML = "<div class='memory-item'>AI作成ツールはありません</div>";
+            return;
+        }
+        el.innerHTML = data.tools.map(t => `
+            <div class="memory-item" style="display:flex;justify-content:space-between;align-items:center;">
+                <div>
+                    <strong>${t.name}</strong><br>
+                    <span style="font-size:0.85em;opacity:0.7;">${t.description}</span>
+                </div>
+                <button class="dev-btn danger" style="padding:2px 8px;font-size:0.8em;" onclick="deleteCustomTool('${t.name}')">削除</button>
+            </div>
+        `).join("");
+    } catch (e) {
+        el.innerHTML = "<div class='memory-item'>読み込みエラー</div>";
+    }
+}
+
+async function deleteCustomTool(name) {
+    if (!confirm(`ツール "${name}" を削除しますか？`)) return;
+    try {
+        const resp = await fetch(`/api/dev/custom-tools/${name}`, { method: "DELETE" });
+        if (resp.ok) {
+            loadCustomTools();
+        } else {
+            const data = await resp.json();
+            alert(`削除失敗: ${data.detail || "不明なエラー"}`);
+        }
+    } catch (e) {
+        alert("削除エラー");
+    }
+}
+
+const customToolsRefreshBtn = document.getElementById("custom-tools-refresh-btn");
+if (customToolsRefreshBtn) {
+    customToolsRefreshBtn.addEventListener("click", loadCustomTools);
+}
+loadCustomTools();
 
 // --- ベクトル再構築 ---
 

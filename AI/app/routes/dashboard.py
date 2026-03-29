@@ -587,12 +587,13 @@ async def get_dev_settings():
             "self_model": scheduler.ablation_self_model,
             "prediction": scheduler.ablation_prediction,
             "distillation": scheduler.ablation_distillation,
+            "bandit": scheduler.ablation_bandit,
         },
     }
 
 
 class AblationRequest(BaseModel):
-    flag: str  # "energy" | "self_model" | "prediction" | "distillation"
+    flag: str  # "energy" | "self_model" | "prediction" | "distillation" | "bandit"
     enabled: bool
 
 @router.post("/dev/ablation")
@@ -603,6 +604,7 @@ async def set_ablation(req: AblationRequest):
         "self_model": "ablation_self_model",
         "prediction": "ablation_prediction",
         "distillation": "ablation_distillation",
+        "bandit": "ablation_bandit",
     }
     attr = flag_map.get(req.flag)
     if not attr:
@@ -615,6 +617,7 @@ async def set_ablation(req: AblationRequest):
             "self_model": scheduler.ablation_self_model,
             "prediction": scheduler.ablation_prediction,
             "distillation": scheduler.ablation_distillation,
+            "bandit": scheduler.ablation_bandit,
         }
     }
 

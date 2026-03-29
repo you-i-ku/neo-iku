@@ -152,3 +152,5 @@ ABLATION_ENERGY_SYSTEM = True    # False: エネルギー蓄積/閾値/消費を
 ABLATION_SELF_MODEL = True       # False: self_model読み書きを無効化（常に空を返す）
 ABLATION_PREDICTION = True       # False: expect=引数を無視（予測-検証ループ無効）
 ABLATION_DISTILLATION = True     # False: 振り返り・原則蒸留を無効化
+ABLATION_BANDIT = False          # True: バンディットアルゴリズムで計画フェーズを代替（デフォルトは旧LLM計画）
+ABLATION_BANDIT = True           # False: バンディット計画を無効化（旧LLM計画フェーズを使用）

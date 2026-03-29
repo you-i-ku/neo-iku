@@ -16,7 +16,7 @@ from config import (
     ENV_STIMULUS_ENABLED, ENV_STIMULUS_PROBABILITY,
     DATA_DIR,
     ABLATION_ENERGY_SYSTEM, ABLATION_SELF_MODEL,
-    ABLATION_PREDICTION, ABLATION_DISTILLATION,
+    ABLATION_PREDICTION, ABLATION_DISTILLATION, ABLATION_BANDIT,
 )
 import math
 
@@ -52,6 +52,7 @@ class AutonomousScheduler:
         self.ablation_self_model = ABLATION_SELF_MODEL
         self.ablation_prediction = ABLATION_PREDICTION
         self.ablation_distillation = ABLATION_DISTILLATION
+        self.ablation_bandit = ABLATION_BANDIT
 
     # --- シグナル ---
 

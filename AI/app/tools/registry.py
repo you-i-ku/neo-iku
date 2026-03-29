@@ -25,6 +25,14 @@ def get_tool(name: str) -> dict | None:
     return _tools.get(name)
 
 
+def unregister_tool(name: str):
+    """ツールをレジストリから削除する"""
+    if name in _tools:
+        del _tools[name]
+        _invalidate_pattern_cache()
+        logger.info(f"ツール削除: {name}")
+
+
 def get_all_tools() -> dict:
     return dict(_tools)
 

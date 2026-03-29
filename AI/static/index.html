@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>イク — neo-iku</title>
-    <link rel="stylesheet" href="/static/style.css?v=56">
+    <link rel="stylesheet" href="/static/style.css?v=57">
 </head>
 <body>
     <!-- ステータスバー -->
@@ -103,6 +103,12 @@
                         </div>
                     </div>
 
+                    <!-- AI作成ツール -->
+                    <div class="section">
+                        <h3>AI作成ツール <button id="custom-tools-refresh-btn" class="dev-btn-sm" title="更新">↻</button></h3>
+                        <div id="custom-tools-list" class="memory-list">読み込み中...</div>
+                    </div>
+
                     <!-- 自己モデル -->
                     <div class="section">
                         <h3>自己モデル <button id="selfmodel-refresh-btn" class="dev-btn-sm" title="更新">↻</button></h3>
@@ -187,6 +193,11 @@
                         <input id="abl-distillation" type="checkbox" checked>
                         <span class="ablation-name">蒸留</span>
                         <span class="ablation-detail">OFF: 振り返り・原則蒸留を無効化</span>
+                    </label>
+                    <label class="ablation-toggle">
+                        <input id="abl-bandit" type="checkbox">
+                        <span class="ablation-name">バンディット計画</span>
+                        <span class="ablation-detail">ON: バンディットアルゴリズムで計画フェーズを代替（デフォルトはLLM計画）</span>
                     </label>
                 </div>
             </div>
@@ -312,6 +323,6 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=56"></script>
+    <script src="/static/app.js?v=57"></script>
 </body>
 </html>

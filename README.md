@@ -165,7 +165,7 @@ AIが使用可能な15ツール:
 | システム | `get_system_metrics` |
 | 出力 | `output_UI`, `non_response` |
 
-AIは`create_tool`で新しいツールを自作でき、`app/tools/custom/`に保存・起動時自動ロードされます。
+AIは`create_tool`で新しいツールを自作でき、`app/tools/custom/`に保存・起動時自動ロードされます。開発者タブの「AI作成ツール」セクションで一覧表示・個別削除が可能（再起動不要）。
 
 ## Configuration
 
