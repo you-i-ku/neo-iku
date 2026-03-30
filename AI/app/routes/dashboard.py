@@ -1147,3 +1147,50 @@ async def distillation_log(
         "current_principles": current_principles,
         "total": total,
     }
+
+
+# --- X連携 ---
+
+@router.get("/x/status")
+async def x_status():
+    """Xのログイン状態を返す"""
+    from app.tools.builtin import X_SESSION_PATH
+    return {"logged_in": X_SESSION_PATH.exists()}
+
+
+@router.post("/x/login")
+async def x_login():
+    """ヘッドありブラウザを起動してXログインを待機、完了後セッションを保存する"""
+    from app.tools.builtin import X_SESSION_PATH
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return {"success": False, "error": "playwrightがインストールされていません。install.batを再実行してください。"}
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=False)
+            context = await browser.new_context()
+            page = await context.new_page()
+            await page.goto("https://x.com/login")
+
+            # x.com/home に遷移したらログイン完了と判断（最大5分待機）
+            await page.wait_for_url("**/home", timeout=300000)
+
+            # セッション保存
+            X_SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
+            await context.storage_state(path=str(X_SESSION_PATH))
+            await browser.close()
+
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/x/logout")
+async def x_logout():
+    """Xセッションを削除する"""
+    from app.tools.builtin import X_SESSION_PATH
+    if X_SESSION_PATH.exists():
+        X_SESSION_PATH.unlink()
+    return {"success": True}

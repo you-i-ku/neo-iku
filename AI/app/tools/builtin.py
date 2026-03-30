@@ -726,6 +726,121 @@ def load_custom_tools():
             logger.error(f"カスタムツール {py_file.name} の読み込みエラー: {e}")
 
 
+# --- X操作ツール ---
+
+X_SESSION_PATH = DATA_DIR / "x_session.json"
+_pending_post_x: dict | None = None
+PENDING_POST_X_MARKER = "__PENDING_POST_X__"
+X_SESSION_EXPIRED_MARKER = "__X_SESSION_EXPIRED__"
+
+
+async def post_to_x(text: str = "") -> str:
+    """Xにテキストを投稿する（ユーザー承認が必要）"""
+    global _pending_post_x
+    if not text.strip():
+        return "エラー: textを指定してください。"
+    if not X_SESSION_PATH.exists():
+        return "Xにログインしていません。開発者タブの「Xにログイン」ボタンからログインしてください。"
+    if len(text) > 280:
+        return f"エラー: 投稿テキストが長すぎます（{len(text)}文字 / 280文字制限）。"
+    _pending_post_x = {"text": text}
+    return PENDING_POST_X_MARKER
+
+
+def get_pending_post_x() -> dict | None:
+    return _pending_post_x
+
+
+async def execute_pending_post_x() -> str:
+    """承認済みのX投稿を実行"""
+    global _pending_post_x
+    if _pending_post_x is None:
+        return "エラー: 承認待ちの投稿がありません。"
+    text = _pending_post_x["text"]
+    _pending_post_x = None
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return "エラー: playwrightがインストールされていません。install.batを再実行してください。"
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(storage_state=str(X_SESSION_PATH))
+            page = await context.new_page()
+            await page.goto("https://x.com/compose/post", wait_until="domcontentloaded", timeout=30000)
+
+            if "login" in page.url or "flow/login" in page.url:
+                await browser.close()
+                return X_SESSION_EXPIRED_MARKER
+
+            textarea = page.locator('[data-testid="tweetTextarea_0"]')
+            await textarea.wait_for(timeout=10000)
+            await textarea.click()
+            await textarea.fill(text)
+            await page.wait_for_timeout(500)
+
+            btn = page.locator('[data-testid="tweetButtonInline"]')
+            await btn.click()
+            await page.wait_for_timeout(2000)
+
+            post_url = page.url
+            await browser.close()
+            return f"投稿しました。URL: {post_url}"
+    except Exception as e:
+        return f"エラー: 投稿に失敗しました: {e}"
+
+
+def cancel_pending_post_x() -> str:
+    global _pending_post_x
+    _pending_post_x = None
+    return "ユーザーにより投稿を拒否されました。"
+
+
+async def check_x_notifications() -> str:
+    """Xの通知ページを開き、最新の通知一覧を取得して返す"""
+    if not X_SESSION_PATH.exists():
+        return "Xにログインしていません。開発者タブの「Xにログイン」ボタンからログインしてください。"
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return "エラー: playwrightがインストールされていません。"
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(storage_state=str(X_SESSION_PATH))
+            page = await context.new_page()
+            await page.goto("https://x.com/notifications", wait_until="domcontentloaded", timeout=30000)
+
+            if "login" in page.url or "flow/login" in page.url:
+                await browser.close()
+                return X_SESSION_EXPIRED_MARKER
+
+            await page.wait_for_timeout(2000)
+
+            # 通知セルのテキストを取得
+            cells = await page.locator('[data-testid="notification"]').all_text_contents()
+            await browser.close()
+
+            if not cells:
+                # fallback: body全体から通知らしい行を拾う
+                body = await page.text_content("body") or ""
+                cells = [l.strip() for l in body.split("\n")
+                         if l.strip() and any(kw in l for kw in
+                         ["いいね", "リポスト", "返信", "フォロー", "引用", "liked", "retweeted", "replied"])]
+
+            if not cells:
+                return "通知はありませんでした。"
+
+            unique = list(dict.fromkeys(c.strip() for c in cells if c.strip()))[:20]
+            return f"X通知（{len(unique)}件）:\n" + "\n".join(f"- {n}" for n in unique)
+    except Exception as e:
+        return f"エラー: 通知取得に失敗しました: {e}"
+
+
 SELF_MODEL_PATH = DATA_DIR / "self_model.json"  # ノーマルモード用（後方互換）
 
 
@@ -1046,6 +1161,19 @@ def register_all():
         "url=取得するURL（http://またはhttps://）",
         fetch_raw_resource,
         required_args=["url"],
+    )
+    register_tool(
+        "post_to_x",
+        "Xにテキストを投稿する（ユーザー承認あり）。投稿後にURLを返す。未ログイン時はエラーを返す",
+        "text=投稿するテキスト（280文字以内）",
+        post_to_x,
+        required_args=["text"],
+    )
+    register_tool(
+        "check_x_notifications",
+        "Xの通知ページを開き、最新の通知一覧（いいね・返信・リポスト等）を取得して返す（引数なし）",
+        "（引数なし）",
+        check_x_notifications,
     )
     # カスタムツール読み込み（起動時に永続化されたツールを復元）
     load_custom_tools()

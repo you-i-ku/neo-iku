@@ -173,6 +173,14 @@ function connect() {
                 showCreateToolApproval(data);
                 break;
 
+            case "post_x_approval":
+                showPostXApproval(data);
+                break;
+
+            case "x_session_expired":
+                showXSessionExpiredToast();
+                break;
+
             case "approval_timeout":
                 // 承認待ちUIを閉じてタイムアウト通知を表示
                 closeApprovalDialog();
@@ -1492,6 +1500,104 @@ if (customToolsRefreshBtn) {
     customToolsRefreshBtn.addEventListener("click", loadCustomTools);
 }
 loadCustomTools();
+
+// --- X連携 ---
+
+async function updateXStatus() {
+    try {
+        const resp = await fetch("/api/x/status");
+        const data = await resp.json();
+        const indicator = document.getElementById("x-status-indicator");
+        const loginBtn = document.getElementById("x-login-btn");
+        const logoutBtn = document.getElementById("x-logout-btn");
+        if (!indicator) return;
+        if (data.logged_in) {
+            indicator.textContent = "● ログイン済み";
+            indicator.style.color = "var(--auto-energy, #4caf50)";
+            loginBtn.style.display = "none";
+            logoutBtn.style.display = "";
+        } else {
+            indicator.textContent = "○ 未ログイン";
+            indicator.style.color = "var(--text-secondary, #888)";
+            loginBtn.style.display = "";
+            logoutBtn.style.display = "none";
+        }
+    } catch (e) {}
+}
+
+const xLoginBtn = document.getElementById("x-login-btn");
+if (xLoginBtn) {
+    xLoginBtn.addEventListener("click", async () => {
+        xLoginBtn.disabled = true;
+        xLoginBtn.textContent = "ブラウザを起動中...";
+        try {
+            const resp = await fetch("/api/x/login", { method: "POST" });
+            const data = await resp.json();
+            if (data.success) {
+                updateXStatus();
+            } else {
+                alert(`ログイン失敗: ${data.error || "不明なエラー"}`);
+            }
+        } catch (e) {
+            alert("ログインエラー");
+        } finally {
+            xLoginBtn.disabled = false;
+            xLoginBtn.textContent = "Xにログイン";
+        }
+    });
+}
+
+const xLogoutBtn = document.getElementById("x-logout-btn");
+if (xLogoutBtn) {
+    xLogoutBtn.addEventListener("click", async () => {
+        if (!confirm("Xのセッションを削除しますか？")) return;
+        await fetch("/api/x/logout", { method: "POST" });
+        updateXStatus();
+    });
+}
+
+updateXStatus();
+
+function showPostXApproval(data) {
+    const el = document.createElement("div");
+    el.className = "message write-approval";
+    el.innerHTML = `
+        <div class="write-approval-header">🐦 X投稿承認</div>
+        <div class="write-approval-meta">${data.char_count} / 280文字</div>
+        <pre class="write-preview">${escapeHtml(data.text)}</pre>
+        <div class="approval-feedback-area">
+            <input class="approval-feedback" type="text" placeholder="コメント（任意）">
+        </div>
+        <div class="write-approval-buttons">
+            <button class="write-btn approve">投稿する</button>
+            <button class="write-btn reject">拒否</button>
+        </div>`;
+    function disableAll() {
+        el.querySelectorAll("button").forEach(b => b.disabled = true);
+        el.querySelector(".approval-feedback").disabled = true;
+    }
+    el.querySelector(".approve").onclick = () => {
+        const feedback = el.querySelector(".approval-feedback").value.trim();
+        disableAll();
+        ws.send(JSON.stringify({ type: "post_x_response", action: "approve", feedback }));
+    };
+    el.querySelector(".reject").onclick = () => {
+        const feedback = el.querySelector(".approval-feedback").value.trim();
+        disableAll();
+        ws.send(JSON.stringify({ type: "post_x_response", action: "reject", feedback }));
+    };
+    document.getElementById("chat-messages").appendChild(el);
+    el.scrollIntoView({ behavior: "smooth" });
+}
+
+function showXSessionExpiredToast() {
+    const toast = document.createElement("div");
+    toast.style.cssText = "position:fixed;bottom:24px;right:24px;background:#c62828;color:#fff;padding:12px 18px;border-radius:8px;z-index:9999;font-size:13px;";
+    toast.textContent = "⚠ Xのセッションが切れています。開発者タブからログインし直してください。";
+    document.body.appendChild(toast);
+    setTimeout(() => toast.remove(), 6000);
+    updateXStatus();
+}
 
 // --- ベクトル再構築 ---
 

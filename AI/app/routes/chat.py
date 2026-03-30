@@ -29,7 +29,7 @@ async def chat_ws(ws: WebSocket):
                 if msg_type == "stop":
                     pipeline.request_stop(data.get("feedback", ""))
 
-                elif msg_type in ("write_response", "exec_response", "create_tool_response"):
+                elif msg_type in ("write_response", "exec_response", "create_tool_response", "post_x_response"):
                     pipeline.resolve_approval(
                         data.get("action", "reject"),
                         data.get("feedback", ""),

@@ -25,6 +25,9 @@ from app.tools.builtin import (
     _git_auto_backup,
     PENDING_CREATE_TOOL_MARKER, get_pending_create_tool,
     execute_pending_create_tool, cancel_pending_create_tool,
+    PENDING_POST_X_MARKER, get_pending_post_x,
+    execute_pending_post_x, cancel_pending_post_x,
+    X_SESSION_EXPIRED_MARKER,
 )
 from app.memory.store import get_conversation_messages
 from config import BASE_DIR, EXEC_CODE_TIMEOUT, CONTEXT_KEEP_ROUNDS, CHAT_HISTORY_MESSAGES, TOOL_MAX_CALLS_PER_RESPONSE, TOOL_SAME_NAME_LIMIT, PLAN_EXECUTE_ENABLED, PLAN_MAX_TOOLS, STRATEGY_CANDIDATES
@@ -1094,6 +1097,34 @@ C. アプローチの説明"""
                     if resp.get("feedback"):
                         result += f"\n理由: {resp['feedback']}"
                     self._emit_signal("approval_denied", f"create_tool: {pending['name']}")
+
+        elif result == PENDING_POST_X_MARKER:
+            pending = get_pending_post_x()
+            if pending:
+                await self._broadcast(json.dumps({
+                    "type": "post_x_approval",
+                    "text": pending["text"],
+                    "char_count": len(pending["text"]),
+                }))
+                resp = await self._wait_approval()
+                if resp["action"] == "approve":
+                    result = await execute_pending_post_x()
+                    if result == X_SESSION_EXPIRED_MARKER:
+                        await self._broadcast(json.dumps({"type": "x_session_expired"}))
+                        result = "エラー: Xのセッションが切れています。開発者タブの「Xにログイン」から再ログインしてください。"
+                    elif resp.get("feedback"):
+                        result += f"\nユーザーからのコメント: {resp['feedback']}"
+                else:
+                    cancel_pending_post_x()
+                    result = "ユーザーにより投稿を拒否されました。"
+                    if resp.get("feedback"):
+                        result += f"\n理由: {resp['feedback']}"
+                    self._emit_signal("approval_denied", "post_to_x")
+
+        # check_x_notificationsのセッション切れ検出
+        elif result == X_SESSION_EXPIRED_MARKER:
+            await self._broadcast(json.dumps({"type": "x_session_expired"}))
+            result = "エラー: Xのセッションが切れています。開発者タブの「Xにログイン」から再ログインしてください。"
 
         return result
 

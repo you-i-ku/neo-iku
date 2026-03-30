@@ -47,7 +47,7 @@ def build_tools_prompt(mirror_seed: int | None = None) -> str:
         ("ファイル", ["read_file", "list_files", "search_files", "create_file", "overwrite_file"]),
         ("記憶", ["search_memories", "write_diary", "search_action_log"]),
         ("自己モデル", ["update_self_model"]),
-        ("外部", ["web_search", "fetch_raw_resource"]),
+        ("外部", ["web_search", "fetch_raw_resource", "post_to_x", "check_x_notifications"]),
         ("実行・拡張", ["exec_code", "create_tool"]),
         ("システム", ["get_system_metrics"]),
         ("出力", ["output_UI"]),
@@ -256,11 +256,19 @@ def _parse_args(args_str: str) -> dict:
         json_args, remaining = _extract_json_args(args_str)
         if json_args:
             args.update(json_args)
-            # 残りの非JSON引数を処理
-            for part in re.finditer(r'(\w+)=([^\s{[]+)', remaining):
-                k = part.group(1)
-                if k not in args:
-                    args[k] = part.group(2).strip()
+            # 残りの非JSON引数を位置ベース境界検出で処理（空白含む値に対応）
+            key_positions = list(re.finditer(r'(?:^|\s)(\w+)=', remaining))
+            if len(key_positions) >= 2:
+                for i, kp in enumerate(key_positions):
+                    k = kp.group(1)
+                    val_start = kp.end()
+                    val_end = key_positions[i + 1].start() if i + 1 < len(key_positions) else len(remaining)
+                    if k not in args:
+                        args[k] = remaining[val_start:val_end].strip()
+            elif key_positions:
+                single = re.match(r'\s*(\w+)=(.*)', remaining, re.DOTALL)
+                if single and single.group(1) not in args:
+                    args[single.group(1)] = single.group(2).strip()
         else:
             # クォートなし: key=value パターンの位置を検出し、値は次のkey=の手前まで
             key_positions = list(re.finditer(r'(?:^|\s)(\w+)=', args_str))
@@ -390,7 +398,7 @@ def build_planning_prompt(mirror_seed: int | None = None) -> str:
         ("ファイル", ["read_file", "list_files", "search_files", "create_file", "overwrite_file"]),
         ("記憶", ["search_memories", "write_diary", "search_action_log"]),
         ("自己モデル", ["update_self_model"]),
-        ("外部", ["web_search", "fetch_raw_resource"]),
+        ("外部", ["web_search", "fetch_raw_resource", "post_to_x", "check_x_notifications"]),
         ("実行・拡張", ["exec_code", "create_tool"]),
         ("システム", ["get_system_metrics"]),
         ("出力", ["output_UI"]),

@@ -11,3 +11,4 @@ onnxruntime
 tokenizers
 huggingface-hub
 numpy
+playwright
