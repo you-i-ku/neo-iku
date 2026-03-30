@@ -1347,7 +1347,7 @@ async function loadDevSettings() {
         }
         // Ablationフラグ同期
         if (data.ablation) {
-            const map = { energy: "abl-energy", self_model: "abl-self-model", prediction: "abl-prediction", bandit: "abl-bandit" };
+            const map = { energy: "abl-energy", self_model: "abl-self-model", prediction: "abl-prediction", bandit: "abl-bandit", mirror: "abl-mirror" };
             for (const [key, id] of Object.entries(map)) {
                 const el = document.getElementById(id);
                 if (el) el.checked = !!data.ablation[key];
@@ -1359,7 +1359,7 @@ async function loadDevSettings() {
 }
 
 // --- Ablationトグル ---
-["energy", "self_model", "prediction", "bandit"].forEach(flag => {
+["energy", "self_model", "prediction", "bandit", "mirror"].forEach(flag => {
     const id = flag === "self_model" ? "abl-self-model" : `abl-${flag}`;
     const el = document.getElementById(id);
     if (!el) return;

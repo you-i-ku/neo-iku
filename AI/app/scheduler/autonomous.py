@@ -16,7 +16,7 @@ from config import (
     ENV_STIMULUS_ENABLED, ENV_STIMULUS_PROBABILITY,
     DATA_DIR,
     ABLATION_ENERGY_SYSTEM, ABLATION_SELF_MODEL,
-    ABLATION_PREDICTION, ABLATION_BANDIT,
+    ABLATION_PREDICTION, ABLATION_BANDIT, ABLATION_MIRROR,
     SESSION_LOG_MAX, SESSION_ARCHIVE_MAX_CHARS,
 )
 import math
@@ -54,6 +54,7 @@ class AutonomousScheduler:
         self.ablation_self_model = ABLATION_SELF_MODEL
         self.ablation_prediction = ABLATION_PREDICTION
         self.ablation_bandit = ABLATION_BANDIT
+        self.ablation_mirror = ABLATION_MIRROR
 
     # --- シグナル ---
 
@@ -430,7 +431,7 @@ class AutonomousScheduler:
         # 鏡の計算（メトリクス + 環境embedding、ランダム比率混合）
         mirror_values = []
         mirror_mix_ratio = None
-        if env_stimulus:
+        if self.ablation_mirror and env_stimulus:
             try:
                 env_words = [w.strip() for w in env_stimulus.split(",")]
                 mirror_data = await self._compute_mirror(env_words)
@@ -514,17 +515,21 @@ class AutonomousScheduler:
                                self_model_before: dict | None = None,
                                self_model_after: dict | None = None) -> dict:
         """step_historyからセッション要約を機械的に生成（LLM不使用）"""
+        def _trunc(s: str, n: int = 100) -> str:
+            s = s or ""
+            return s[:n] + "..." if len(s) > n else s
+
         steps = []
         for step in (result.step_history or [])[:5]:
             entry = {
                 "tool": step.get("tool", "?"),
-                "summary": (step.get("result_summary") or "")[:60],
+                "result": _trunc(step.get("result_summary") or ""),
                 "status": step.get("status", "?"),
             }
             if step.get("intent"):
-                entry["intent"] = step["intent"][:60]
-            if step.get("expected_result"):
-                entry["expect"] = step["expected_result"][:60]
+                entry["intent"] = _trunc(step["intent"])
+            if step.get("expected"):
+                entry["expect"] = _trunc(step["expected"])
             steps.append(entry)
 
         # self_model変更キー検出
@@ -552,7 +557,7 @@ class AutonomousScheduler:
             summary["self_model_changed"] = sm_changed
         return summary
 
-    def _save_session_summary(self, summary: dict):
+    async def _save_session_summary(self, summary: dict):
         """session_logにセッション要約を追加し、超過時はアーカイブ"""
         from app.tools.builtin import _load_self_model, _save_self_model
         model = _load_self_model()
@@ -562,14 +567,14 @@ class AutonomousScheduler:
         log.append(summary)
 
         if len(log) > SESSION_LOG_MAX:
-            self._archive_oldest_sessions(model, log)
+            await self._archive_oldest_sessions(model, log)
 
         model["session_log"] = log
         _save_self_model(model, changed_key="session_log")
         logger.info(f"セッション要約保存: #{summary.get('session', '?')} (log={len(log)}件)")
 
-    def _archive_oldest_sessions(self, model: dict, log: list):
-        """古い5件を1行に圧縮してsession_archiveに退避"""
+    async def _archive_oldest_sessions(self, model: dict, log: list):
+        """古い5件をLLMで2文要約してsession_archiveに退避"""
         to_archive = log[:5]
         del log[:5]
 
@@ -578,13 +583,7 @@ class AutonomousScheduler:
             archive = ""
 
         for s in to_archive:
-            tools = " → ".join(
-                st.get("tool", "?") for st in s.get("steps", [])
-            )
-            sm_part = ""
-            if s.get("self_model_changed"):
-                sm_part = f" [sm:{','.join(s['self_model_changed'])}]"
-            line = f"#{s.get('session', '?')} {s.get('trigger', '?')} {tools}{sm_part}"
+            line = await self._summarize_session_for_archive(s)
             archive += line + "\n"
 
         # 最大文字数制限
@@ -595,6 +594,51 @@ class AutonomousScheduler:
             archive = "\n".join(lines) + "\n"
 
         model["session_archive"] = archive
+
+    async def _summarize_session_for_archive(self, s: dict) -> str:
+        """セッション1件をLLMで2文に要約してアーカイブ用1行を返す。失敗時は機械的フォールバック"""
+        num = s.get("session", "?")
+        time_str = s.get("time", "")
+        trigger = s.get("trigger", "?")
+        steps = s.get("steps", [])
+
+        # LLMに渡すセッション情報を構築
+        steps_text = "\n".join(
+            f"- {st.get('tool', '?')}: {st.get('result', '')} "
+            f"{'intent=' + st['intent'] if st.get('intent') else ''} "
+            f"{'expect=' + st['expect'] if st.get('expect') else ''}".strip()
+            for st in steps
+        )
+        had_output = s.get("had_output", False)
+        sm_changed = s.get("self_model_changed", [])
+
+        prompt = f"""以下はAIの1セッションの記録である。
+トリガー: {trigger}
+ステップ:
+{steps_text}
+出力あり: {had_output}
+自己モデル変更: {', '.join(sm_changed) if sm_changed else 'なし'}
+
+【指示】
+何をしようとして何が起きたかを2文以内の日本語で記述すること。
+解釈や評価は不要。事実のみ。50文字以内が望ましい。"""
+
+        try:
+            from app.llm.manager import llm_manager
+            llm = llm_manager.get()
+            response = await llm.chat([
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": "要約してください。"},
+            ])
+            summary_text = (response or "").strip().replace("\n", " ")[:120]
+        except Exception as e:
+            logger.warning(f"セッションアーカイブLLM要約失敗 (#{num}): {e}")
+            # フォールバック: 機械的1行
+            tools = " → ".join(st.get("tool", "?") for st in steps)
+            sm_part = f" [sm:{','.join(sm_changed)}]" if sm_changed else ""
+            summary_text = f"{trigger}: {tools}{sm_part}"
+
+        return f"#{num} {time_str} {summary_text}"
 
     async def _reflect(self, selected_action: dict | None, result, self_model: dict, action_goal: str = "", selected_strategy: str | None = None,
                        session_num: int | None = None, trigger: str = "timer", env_stimulus: str | None = None, mirror_values: list | None = None,
@@ -649,7 +693,7 @@ class AutonomousScheduler:
                     self_model_before=self_model,
                     self_model_after=post_model2,
                 )
-                self._save_session_summary(summary)
+                await self._save_session_summary(summary)
             except Exception as e:
                 logger.error(f"セッション要約保存エラー: {e}")
 

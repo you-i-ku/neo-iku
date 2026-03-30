@@ -587,12 +587,13 @@ async def get_dev_settings():
             "self_model": scheduler.ablation_self_model,
             "prediction": scheduler.ablation_prediction,
             "bandit": scheduler.ablation_bandit,
+            "mirror": scheduler.ablation_mirror,
         },
     }
 
 
 class AblationRequest(BaseModel):
-    flag: str  # "energy" | "self_model" | "prediction" | "bandit"
+    flag: str  # "energy" | "self_model" | "prediction" | "bandit" | "mirror"
     enabled: bool
 
 @router.post("/dev/ablation")
@@ -603,6 +604,7 @@ async def set_ablation(req: AblationRequest):
         "self_model": "ablation_self_model",
         "prediction": "ablation_prediction",
         "bandit": "ablation_bandit",
+        "mirror": "ablation_mirror",
     }
     attr = flag_map.get(req.flag)
     if not attr:
@@ -615,6 +617,7 @@ async def set_ablation(req: AblationRequest):
             "self_model": scheduler.ablation_self_model,
             "prediction": scheduler.ablation_prediction,
             "bandit": scheduler.ablation_bandit,
+            "mirror": scheduler.ablation_mirror,
         }
     }
 
@@ -1167,12 +1170,52 @@ async def x_login():
     except ImportError:
         return {"success": False, "error": "playwrightがインストールされていません。install.batを再実行してください。"}
 
+    import subprocess, tempfile, shutil, time, asyncio as _asyncio
+
+    # Chromeのパス候補（Windows）
+    chrome_candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        shutil.which("chrome") or "",
+        shutil.which("google-chrome") or "",
+    ]
+    chrome_path = next((c for c in chrome_candidates if c and __import__("os").path.exists(c)), None)
+
+    if not chrome_path:
+        return {"success": False, "error": "Chromeが見つかりません。Google Chromeをインストールしてください。"}
+
+    CDP_PORT = 9355
+    tmp_profile = tempfile.mkdtemp(prefix="x_login_profile_")
+    proc = None
     try:
+        # Chromeを独立プロセスとして起動（PlaywrightのautomationフラグなしのCDP接続用）
+        proc = subprocess.Popen([
+            chrome_path,
+            f"--remote-debugging-port={CDP_PORT}",
+            f"--user-data-dir={tmp_profile}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "https://x.com/login",
+        ])
+
+        # CDP準備待ち
+        import httpx as _httpx
+        for _ in range(20):
+            await _asyncio.sleep(0.5)
+            try:
+                r = await _httpx.AsyncClient().get(f"http://localhost:{CDP_PORT}/json/version", timeout=2)
+                if r.status_code == 200:
+                    break
+            except Exception:
+                pass
+        else:
+            return {"success": False, "error": "Chrome CDP接続タイムアウト"}
+
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=False)
-            context = await browser.new_context()
-            page = await context.new_page()
-            await page.goto("https://x.com/login")
+            browser = await p.chromium.connect_over_cdp(f"http://localhost:{CDP_PORT}")
+            context = browser.contexts[0] if browser.contexts else await browser.new_context()
+            pages = context.pages
+            page = pages[0] if pages else await context.new_page()
 
             # x.com/home に遷移したらログイン完了と判断（最大5分待機）
             await page.wait_for_url("**/home", timeout=300000)
@@ -1180,11 +1223,14 @@ async def x_login():
             # セッション保存
             X_SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)
             await context.storage_state(path=str(X_SESSION_PATH))
-            await browser.close()
 
         return {"success": True}
     except Exception as e:
         return {"success": False, "error": str(e)}
+    finally:
+        if proc:
+            proc.terminate()
+        shutil.rmtree(tmp_profile, ignore_errors=True)
 
 
 @router.post("/x/logout")
