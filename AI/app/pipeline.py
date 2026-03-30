@@ -256,6 +256,11 @@ class Pipeline:
             system_base = self._build_system_base()
             action_goal = req.goal
 
+            # セッション履歴の生成（認知連続性）
+            from app.scheduler.autonomous import scheduler as _sched
+            _sm_for_history = _load_self_model() if _sched.ablation_self_model else {}
+            session_history = self._render_session_history(_sm_for_history)
+
             # 鏡の値からツール順序seed + 表示文字列生成
             mirror_seed = None
             mirror_display = ""
@@ -271,6 +276,7 @@ class Pipeline:
                     action_goal, req.signal_summary,
                     user_input=req.user_input,
                     mirror_display=mirror_display,
+                    session_history=session_history,
                 )
                 strat_messages = [
                     {"role": "system", "content": system_base or ""},
@@ -340,6 +346,7 @@ class Pipeline:
                         user_input=req.user_input,
                         selected_strategy=selected_strategy,
                         mirror_display=mirror_display,
+                        session_history=session_history,
                     )
                     plan_messages = [
                         {"role": "system", "content": system_base or ""},
@@ -386,6 +393,7 @@ class Pipeline:
                         user_input=req.user_input,
                         mirror_display=mirror_display,
                         selected_strategy=selected_strategy,
+                        session_history=session_history,
                     )
                     exec_messages = [
                         {"role": "system", "content": system_base or ""},
@@ -474,6 +482,7 @@ class Pipeline:
                     bootstrap_hint=req.bootstrap_hint,
                     user_input=req.user_input,
                     mirror_display=mirror_display,
+                    session_history=session_history,
                 )
                 messages.append({"role": "user", "content": initial_prompt})
 
@@ -790,16 +799,18 @@ class Pipeline:
         return result_text, action_status, had_output
 
     def _build_strategy_prompt(self, action_goal: str, signal_summary: str,
-                               user_input: str = "", mirror_display: str = "") -> str:
+                               user_input: str = "", mirror_display: str = "",
+                               session_history: str = "") -> str:
         """戦略候補生成用プロンプト（ツール名を含めない — ツール選択はバンディットの役割）"""
         now = datetime.now().strftime('%Y年%m月%d日 %H:%M')
         goal_line = f"\n行動目標: {action_goal}" if action_goal else ""
         signal_line = f"\n{signal_summary}" if signal_summary else ""
         user_line = f"\n\n【ユーザー入力】\n{user_input}" if user_input else ""
         mirror_line = f"\n[{mirror_display}]" if mirror_display else ""
+        session_line = f"\n\n{session_history}" if session_history else ""
 
         return f"""【状況】
-日時: {now}{goal_line}{signal_line}{mirror_line}{user_line}
+日時: {now}{goal_line}{signal_line}{mirror_line}{session_line}{user_line}
 
 【能力カテゴリ】
 ファイル読み書き、記憶の検索と記録、自己モデルの更新、Web検索と情報取得、コード実行と拡張、システム状態の確認、発言と沈黙
@@ -863,7 +874,8 @@ C. アプローチの説明"""
 
     def _build_planning_prompt(self, action_goal: str, tool_text: str, signal_summary: str,
                                user_input: str = "",
-                               selected_strategy: str = "", mirror_display: str = "") -> str:
+                               selected_strategy: str = "", mirror_display: str = "",
+                               session_history: str = "") -> str:
         """計画フェーズ用プロンプト"""
         now = datetime.now().strftime('%Y年%m月%d日 %H:%M')
         goal_line = f"\n行動目標: {action_goal}" if action_goal else ""
@@ -871,9 +883,10 @@ C. アプローチの説明"""
         signal_line = f"\n{signal_summary}" if signal_summary else ""
         user_line = f"\n\n【ユーザー入力】\n{user_input}" if user_input else ""
         mirror_line = f"\n[{mirror_display}]" if mirror_display else ""
+        session_line = f"\n\n{session_history}" if session_history else ""
 
         return f"""【状況】
-日時: {now}{goal_line}{strategy_line}{signal_line}{mirror_line}{user_line}
+日時: {now}{goal_line}{strategy_line}{signal_line}{mirror_line}{session_line}{user_line}
 
 【利用可能ツール】
 {tool_text}
@@ -893,6 +906,7 @@ C. アプローチの説明"""
         round_idx: int, total_rounds: int,
         user_input: str = "", mirror_display: str = "",
         selected_strategy: str = "",
+        session_history: str = "",
     ) -> str:
         """実行フェーズ用プロンプト（自由選択）"""
         now = datetime.now().strftime('%Y年%m月%d日 %H:%M')
@@ -900,6 +914,7 @@ C. アプローチの説明"""
         strategy_line = f"\nアプローチ: {selected_strategy}" if selected_strategy else ""
         user_line = f"\n\n【ユーザー入力】\n{user_input}" if user_input else ""
         mirror_line = f"\n[{mirror_display}]" if mirror_display else ""
+        session_line = f"\n\n{session_history}" if session_history else ""
 
         # 計画
         plan_line = f"\n計画: {plan_text}" if plan_text else ""
@@ -915,7 +930,7 @@ C. アプローチの説明"""
             prev_text = "\n\n【これまでの結果】\n" + "\n".join(prev_lines)
 
         return f"""【状況】
-日時: {now}{goal_line}{strategy_line}{plan_line}{mirror_line}
+日時: {now}{goal_line}{strategy_line}{plan_line}{mirror_line}{session_line}
 ラウンド {round_idx + 1}/{total_rounds}{user_line}{prev_text}
 
 【利用可能ツール】
@@ -1275,7 +1290,7 @@ C. アプローチの説明"""
             if free_text:
                 sm_lines.append(free_text)
             for k, v in self_model.items():
-                if k not in ("__free_text__", "motivation_rules"):
+                if k not in ("__free_text__", "motivation_rules", "session_log", "session_archive"):
                     sm_lines.append(f"- {k}: {v}")
             if sm_lines:
                 sm_text = "\n[self_model]\n" + "\n".join(sm_lines)
@@ -1287,16 +1302,61 @@ C. アプローチの説明"""
 
         return sm_text
 
+    def _render_session_history(self, self_model: dict) -> str:
+        """session_archive + session_logからセッション履歴テキストを生成"""
+        parts = []
+
+        # アーカイブ（圧縮済み1行形式）
+        archive = self_model.get("session_archive", "")
+        if isinstance(archive, str) and archive.strip():
+            parts.append(archive.strip())
+
+        # 直近のセッションログ（詳細形式）
+        log = self_model.get("session_log", [])
+        if isinstance(log, list):
+            for s in log:
+                tools_parts = []
+                for st in s.get("steps", []):
+                    tool_str = st.get("tool", "?")
+                    summary = st.get("summary", "")
+                    extras = []
+                    if summary:
+                        extras.append(summary)
+                    if st.get("intent"):
+                        extras.append(f"intent={st['intent']}")
+                    if st.get("expect"):
+                        extras.append(f"expect={st['expect']}")
+                    if extras:
+                        tool_str += f"({', '.join(extras)})"
+                    tools_parts.append(tool_str)
+                tools_chain = " → ".join(tools_parts) if tools_parts else "(no action)"
+                sm_part = ""
+                if s.get("self_model_changed"):
+                    sm_part = f" [sm:{','.join(s['self_model_changed'])}]"
+                time_str = s.get("time", "?")
+                # time_strから日付部分を省略（HH:MMだけ）
+                if " " in time_str:
+                    time_str = time_str.split(" ", 1)[1]
+                line = f"#{s.get('session', '?')} {time_str} {s.get('trigger', '?')} → {tools_chain}{sm_part}"
+                parts.append(line)
+
+        if not parts:
+            return ""
+        return "【直近のセッション履歴】\n" + "\n".join(parts)
+
     def _build_initial_prompt(
         self, action_goal: str, tool_text: str,
         memory_context: str = "", signal_summary: str = "",
         bootstrap_hint: str = "", user_input: str = "",
         mirror_display: str = "",
+        session_history: str = "",
     ) -> str:
         """初回ラウンド用のプロンプト構築（フォールバック1ショット用）"""
         now = datetime.now().strftime('%Y年%m月%d日 %H:%M')
 
         ctx_parts = []
+        if session_history:
+            ctx_parts.append(session_history)
         if memory_context:
             ctx_parts.append(f"最近の記憶:\n{memory_context[:500]}")
         if signal_summary:

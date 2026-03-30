@@ -17,6 +17,7 @@ from config import (
     DATA_DIR,
     ABLATION_ENERGY_SYSTEM, ABLATION_SELF_MODEL,
     ABLATION_PREDICTION, ABLATION_BANDIT,
+    SESSION_LOG_MAX, SESSION_ARCHIVE_MAX_CHARS,
 )
 import math
 
@@ -40,12 +41,13 @@ class AutonomousScheduler:
         self._is_checking = False
         self._concurrent_mode = False
         self._is_speaking = False
-        self._last_conv_id: int | None = None  # セッション継続用
         self._last_trigger: str = "timer"  # "timer" / "energy" / "manual"
         self._pending_messages: list[dict] = []  # ユーザー入力キュー
         self._energy_breakdown: dict[str, float] = {}  # シグナル種別ごとのエネルギー貢献度
         self._session_count: int = 0  # 自律行動セッション番号（起動ごとにリセット）
         self._tool_usage_window: deque[dict] = deque(maxlen=50)  # 退屈乗数・習熟検出用
+        self._thread_state_path = DATA_DIR / "thread_state.json"
+        self._last_conv_id: int | None = self._load_thread_state()  # 再起動後も維持
 
         # Ablationフラグ（ランタイムで切替可能）
         self.ablation_energy = ABLATION_ENERGY_SYSTEM
@@ -276,6 +278,29 @@ class AutonomousScheduler:
 
     # --- スケジューラ制御 ---
 
+    def _load_thread_state(self) -> int | None:
+        """再起動後もセッション連続性を維持するため、最後のconv_idをファイルから読み込む"""
+        try:
+            if self._thread_state_path.exists():
+                data = json.loads(self._thread_state_path.read_text(encoding="utf-8"))
+                conv_id = data.get("last_conv_id")
+                if conv_id is not None:
+                    logger.info(f"スレッド状態復元: last_conv_id={conv_id}")
+                    return int(conv_id)
+        except Exception as e:
+            logger.warning(f"thread_state.json 読み込み失敗: {e}")
+        return None
+
+    def _save_thread_state(self):
+        """セッション完了後にconv_idを永続化"""
+        try:
+            self._thread_state_path.write_text(
+                json.dumps({"last_conv_id": self._last_conv_id}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.warning(f"thread_state.json 書き込み失敗: {e}")
+
     def start(self):
         if self._task is None:
             self._load_stimulus_pools()
@@ -351,8 +376,6 @@ class AutonomousScheduler:
                 continue
 
             trigger = self._last_trigger
-            if trigger == "timer":
-                self._last_conv_id = None  # タイマー起因は新規セッション
             self.add_signal("idle_tick")
 
             try:
@@ -446,13 +469,10 @@ class AutonomousScheduler:
             logger.error(f"候補生成フォールバック: {e}")
 
         # 4. 行動 (Act): pipelineで実行
-        # action_complete起因なら前回のconv_idを引き継ぐ（セッション継続）
-        continue_conv_id = None
-        if self._last_conv_id is not None:
-            has_action_complete = any(s["type"] == "action_complete" for s in signal_snapshot)
-            if has_action_complete:
-                continue_conv_id = self._last_conv_id
-                logger.info(f"セッション継続: conv_id={continue_conv_id}")
+        # 常に前回のconv_idを引き継ぐ（セッション間の文脈連続性）
+        continue_conv_id = self._last_conv_id
+        if continue_conv_id is not None:
+            logger.info(f"スレッド継続: conv_id={continue_conv_id}")
 
         request = PipelineRequest(
             source="autonomous",
@@ -468,6 +488,7 @@ class AutonomousScheduler:
         )
         result = await pipeline.submit(request)
         self._last_conv_id = result.conv_id  # 次のアクションでの継続用に保持
+        self._save_thread_state()  # 再起動後も維持
 
         # UI通知: お返事完了
         if pending:
@@ -485,6 +506,95 @@ class AutonomousScheduler:
             mirror_values=mirror_values or None,
             mirror_mix_ratio=mirror_mix_ratio,
         )
+
+    # --- セッション要約（認知連続性） ---
+
+    def _build_session_summary(self, result, action_goal: str, trigger: str,
+                               strategy_text: str = "",
+                               self_model_before: dict | None = None,
+                               self_model_after: dict | None = None) -> dict:
+        """step_historyからセッション要約を機械的に生成（LLM不使用）"""
+        steps = []
+        for step in (result.step_history or [])[:5]:
+            entry = {
+                "tool": step.get("tool", "?"),
+                "summary": (step.get("result_summary") or "")[:60],
+                "status": step.get("status", "?"),
+            }
+            if step.get("intent"):
+                entry["intent"] = step["intent"][:60]
+            if step.get("expected_result"):
+                entry["expect"] = step["expected_result"][:60]
+            steps.append(entry)
+
+        # self_model変更キー検出
+        sm_changed = []
+        if self_model_before and self_model_after:
+            all_keys = set(self_model_before.keys()) | set(self_model_after.keys())
+            skip = {"session_log", "session_archive"}
+            for k in all_keys:
+                if k in skip:
+                    continue
+                if self_model_before.get(k) != self_model_after.get(k):
+                    sm_changed.append(k)
+
+        summary = {
+            "session": self._session_count,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "trigger": trigger,
+            "goal": (action_goal or "")[:80],
+            "steps": steps,
+            "had_output": result.had_output,
+        }
+        if strategy_text:
+            summary["strategy"] = strategy_text[:80]
+        if sm_changed:
+            summary["self_model_changed"] = sm_changed
+        return summary
+
+    def _save_session_summary(self, summary: dict):
+        """session_logにセッション要約を追加し、超過時はアーカイブ"""
+        from app.tools.builtin import _load_self_model, _save_self_model
+        model = _load_self_model()
+        log = model.get("session_log", [])
+        if not isinstance(log, list):
+            log = []
+        log.append(summary)
+
+        if len(log) > SESSION_LOG_MAX:
+            self._archive_oldest_sessions(model, log)
+
+        model["session_log"] = log
+        _save_self_model(model, changed_key="session_log")
+        logger.info(f"セッション要約保存: #{summary.get('session', '?')} (log={len(log)}件)")
+
+    def _archive_oldest_sessions(self, model: dict, log: list):
+        """古い5件を1行に圧縮してsession_archiveに退避"""
+        to_archive = log[:5]
+        del log[:5]
+
+        archive = model.get("session_archive", "")
+        if not isinstance(archive, str):
+            archive = ""
+
+        for s in to_archive:
+            tools = " → ".join(
+                st.get("tool", "?") for st in s.get("steps", [])
+            )
+            sm_part = ""
+            if s.get("self_model_changed"):
+                sm_part = f" [sm:{','.join(s['self_model_changed'])}]"
+            line = f"#{s.get('session', '?')} {s.get('trigger', '?')} {tools}{sm_part}"
+            archive += line + "\n"
+
+        # 最大文字数制限
+        if len(archive) > SESSION_ARCHIVE_MAX_CHARS:
+            lines = archive.strip().split("\n")
+            while len("\n".join(lines)) > SESSION_ARCHIVE_MAX_CHARS and lines:
+                lines.pop(0)
+            archive = "\n".join(lines) + "\n"
+
+        model["session_archive"] = archive
 
     async def _reflect(self, selected_action: dict | None, result, self_model: dict, action_goal: str = "", selected_strategy: str | None = None,
                        session_num: int | None = None, trigger: str = "timer", env_stimulus: str | None = None, mirror_values: list | None = None,
@@ -528,6 +638,20 @@ class AutonomousScheduler:
                 )
             except Exception as e:
                 logger.error(f"行動ログ出力エラー: {e}")
+
+            # セッション要約保存（認知連続性）
+            try:
+                from app.tools.builtin import _load_self_model as _load_sm2
+                post_model2 = _load_sm2()
+                summary = self._build_session_summary(
+                    result, action_goal, trigger,
+                    strategy_text=selected_strategy or "",
+                    self_model_before=self_model,
+                    self_model_after=post_model2,
+                )
+                self._save_session_summary(summary)
+            except Exception as e:
+                logger.error(f"セッション要約保存エラー: {e}")
 
     # --- 行動ログファイル出力 ---
 
