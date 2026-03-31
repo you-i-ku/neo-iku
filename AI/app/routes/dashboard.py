@@ -486,10 +486,8 @@ class StrategyCandidatesRequest(BaseModel):
 
 @router.post("/dev/strategy-candidates")
 async def set_strategy_candidates(req: StrategyCandidatesRequest):
-    """戦略候補数を変更（0で無効）"""
-    from app.pipeline import pipeline
-    pipeline.strategy_candidates = max(0, min(10, req.count))
-    return {"strategy_candidates": pipeline.strategy_candidates}
+    """戦略候補数を変更（1ストリーム化により無効化）"""
+    return {"strategy_candidates": 0}
 
 @router.post("/dev/autonomous-trigger")
 async def trigger_autonomous():
@@ -576,7 +574,7 @@ async def get_dev_settings():
     from app.pipeline import pipeline
     return {
         "autonomous_interval": scheduler._interval,
-        "strategy_candidates": pipeline.strategy_candidates,
+        "strategy_candidates": 0,
         "concurrent_mode": scheduler._concurrent_mode,
         "motivation_energy": round(scheduler._motivation_energy, 1),
         "motivation_threshold": round(scheduler.get_threshold(), 1),

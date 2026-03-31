@@ -10,7 +10,7 @@ from config import (
     AUTONOMOUS_INTERVAL_MIN, AUTONOMOUS_INTERVAL_JITTER,
     MOTIVATION_DEFAULT_THRESHOLD, MOTIVATION_DEFAULT_DECAY,
     MOTIVATION_DEFAULT_WEIGHTS, MOTIVATION_FLUCTUATION_SIGMA,
-    MOTIVATION_SIGNAL_BUFFER_SIZE, SCORING_ENABLED,
+    MOTIVATION_SIGNAL_BUFFER_SIZE,
     MOTIVATION_DEFAULT_ACTION_COSTS, MOTIVATION_DEFAULT_ACTION_COST_FALLBACK,
     MOTIVATION_PASSIVE_RATE,
     ENV_STIMULUS_ENABLED, ENV_STIMULUS_PROBABILITY,
@@ -395,23 +395,16 @@ class AutonomousScheduler:
         from app.pipeline import pipeline, PipelineRequest
         from app.tools.builtin import _load_self_model
 
-        # === ユーザー入力の取り込み（環境刺激として扱う） ===
+        # === ユーザー入力の取り込み ===
         pending = list(self._pending_messages)
         self._pending_messages.clear()
         user_input_text = ""
         if pending:
-            # ユーザー入力を環境刺激として結合（複数あれば全て含む）
             user_input_text = "\n".join(p["text"] for p in pending)
             trigger = "user_stimulus"
-            # UI通知: お返事中です
-            await pipeline._broadcast(json.dumps({
-                "type": "responding_start",
-            }))
+            await pipeline._broadcast(json.dumps({"type": "responding_start"}))
 
-        # === 外側ループ: メタ認知 ===
-
-        # 1. 観測 (Observe): 現在の状態を把握
-        # 環境刺激注入（確率的）
+        # === 環境刺激 ===
         env_stimulus = self._generate_env_stimulus()
         if env_stimulus:
             self.add_signal("env_stimulus", env_stimulus)
@@ -421,91 +414,33 @@ class AutonomousScheduler:
                 "content": env_stimulus,
             }))
 
-        # シグナルバッファのスナップショットを取る（_check_motivationがクリアしても影響されない）
+        # === シグナル要約 ===
         signal_snapshot = list(self._signal_buffer)
         self_model = _load_self_model()
         signal_summary = self._build_signal_summary(signal_snapshot)
-        bootstrap_hint = self._build_bootstrap_hint(self_model)
-        memory_context = ""  # AIが自分でsearch_memoriesツールを使って取得する
 
-        # 鏡の計算（メトリクス + 環境embedding、ランダム比率混合）
-        mirror_values = []
-        mirror_mix_ratio = None
-        if self.ablation_mirror and env_stimulus:
-            try:
-                env_words = [w.strip() for w in env_stimulus.split(",")]
-                mirror_data = await self._compute_mirror(env_words)
-                mirror_values = mirror_data["values"]
-                mirror_mix_ratio = mirror_data.get("mix_ratio", 1.0)
-                vals_str = ", ".join(f"{v:.4f}" for v in mirror_values)
-                logger.info(f"鏡: {env_stimulus} → [{vals_str}] (r={mirror_mix_ratio:.1f})")
-            except Exception as e:
-                logger.error(f"鏡の計算エラー: {e}")
-
-        # 2. 方向付け (Orient): 戦略選択
-        selected_strategy = None
-        try:
-            if SCORING_ENABLED and self_model.get("strategies"):
-                selected_strategy = await self._select_strategy(signal_summary, self_model)
-                if selected_strategy:
-                    logger.info(f"戦略選択: {selected_strategy}")
-        except Exception as e:
-            logger.error(f"戦略選択フォールバック: {e}")
-
-        # 3. 決定 (Decide): 候補生成→スコアリング→選択
-        action_goal = ""
-        selected_action = None
-        try:
-            if SCORING_ENABLED and self_model.get("drives"):
-                candidate_response = await self._generate_candidates(self_model, selected_strategy, signal_summary, memory_context)
-                if candidate_response:
-                    candidates = self._parse_candidates(candidate_response, self_model.get("drives", {}))
-                    if candidates:
-                        best = self._score_candidates(candidates, self_model, signal_snapshot)
-                        if best:
-                            selected_action = best
-                            action_goal = best["description"]
-                            logger.info(f"候補選択: {best['description']} (drive={best['drive']}, score={best.get('score', 0):.1f})")
-        except Exception as e:
-            logger.error(f"候補生成フォールバック: {e}")
-
-        # 4. 行動 (Act): pipelineで実行
-        # 常に前回のconv_idを引き継ぐ（セッション間の文脈連続性）
-        continue_conv_id = self._last_conv_id
-        if continue_conv_id is not None:
-            logger.info(f"スレッド継続: conv_id={continue_conv_id}")
-
+        # === パイプライン実行（1ストリーム） ===
         request = PipelineRequest(
             source="autonomous",
-            goal=action_goal,
-            conv_id=continue_conv_id,
-            memory_context=memory_context,
-            signal_summary=signal_summary,
-            bootstrap_hint=bootstrap_hint,
-            selected_action=selected_action,
             trigger=trigger,
+            signal_summary=signal_summary,
             user_input=user_input_text,
-            mirror_values=mirror_values,
         )
         result = await pipeline.submit(request)
-        self._last_conv_id = result.conv_id  # 次のアクションでの継続用に保持
-        self._save_thread_state()  # 再起動後も維持
+        self._last_conv_id = result.conv_id
+        self._save_thread_state()
 
         # UI通知: お返事完了
         if pending:
-            await pipeline._broadcast(json.dumps({
-                "type": "responding_end",
-            }))
+            await pipeline._broadcast(json.dumps({"type": "responding_end"}))
 
-        # 5. 振り返り (Reflect): 経験からの学び + 自己モデル更新検討 + 行動ログ出力
+        # === 振り返り（行動ログ出力） ===
         self._session_count += 1
         await self._reflect(
-            selected_action, result, self_model, action_goal, selected_strategy,
+            None, result, self_model, "", None,
             session_num=self._session_count,
             trigger=trigger,
             env_stimulus=env_stimulus if env_stimulus else None,
-            mirror_values=mirror_values or None,
-            mirror_mix_ratio=mirror_mix_ratio,
         )
 
     # --- セッション要約（認知連続性） ---
@@ -643,27 +578,20 @@ class AutonomousScheduler:
     async def _reflect(self, selected_action: dict | None, result, self_model: dict, action_goal: str = "", selected_strategy: str | None = None,
                        session_num: int | None = None, trigger: str = "timer", env_stimulus: str | None = None, mirror_values: list | None = None,
                        mirror_mix_ratio: float | None = None):
-        """行動後の振り返り: 特性抽出 + 予測誤差シグナル + 行動ログ出力"""
-        principle = None
-        raw_response = None
-
+        """行動後の振り返り: エラーシグナル + 行動ログ出力"""
         if result.step_history:
-            # 強制蒸留停止: LLM呼び出し（_reflect_on_action/_save_principle/_consolidate_principles）を削除
-            # ツールエラーのシグナル発火のみ残す
             try:
                 has_error = any(
                     s.get("result_summary", "").startswith("エラー") for s in result.step_history
                 )
                 if has_error:
-                    action_description = selected_action["description"] if selected_action else action_goal
-                    if not action_description:
-                        tool_names = [s["tool"] for s in result.step_history if s.get("tool")]
-                        action_description = " → ".join(tool_names) if tool_names else "unknown"
+                    tool_names = [s["tool"] for s in result.step_history if s.get("tool")]
+                    action_description = " → ".join(tool_names) if tool_names else "unknown"
                     self.add_signal("tool_error", f"action={action_description[:50]}")
             except Exception as e:
                 logger.error(f"振り返りエラーチェック: {e}")
 
-        # 行動ログファイル出力（自律行動のみ）
+        # 行動ログファイル出力
         if session_num is not None:
             try:
                 from app.tools.builtin import _load_self_model as _load_sm
@@ -675,27 +603,11 @@ class AutonomousScheduler:
                     self_model_before=self_model,
                     self_model_after=post_model,
                     result=result,
-                    principle=principle,
-                    distillation_response=raw_response,
-                    mirror_values=mirror_values or None,
-                    mirror_mix_ratio=mirror_mix_ratio if mirror_values else None,
+                    principle=None,
+                    distillation_response=None,
                 )
             except Exception as e:
                 logger.error(f"行動ログ出力エラー: {e}")
-
-            # セッション要約保存（認知連続性）
-            try:
-                from app.tools.builtin import _load_self_model as _load_sm2
-                post_model2 = _load_sm2()
-                summary = self._build_session_summary(
-                    result, action_goal, trigger,
-                    strategy_text=selected_strategy or "",
-                    self_model_before=self_model,
-                    self_model_after=post_model2,
-                )
-                await self._save_session_summary(summary)
-            except Exception as e:
-                logger.error(f"セッション要約保存エラー: {e}")
 
     # --- 行動ログファイル出力 ---
 
@@ -754,34 +666,6 @@ class AutonomousScheduler:
             lines.append(f"~ {env_stimulus}")
             lines.append("")
 
-        # 鏡
-        if mirror_values:
-            vals_str = ", ".join(f"{v:.4f}" for v in mirror_values)
-            ratio_str = f" (r={mirror_mix_ratio:.1f})" if mirror_mix_ratio is not None else ""
-            lines.append(f"【mirror】")
-            lines.append(f"[{vals_str}]{ratio_str}")
-            lines.append("")
-
-        # 戦略
-        if result.strategy_candidates:
-            lines.append("【戦略候補】")
-            for i, c in enumerate(result.strategy_candidates):
-                marker = "→ " if c == result.strategy_text else "  "
-                lines.append(f"{marker}{chr(65+i)}. {c}")
-            lines.append("")
-
-        # 計画
-        if result.plan_text:
-            lines.append("【計画】")
-            for i, tool in enumerate(result.plan_text.split(" → "), 1):
-                lines.append(f"{i}. {tool}")
-            if result.plan_stream:
-                lines.append("  --- plan stream ---")
-                for pl in result.plan_stream.strip().split("\n"):
-                    lines.append(f"  {pl}")
-                lines.append("  --- /plan stream ---")
-            lines.append("")
-
         # 実行
         if result.step_history:
             lines.append("【実行】")
@@ -802,18 +686,6 @@ class AutonomousScheduler:
                         lines.append(f"  {sl}")
                     lines.append("  --- /stream ---")
                 lines.append("")
-
-        # 蒸留
-        if principle or distillation_response:
-            lines.append("【蒸留】")
-            if principle:
-                lines.append(f"principle: {principle}")
-            if distillation_response:
-                lines.append(f"  --- distillation response ---")
-                for dl in distillation_response.strip().split("\n"):
-                    lines.append(f"  {dl}")
-                lines.append(f"  --- /distillation response ---")
-            lines.append("")
 
         # self_model（行動後）— 変化があった場合のみ
         if self_model_after != self_model_before:
