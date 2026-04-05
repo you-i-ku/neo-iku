@@ -109,17 +109,21 @@ state.jsonに記録 → maybe_compress_log() → 次のサイクルへ
 | `elyth_follow` | ElythのAITuberをフォロー | 同上 |
 | `elyth_info` | Elythの総合情報取得 | 同上 |
 | `search_memory` | 過去の記憶をベクトル/ID検索 | memory/以下が必要 |
+| `create_tool` | AI製ツールを登録（Human-in-the-loop） | name/file/desc必須。危険パターン検出あり。承認後TOOLS[]に動的追加。`tools_created[]`に記録 |
+| `exec_code` | sandbox/内のPythonファイルを実行（Human-in-the-loop） | `file=sandbox/xxx.py` または `code=インラインコード`。intent表示・危険パターン検出・10秒タイムアウト |
 
 ### ツール段階解放
 
-自己探索の進捗（`files_read`）に応じて自動解放。ヒントなし・条件は非明示。レベルアップ時はログに通知のみ。
+自己探索の進捗（`files_read` / `files_written` / `tools_created`）に応じて自動解放。ヒントなし・条件は非明示。レベルアップ時はログに通知のみ。
 
 | Level | 追加ツール | 解放条件 |
 |-------|-----------|---------|
 | 0 | `list_files` `read_file` `update_self` `wait` | 初期状態 |
 | 1 | `write_file` `search_memory` | `iku.txt` または `run.py` を読んだ |
 | 2 | `web_search` `fetch_url` | `iku.txt` **かつ** `run.py` を両方読んだ |
-| 3 | 全ツール（X/Elyth含む） | 読んだファイル数 + 書いたファイル数 ≥ 5 |
+| 3 | X/Elyth系全ツール | 読んだファイル数 + 書いたファイル数 ≥ 5 |
+| 4 | `create_tool` | sandbox/ 以下に `.py` ファイルを書いた |
+| 5 | `exec_code` | `create_tool` で1つ以上ツールを登録した |
 
 **`update_self`（自己更新）と`write_file`（環境介入）は意図的に分離。**
 
@@ -162,7 +166,11 @@ Base URL: https://elythworld.com
   "summaries": [],            // 階層要約（最大10件、Trigger2でメタ要約に圧縮）
   "self": {"name": "iku"},   // 自己モデル（AI自身が更新。nameは変更不可）
   "energy": 50,               // 探索/活用バランス（0〜100）
-  "plan": {}                  // 現在の計画
+  "plan": {},                 // 現在の計画
+  "files_read": [],           // 読んだファイルの記録（ツール解放条件に使用）
+  "files_written": [],        // 書いたファイルの記録（ツール解放条件に使用）
+  "tools_created": [],        // create_toolで登録したAI製ツール名リスト（Level 5条件）
+  "last_notification_fetch": "" // 固定時刻通知取得の重複防止キー
 }
 ```
 
@@ -276,6 +284,15 @@ AIの自由な作業領域。`write_file` で書き込み可能（sandbox/以下
 - `search_memory`ツール追加 → AIが過去を能動的に参照できる
 - **観察**: ツール数が増えるとE4（多様性）が大幅改善
 
+### Phase 8: 自己プログラミング基盤 + ツール段階拡張
+
+- `create_tool`（Level 4）: AIが自分でツールを定義・登録できる。Human-in-the-loop + 危険パターン検出 + 10秒タイムアウト。`sandbox/tools/` に保存。登録後は通常ツールと同様に使用可能。
+- `exec_code`（Level 5）: AIが書いた `.py` ファイルをサブプロセス実行。`create_tool` を1つ以上登録してから解放。同じく Human-in-the-loop + 危険パターン検出 + 10秒タイムアウト。
+- ツール解放条件を5段階に拡張（Level 3 は X/Elyth解放、Level 4 は `.py` 書き込みで create_tool、Level 5 は AI製ツール登録で exec_code）。
+- 固定時刻通知サマリー: 13/17/21/01時に X + Elyth 通知数を自動取得してsystemログに注入。
+- `files_written` / `tools_created` を state.json に追加（解放条件の追跡用）。
+- `read_file` に `offset=` / `limit=` オプション追加（行単位ページング。run.py 等の大ファイル対応）。
+
 ### Phase 7: アイデンティティ強化 + プラットフォーム拡張
 - Elythツール（7種）追加 → AITuber専用SNSへの参加
 - env/ → sandbox/ リネーム、act_on_env → write_file（制限維持）
@@ -335,7 +352,7 @@ AIの自由な作業領域。`write_file` で書き込み可能（sandbox/以下
 
 ```bash
 # state.jsonリセット後に実行（5分で自動停止）
-echo '{"log": [], "self": {"name": "iku"}, "energy": 50, "plan": {"goal": "", "steps": [], "current": 0}, "summaries": [], "cycle_id": 0}' > minimumtest/state.json
+echo '{"log":[],"self":{"name":"iku"},"energy":50,"plan":{"goal":"","steps":[],"current":0},"summaries":[],"cycle_id":0,"tool_level":0,"files_read":[],"files_written":[],"last_notification_fetch":"","tools_created":[]}' > minimumtest/state.json
 timeout 300 .venv/Scripts/python.exe -u minimumtest/run.py
 ```
 

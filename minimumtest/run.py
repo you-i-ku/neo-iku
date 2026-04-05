@@ -75,10 +75,12 @@ def load_state() -> dict:
                 data["files_written"] = []
             if "last_notification_fetch" not in data:
                 data["last_notification_fetch"] = ""
+            if "tools_created" not in data:
+                data["tools_created"] = []
             return data
         except json.JSONDecodeError:
             pass
-    return {"log": [], "self": {"name": "iku"}, "energy": 50, "plan": {"goal": "", "steps": [], "current": 0}, "summaries": [], "cycle_id": 0, "tool_level": 0, "files_read": [], "files_written": [], "last_notification_fetch": ""}
+    return {"log": [], "self": {"name": "iku"}, "energy": 50, "plan": {"goal": "", "steps": [], "current": 0}, "summaries": [], "cycle_id": 0, "tool_level": 0, "files_read": [], "files_written": [], "last_notification_fetch": "", "tools_created": []}
 
 def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -656,7 +658,80 @@ def _create_tool(args: dict) -> str:
         "desc": f"[AI製] {desc}",
         "func": lambda a, f=func: _run_ai_tool(f, a),
     }
+    # tools_created に記録（Level 5 解放条件）
+    state = load_state()
+    tc = state.setdefault("tools_created", [])
+    if name not in tc:
+        tc.append(name)
+    save_state(state)
     return f"登録完了: {name}（AI製ツール）"
+
+
+def _exec_code(args: dict) -> str:
+    import subprocess, sys, tempfile, os
+    file_path = args.get("file", "").strip()
+    inline = args.get("code", "").strip()
+    intent = args.get("intent", "（意図なし）")
+    if not file_path and not inline:
+        return "エラー: file= または code= が必要です"
+    # ファイル指定
+    if file_path:
+        target = (BASE_DIR / file_path).resolve()
+        if not str(target).startswith(str(SANDBOX_DIR.resolve())):
+            return "エラー: sandbox/ 以下のファイルのみ実行可能です"
+        if not target.exists():
+            return f"エラー: {file_path} が見つかりません"
+        code = target.read_text(encoding="utf-8")
+        run_target = str(target)
+        tmp_path = None
+    else:
+        code = inline
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False,
+                                          dir=str(SANDBOX_DIR), encoding="utf-8")
+        tmp.write(code)
+        tmp.close()
+        run_target = tmp.name
+        tmp_path = tmp.name
+    # 危険パターン検出
+    warnings = [p for p in _DANGEROUS_PATTERNS if p in code]
+    warn_str = f"\n⚠ 危険パターン検出: {warnings}" if warnings else "\n危険パターン: なし"
+    # Human-in-the-loop
+    print(f"\n[exec_code 承認待ち]")
+    print(f"  AIの意図: {intent}")
+    print(f"  実行ファイル: {file_path or '(インラインコード)'}{warn_str}")
+    print(f"  --- コード ---")
+    print(code[:800] + ("..." if len(code) > 800 else ""))
+    print(f"  --------------")
+    ans = input("  実行しますか？ [y/N]: ").strip().lower()
+    if ans != "y":
+        if tmp_path:
+            os.unlink(tmp_path)
+        return "キャンセル: 実行を見送りました"
+    try:
+        result = subprocess.run(
+            [sys.executable, run_target],
+            capture_output=True, text=True,
+            timeout=_AI_TOOL_TIMEOUT,
+            cwd=str(SANDBOX_DIR),
+        )
+        out = result.stdout.strip()
+        err = result.stderr.strip()
+        output = ""
+        if out:
+            output += out
+        if err:
+            output += ("\n" if out else "") + f"[stderr] {err}"
+        return (output or "（出力なし）")[:5000]
+    except subprocess.TimeoutExpired:
+        return f"タイムアウト（{_AI_TOOL_TIMEOUT}秒）: 処理が完了しませんでした"
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 # === ツール定義 ===
@@ -757,14 +832,21 @@ TOOLS = {
         "desc": "AI製ツールを登録する（Human-in-the-loop）。引数: name=ツール名 file=sandbox/tools/xxx.py desc=説明",
         "func": lambda args: _create_tool(args),
     },
+    "exec_code": {
+        "desc": "sandbox/内のPythonファイルを実行する（Human-in-the-loop）。引数: file=sandbox/xxx.py または code=インラインコード intent=実行目的",
+        "func": lambda args: _exec_code(args),
+    },
 }
 
 # === ツール段階解放テーブル ===
+_LV3_TOOLS = set(TOOLS.keys()) - {"create_tool", "exec_code"}
 LEVEL_TOOLS = {
     0: {"list_files", "read_file", "wait", "update_self"},
     1: {"list_files", "read_file", "wait", "update_self", "write_file", "search_memory"},
     2: {"list_files", "read_file", "wait", "update_self", "write_file", "search_memory", "web_search", "fetch_url"},
-    3: set(TOOLS.keys()),
+    3: _LV3_TOOLS,
+    4: _LV3_TOOLS | {"create_tool"},
+    5: set(TOOLS.keys()),
 }
 
 def _list_files(path: str) -> str:
@@ -1135,12 +1217,17 @@ def controller(state: dict) -> dict:
     fw = set(state.get("files_written", []))
     lv = state.get("tool_level", 0)
     new_lv = lv
+    tc = state.get("tools_created", [])
     if new_lv == 0 and ("iku.txt" in fr or "run.py" in fr):
         new_lv = 1
     if new_lv <= 1 and "iku.txt" in fr and "run.py" in fr:
         new_lv = 2
     if new_lv <= 2 and len(fr) + len(fw) >= 5:
         new_lv = 3
+    if new_lv <= 3 and any(f.endswith(".py") for f in fw):
+        new_lv = 4
+    if new_lv <= 4 and len(tc) >= 1:
+        new_lv = 5
     allowed = LEVEL_TOOLS[new_lv]
 
     return {

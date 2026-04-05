@@ -12,6 +12,8 @@ AI/.env
 
 # Data (auto-generated)
 data/
+minimumtest/raw_log.txt
+minimumtest/llm_debug.log
 
 # IDE / Dev tools
 .vscode/
