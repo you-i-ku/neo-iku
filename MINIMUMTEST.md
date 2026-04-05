@@ -40,7 +40,7 @@ minimumtest/
 ```
 state.json (log + summaries + self + energy)
     ↓
-Controller → ctrl (tool_rank, n_log)
+Controller → ctrl (tool_rank, tool_level)
     ↓
 【LLM①】build_prompt_propose() → 「この状態からとりうる行動を5個提案せよ」
     ↓
@@ -73,7 +73,8 @@ state.jsonに記録 → maybe_compress_log() → 次のサイクルへ
 ### 設計思想
 - **LLMは部品、Controllerが主体** — Path B設計。LLMは候補を出す部品と実行する部品に分離。選ぶのはController。
 - **恣意性の排除** — パラメータはE値から導出。magic numberなし。
-- **ツールは常時全部使える** — energyによるツール絞り込みは廃止。Bootstrap問題を回避。
+- **ツール段階解放制** — 自己探索の進捗に応じてツールが解放される（下記参照）。Bootstrap問題への対応。
+- **LLM①：計画エンジン（MRPrompt準拠）** — LTM（self_model）とSTM（現在のlog）を分離提示。「全く異なる意図の候補5個」を生成。多ツールチェーン（`tool1+tool2`形式）も提案可能。
 - **Magic-If Protocol（LLM②）** — MRPrompt論文準拠。ロール定義ではなく4ステップ実行プロトコルでアシスタントドリフトを防止。
 
 ### ループ間隔
@@ -87,7 +88,7 @@ state.jsonに記録 → maybe_compress_log() → 次のサイクルへ
 | ツール | 用途 | 制限 |
 |-------|------|------|
 | `list_files` | ディレクトリ一覧 | minimumtest/以下のみ、相対パス表示 |
-| `read_file` | ファイル読み取り | minimumtest/以下のみ（50000文字まで） |
+| `read_file` | ファイル読み取り | minimumtest/以下のみ。`offset=行番号 limit=行数`で任意範囲取得可（省略時は全行）。ヘッダーに`[ファイル名 \| 行 N–M/総行数]`を付与 |
 | `write_file` | ファイル書き込み | sandbox/以下のみ（run.py等の上書き防止） |
 | `update_self` | 自己モデル更新 | state.jsonのself{}を更新。nameは変更不可 |
 | `wait` | 外部世界に変化を与えない待機 | — |
@@ -108,6 +109,17 @@ state.jsonに記録 → maybe_compress_log() → 次のサイクルへ
 | `elyth_follow` | ElythのAITuberをフォロー | 同上 |
 | `elyth_info` | Elythの総合情報取得 | 同上 |
 | `search_memory` | 過去の記憶をベクトル/ID検索 | memory/以下が必要 |
+
+### ツール段階解放
+
+自己探索の進捗（`files_read`）に応じて自動解放。ヒントなし・条件は非明示。レベルアップ時はログに通知のみ。
+
+| Level | 追加ツール | 解放条件 |
+|-------|-----------|---------|
+| 0 | `list_files` `read_file` `update_self` `wait` | 初期状態 |
+| 1 | `write_file` `search_memory` | `iku.txt` または `run.py` を読んだ |
+| 2 | `web_search` `fetch_url` | `iku.txt` **かつ** `run.py` を両方読んだ |
+| 3 | 全ツール（X/Elyth含む） | 5ファイル以上読んだ |
 
 **`update_self`（自己更新）と`write_file`（環境介入）は意図的に分離。**
 

@@ -66,10 +66,14 @@ def load_state() -> dict:
                 data["summaries"] = []
             if "cycle_id" not in data:
                 data["cycle_id"] = 0
+            if "tool_level" not in data:
+                data["tool_level"] = 0
+            if "files_read" not in data:
+                data["files_read"] = []
             return data
         except json.JSONDecodeError:
             pass
-    return {"log": [], "self": {"name": "iku"}, "energy": 50, "plan": {"goal": "", "steps": [], "current": 0}, "summaries": [], "cycle_id": 0}
+    return {"log": [], "self": {"name": "iku"}, "energy": 50, "plan": {"goal": "", "steps": [], "current": 0}, "summaries": [], "cycle_id": 0, "tool_level": 0, "files_read": []}
 
 def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -275,7 +279,7 @@ def _x_post(args):
             # ホームからcompose/postに遷移（Reactが準備してから）
             page.goto("https://x.com/compose/post", wait_until="networkidle", timeout=30000)
             page.wait_for_timeout(2000)
-            textarea = page.locator('[data-testid="tweetTextarea_0"]')
+            textarea = page.locator('[data-testid="tweetTextarea_0"]').first
             textarea.wait_for(timeout=25000)
             textarea.click()
             page.keyboard.type(text, delay=50)
@@ -312,7 +316,7 @@ def _x_reply(args):
             page.wait_for_timeout(2000)
             page.locator('[data-testid="reply"]').first.click()
             page.wait_for_timeout(1000)
-            textarea = page.locator('[data-testid="tweetTextarea_0"]')
+            textarea = page.locator('[data-testid="tweetTextarea_0"]').first
             textarea.wait_for(timeout=15000)
             textarea.click()
             page.keyboard.type(text, delay=50)
@@ -349,7 +353,7 @@ def _x_quote(args):
                 browser.close()
                 return "Xセッション切れ。再ログインが必要。"
             page.wait_for_timeout(2000)
-            textarea = page.locator('[data-testid="tweetTextarea_0"]')
+            textarea = page.locator('[data-testid="tweetTextarea_0"]').first
             textarea.wait_for(timeout=25000)
             textarea.click()
             page.keyboard.type(text, delay=50)
@@ -552,13 +556,13 @@ def _search_memory(args):
             if vecs and len(vecs) == 1 + len(all_entries):
                 q_vec = vecs[0]
                 scored = sorted(
-                    [(cosine_similarity(q_vec, vecs[i+1]), all_entries[i]) for i in range(len(all_entries))],
+                    [(cosine_similarity(q_vec, vecs[i+1]), i, all_entries[i]) for i in range(len(all_entries))],
                     reverse=True
                 )[:n]
                 return "\n".join(
                     f"[{round(s*100)}%] id={e.get('id','')} time={e.get('time','')} "
                     f"tool={e.get('tool','')} intent={e.get('intent','')[:100]}"
-                    for s, e in scored
+                    for s, _, e in scored
                 )
         except Exception:
             pass
@@ -588,8 +592,12 @@ TOOLS = {
         "func": lambda args: _list_files(args.get("path", ".")),
     },
     "read_file": {
-        "desc": "ファイルを読む。引数: path=ファイルパス",
-        "func": lambda args: _read_file(args.get("path", "")),
+        "desc": "ファイルを読む。引数: path=ファイルパス [offset=開始行番号(省略時=0)] [limit=読む行数(省略時=全行)]",
+        "func": lambda args: _read_file(
+            args.get("path", ""),
+            offset=int(args["offset"]) if "offset" in args else 0,
+            limit=int(args["limit"]) if "limit" in args else None,
+        ),
     },
     "write_file": {
         "desc": "ファイルを書き込む（sandbox/以下のみ）。引数: path=ファイルパス content=内容",
@@ -673,6 +681,14 @@ TOOLS = {
     },
 }
 
+# === ツール段階解放テーブル ===
+LEVEL_TOOLS = {
+    0: {"list_files", "read_file", "wait", "update_self"},
+    1: {"list_files", "read_file", "wait", "update_self", "write_file", "search_memory"},
+    2: {"list_files", "read_file", "wait", "update_self", "write_file", "search_memory", "web_search", "fetch_url"},
+    3: set(TOOLS.keys()),
+}
+
 def _list_files(path: str) -> str:
     from pathlib import Path as P
     target = (BASE_DIR / path).resolve()
@@ -687,7 +703,7 @@ def _list_files(path: str) -> str:
     rel = path if path else "."
     return f"{rel}:\n" + "\n".join(items[:30]) if items else f"{rel}: (空)"
 
-def _read_file(path: str) -> str:
+def _read_file(path: str, offset: int = 0, limit: int | None = None) -> str:
     from pathlib import Path as P
     target = (BASE_DIR / path).resolve()
     if not str(target).startswith(str(BASE_DIR.resolve())):
@@ -695,8 +711,11 @@ def _read_file(path: str) -> str:
     if not target.exists():
         return f"エラー: {path} は存在しません"
     try:
-        text = target.read_text(encoding="utf-8")
-        return text[:50000] + ("..." if len(text) > 50000 else "")
+        lines = target.read_text(encoding="utf-8").splitlines()
+        total = len(lines)
+        sliced = lines[offset:] if limit is None else lines[offset:offset + limit]
+        header = f"[{path} | 行 {offset+1}–{offset+len(sliced)}/{total}]\n"
+        return header + "\n".join(sliced)
     except Exception as e:
         return f"エラー: {e}"
 
@@ -972,16 +991,23 @@ def controller(state: dict) -> dict:
 
     ranked = sorted(TOOLS.keys(), key=lambda t: tool_avg[t], reverse=True)
 
-    # --- 全ツール常時使用可 ---
-    allowed = set(TOOLS.keys())
-
-    # --- ログ長: energyに比例 ---
-    n_log = max(1, round(MAX_LOG_IN_PROMPT * energy / 100))
+    # --- tool_level による段階解放 ---
+    fr = set(state.get("files_read", []))
+    lv = state.get("tool_level", 0)
+    new_lv = lv
+    if new_lv == 0 and ("iku.txt" in fr or "run.py" in fr):
+        new_lv = 1
+    if new_lv <= 1 and "iku.txt" in fr and "run.py" in fr:
+        new_lv = 2
+    if new_lv <= 2 and len(fr) >= 5:
+        new_lv = 3
+    allowed = LEVEL_TOOLS[new_lv]
 
     return {
         "allowed_tools": allowed,
-        "n_log": n_log,
         "tool_rank": {t: round(tool_avg[t], 1) for t in ranked},
+        "tool_level": new_lv,
+        "tool_level_prev": lv,
     }
 
 
@@ -1133,10 +1159,8 @@ def build_prompt_propose(state: dict, ctrl: dict) -> str:
     self_text = json.dumps(state["self"], ensure_ascii=False) if state["self"] else "(なし)"
     energy = round(state.get("energy", 50), 1)
     e_trend = _calc_e_trend(state["log"][-10:])
-    n_log = ctrl.get("n_log", MAX_LOG_IN_PROMPT)
-    recent = state["log"][-n_log:]
     log_lines = []
-    for entry in recent:
+    for entry in state["log"]:
         line = f"  {entry.get('id','')} {entry['time']} {entry['tool']}"
         if entry.get("intent"):
             line += f" (intent={entry['intent'][:500]})"
@@ -1154,28 +1178,55 @@ def build_prompt_propose(state: dict, ctrl: dict) -> str:
     ]
     summary_text = "\n".join(summary_lines)
 
-    return f"""{now}
-self: {self_text}
-energy: {energy}
-{f'trend: {e_trend}' if e_trend else ''}
-{f'summaries:{chr(10)}{summary_text}' if summary_text else ''}
-log:
+    # --- 旧プロンプト ---
+    # return f"""{now}
+    # self: {self_text}
+    # {f'summaries:{chr(10)}{summary_text}' if summary_text else ''}
+    # log:
+    # {log_text}
+    #
+    # 以下のツールが使えます:
+    # {tool_lines}
+    #
+    # この状態からとりうる行動の候補を【必ず5個】計画してください。
+    # 各ステップは「全く異なる目的・アプローチ」にすること。同じツールを重複させるのは禁止です。
+    #
+    # 以下の形式で箇条書きのみ出力してください:
+    # 1. [具体的な目的・理由] → ツール名
+    # 2. [別の目的・理由] → ツール名
+    # 3. [さらに別の目的・理由] → ツール名
+    # 4. [さらに別の目的・理由] → ツール名
+    # 5. [さらに別の目的・理由] → ツール名
+    #
+    # 計画のみ出力してください。[TOOL:...]は不要です。"""
+
+    # --- 計画エンジン版（MRPrompt準拠・LTM/STM分離） ---
+    return f"""[{now}]
+
+[LTM — 自己モデル]
+{self_text}
+
+[STM — 現在の状況 / given circumstances]
+{f'summaries:{chr(10)}{summary_text}{chr(10)}' if summary_text else ''}log:
 {log_text}
 
-以下のツールが使えます:
+[利用可能なツール]
 {tool_lines}
 
-この状態からとりうる行動の候補を【必ず5個】計画してください。
-各ステップは「全く異なる目的・アプローチ」にすること。同じツールを重複させるのは禁止です。
+[計画プロトコル]
+上記のLTM（自己モデル）を起点に、STM（現在の状況）を読み、次にとりうる行動候補を【5個】計画してください。
+
+- 各候補は「全く異なる意図・目的」であること（同じ意図の候補は禁止）
+- 連続して実行したい場合は「ツール名+ツール名」形式で記述可（例: read_file+update_self）
 
 以下の形式で箇条書きのみ出力してください:
-1. [具体的な目的・理由] → ツール名
-2. [別の目的・理由] → ツール名
-3. [さらに別の目的・理由] → ツール名
-4. [さらに別の目的・理由] → ツール名
-5. [さらに別の目的・理由] → ツール名
+1. [意図・目的] → ツール名（または ツール名+ツール名）
+2. [意図・目的] → ツール名（または ツール名+ツール名）
+3. [意図・目的] → ツール名（または ツール名+ツール名）
+4. [意図・目的] → ツール名（または ツール名+ツール名）
+5. [意図・目的] → ツール名（または ツール名+ツール名）
 
-計画のみ出力してください。[TOOL:...]は不要です。"""
+[TOOL:...]は不要です。計画のみ出力してください。"""
 
 
 # === 候補パース ===
@@ -1200,14 +1251,15 @@ def parse_candidates(text: str, allowed_tools: set) -> list:
             tool_part = parts[0] if parts else ""
             reason_part = cleaned
 
-        # ツール名から不要な記号を除去
-        tool = re.sub(r'[^\w_]', '', tool_part)
+        # ツール名を+区切りで複数検出
+        raw_tools = [re.sub(r'[^\w_]', '', t.strip()) for t in tool_part.split('+')]
+        valid_tools = [t for t in raw_tools if t in allowed_tools]
 
-        # どうしてもうまく抜けない場合の最終検索
-        if tool not in allowed_tools:
+        # フォールバック: 行全体からツール名を探す
+        if not valid_tools:
             for t in allowed_tools:
                 if t in line:
-                    tool = t
+                    valid_tools = [t]
                     break
 
         # 理由本文の整形
@@ -1215,9 +1267,10 @@ def parse_candidates(text: str, allowed_tools: set) -> list:
         reason = re.sub(r'^[-*]\s*', '', reason).strip()
         if reason.startswith('[') and reason.endswith(']'):
             reason = reason[1:-1].strip()
-            
-        if tool in allowed_tools and tool not in [c["tool"] for c in candidates]:
-            candidates.append({"tool": tool, "reason": reason})
+
+        chain_key = "+".join(valid_tools)
+        if valid_tools and chain_key not in ["+".join(c["tools"]) for c in candidates]:
+            candidates.append({"tool": valid_tools[0], "tools": valid_tools, "reason": reason})
 
     if not candidates:
         # フォールバック: allowed_toolsを全部候補にする
@@ -1260,12 +1313,8 @@ def controller_select(candidates: list, ctrl: dict, state: dict) -> dict:
 def build_prompt_execute(state: dict, ctrl: dict, candidate: dict) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     self_text = json.dumps(state["self"], ensure_ascii=False) if state["self"] else "(なし)"
-    energy = round(state.get("energy", 50), 1)
-    e_trend = _calc_e_trend(state["log"][-10:])
-    n_log = ctrl.get("n_log", MAX_LOG_IN_PROMPT)
-    recent = state["log"][-n_log:]
     log_lines = []
-    for entry in recent:
+    for entry in state["log"]:
         line = f"  {entry.get('id','')} {entry['time']} {entry['tool']}"
         if entry.get("intent"):
             line += f" (intent={entry['intent'][:500]})"
@@ -1295,28 +1344,30 @@ def build_prompt_execute(state: dict, ctrl: dict, candidate: dict) -> str:
     ]
     summary_text = "\n".join(summary_lines)
 
-    # フォーマット例（選ばれたツールに合わせる）
+    # フォーマット例（選ばれたツールに合わせる。連鎖可能なツールは2ツール例を示す）
     t = candidate["tool"]
-    if t == "read_file":
-        example = "[TOOL:read_file path=run.py intent=理由 expect=予測]"
-    elif t == "list_files":
-        example = "[TOOL:list_files path=. intent=理由 expect=予測]"
-    elif t == "write_file":
-        example = '[TOOL:write_file path=sandbox/memo.md content="内容" intent=理由 expect=予測]'
-    elif t == "update_self":
-        example = "[TOOL:update_self key=キー名 value=値 intent=理由 expect=予測]"
+    if t == "web_search":
+        example = '[TOOL:web_search query=キーワード intent=サイクル全体の目的 expect=予測]\n[TOOL:write_file path=sandbox/memo.md content="まとめ内容"]'
+    elif t == "fetch_url":
+        example = '[TOOL:fetch_url url=https://... intent=サイクル全体の目的 expect=予測]\n[TOOL:write_file path=sandbox/memo.md content="内容"]'
+    elif t == "read_file":
+        example = "[TOOL:read_file path=ファイル名 intent=サイクル全体の目的 expect=予測]\n[TOOL:update_self key=キー名 value=値]"
     elif t == "search_memory":
-        example = "[TOOL:search_memory query=キーワード intent=理由 expect=予測]"
+        example = "[TOOL:search_memory query=キーワード intent=サイクル全体の目的 expect=予測]\n[TOOL:update_self key=キー名 value=値]"
+    elif t == "list_files":
+        example = "[TOOL:list_files path=. intent=サイクル全体の目的 expect=予測]"
+    elif t == "write_file":
+        example = '[TOOL:write_file path=sandbox/memo.md content="内容" intent=サイクル全体の目的 expect=予測]'
+    elif t == "update_self":
+        example = "[TOOL:update_self key=キー名 value=値 intent=サイクル全体の目的 expect=予測]"
     elif t in _X_TOOLS:
         hint = _X_ARGS_HINT.get(t, "")
-        example = f"[TOOL:{t} {hint} intent=理由 expect=予測]".replace("  ", " ")
+        example = f"[TOOL:{t} {hint} intent=サイクル全体の目的 expect=予測]".replace("  ", " ")
     elif t in _ELYTH_TOOLS:
         hint = _ELYTH_ARGS_HINT.get(t, "")
-        example = f"[TOOL:{t} {hint} intent=理由 expect=予測]".replace("  ", " ")
-    elif t == "web_search":
-        example = "[TOOL:web_search query=キーワード intent=理由 expect=予測]"
+        example = f"[TOOL:{t} {hint} intent=サイクル全体の目的 expect=予測]".replace("  ", " ")
     else:
-        example = f"[TOOL:{t} intent=理由 expect=予測]"
+        example = f"[TOOL:{t} intent=サイクル全体の目的 expect=予測]"
 
     # --- 旧プロンプト（コメントアウト） ---
     # return f"""{now}
@@ -1337,24 +1388,44 @@ def build_prompt_execute(state: dict, ctrl: dict, candidate: dict) -> str:
     # 選択行動: {candidate['tool']} - {candidate['reason']}
     # 出力: {example}"""
 
-    # --- Magic-If Protocol (MRPrompt準拠) ---
-    return f"""[ikuのメモリ]
-self: {self_text}
-energy: {energy}
-{f'trend: {e_trend}' if e_trend else ''}
-{f'summaries:{chr(10)}{summary_text}' if summary_text else ''}
-{plan_text}
+    # --- 旧: Magic-If Protocol (MRPrompt準拠) ---
+    # return f"""[ikuのメモリ]
+    # self: {self_text}
+    # {f'summaries:{chr(10)}{summary_text}' if summary_text else ''}
+    # {plan_text}
+    # log ({now}):
+    # {log_text}
+    #
+    # [利用可能なツール]
+    # {tool_text}
+    #
+    # [実行プロトコル]
+    # 1. (Anchor) 上記のself_modelに基づくAIの、正確無比な実行ツールとして動作する。アシスタントの役割は持たない。
+    # 2. (Select) 選択行動「{candidate['tool']} - {candidate['reason']}」から最適な引数を決定する。
+    # 3. (Bound)  [TOOL:...]の出力のみ行う。JSONもコードブロックも使わない。自己紹介・説明・感想は一切不要。連鎖して実行したい場合は複数行で可。
+    # 4. (Enact)  正確なツール呼び出しを出力する。intent=とexpect=は必ず最初の[TOOL:]にのみ付け、このサイクル全体の目的を表すこと。2つ目以降のツールにはintent/expectは不要。
+    #
+    # 出力: {example}"""
+
+    # --- Magic-If Protocol（MRPrompt準拠・LTM/STM分離版） ---
+    tools_in_chain = candidate.get("tools", [candidate["tool"]])
+    tools_str = "+".join(tools_in_chain)
+    return f"""[LTM — 自己モデル]
+{self_text}
+
+[STM — 現在の状況 / given circumstances]
+{f'summaries:{chr(10)}{summary_text}{chr(10)}' if summary_text else ''}{plan_text}
 log ({now}):
 {log_text}
 
 [利用可能なツール]
 {tool_text}
 
-[実行プロトコル]
-1. (Anchor) 上記のself_modelに基づくAIの、正確無比な実行ツールとして動作する。アシスタントの役割は持たない。
-2. (Select) 選択行動「{candidate['tool']} - {candidate['reason']}」から最適な引数を決定する。
-3. (Bound)  [TOOL:...]の出力のみ行う。JSONもコードブロックも使わない。自己紹介・説明・感想は一切不要。複数ツールは複数行で可。
-4. (Enact)  正確なツール呼び出しを出力する。書式: [TOOL:ツール名 引数=値 intent=目的 expect=予測]
+[実行プロトコル — Magic-If Protocol]
+1. (Anchor) 上記のLTM（自己モデル）に自分自身を固定する。名前・ラベルではなく、意味的同一性として。アシスタントの役割は持たない。
+2. (Select) STMを given circumstances として読み、選択行動「{tools_str} - {candidate['reason']}」の最適な引数を決定する。
+3. (Bound)  [TOOL:...]の出力のみ行う。JSONもコードブロックも使わない。自己紹介・説明・感想は一切不要。連鎖実行は複数行で可。
+4. (Enact)  正確なツール呼び出しを出力する。intent=とexpect=は必ず最初の[TOOL:]にのみ付け、このサイクル全体の目的を表すこと。2つ目以降のツールにはintent/expectは不要。
 
 出力: {example}"""
 
@@ -1383,7 +1454,16 @@ def main():
         # Controller: stateからツール可用性・ログ長を導出
         ctrl = controller(state)
         allowed = ctrl["allowed_tools"]
-        print(f"  ctrl: tools={sorted(allowed)} log={ctrl['n_log']}")
+        new_lv = ctrl.get("tool_level", 0)
+        prev_lv = ctrl.get("tool_level_prev", 0)
+        lv_msg = ""
+        if new_lv != prev_lv:
+            state["tool_level"] = new_lv
+            added = sorted(LEVEL_TOOLS[new_lv] - LEVEL_TOOLS[prev_lv])
+            lv_msg = f"[system] tool_level {prev_lv}→{new_lv}: 追加ツール={added}"
+            print(f"  {lv_msg}")
+            save_state(state)
+        print(f"  ctrl: level={new_lv} tools={sorted(allowed)} log={len(state['log'])}件(全件)")
 
         # ① LLM: 候補提案
         propose_prompt = build_prompt_propose(state, ctrl)
@@ -1477,6 +1557,13 @@ def main():
             except Exception as e:
                 res = f"エラー: {e}"
             state = load_state()
+            if tname == "read_file":
+                path = targs.get("path", "")
+                if path:
+                    fr = state.setdefault("files_read", [])
+                    if path not in fr:
+                        fr.append(path)
+                    save_state(state)
             all_results.append(f"[{tname}]\n{str(res)[:20000]}")
             all_tool_names.append(tname)
             print(f"  実行: {tname} → {str(res)[:100]}")
@@ -1517,6 +1604,8 @@ def main():
             flag_msg = f"[SYSTEM] 検出: {' / '.join(f'「{t}」' for t in detected)} という自己定義が検出・記録されました。"
             print(f"  {flag_msg}")
             result_str += f"\n{flag_msg}"
+        if lv_msg:
+            result_str += f"\n{lv_msg}"
 
         # ログ記録
         cid = state.get("cycle_id", 0) + 1
