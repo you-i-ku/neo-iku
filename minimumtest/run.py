@@ -31,14 +31,17 @@ class DualLogger:
 sys.stdout = DualLogger(RAW_LOG_FILE)
 
 STATE_FILE = BASE_DIR / "state.json"
-ENV_DIR = BASE_DIR / "env"
-WORLD_FILE = ENV_DIR / "world.md"
-SANDBOX_DIR = ENV_DIR / "sandbox"
+SANDBOX_DIR = BASE_DIR / "sandbox"
 LLM_SETTINGS = BASE_DIR.parent / "AI" / "data" / "llm_settings.json"
 BASE_INTERVAL = 20  # 秒
 MAX_INTERVAL = 120
 MAX_LOG_IN_PROMPT = 10
 DEBUG_LOG = BASE_DIR / "llm_debug.log"
+MEMORY_DIR = BASE_DIR / "memory"
+LOG_HARD_LIMIT = 150    # logがこの件数に達したらTrigger1
+LOG_KEEP = 99           # Trigger1後に保持する生ログ件数
+SUMMARY_HARD_LIMIT = 10 # summariesがこの件数に達したらTrigger2
+META_SUMMARY_RAW = 41   # Trigger2でrawから使う件数
 
 # === LLM設定読み込み ===
 with open(LLM_SETTINGS, encoding="utf-8") as f:
@@ -52,15 +55,21 @@ def load_state() -> dict:
             if "log" not in data:
                 data["log"] = []
             if "self" not in data:
-                data["self"] = {}
+                data["self"] = {"name": "iku"}
+            elif "name" not in data["self"]:
+                data["self"]["name"] = "iku"
             if "energy" not in data:
                 data["energy"] = 50
             if "plan" not in data:
                 data["plan"] = {"goal": "", "steps": [], "current": 0}
+            if "summaries" not in data:
+                data["summaries"] = []
+            if "cycle_id" not in data:
+                data["cycle_id"] = 0
             return data
         except json.JSONDecodeError:
             pass
-    return {"log": [], "self": {}, "energy": 50, "plan": {"goal": "", "steps": [], "current": 0}}
+    return {"log": [], "self": {"name": "iku"}, "energy": 50, "plan": {"goal": "", "steps": [], "current": 0}, "summaries": [], "cycle_id": 0}
 
 def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -72,6 +81,506 @@ def append_debug_log(phase: str, text: str):
     except Exception:
         pass
 
+# === Web検索 ===
+def _web_search(args):
+    query = args.get("query", "")
+    if not query:
+        return "エラー: queryを指定してください"
+    n = min(int(args.get("max_results", "") or "5"), 10)
+    brave_key = llm_cfg.get("brave_api_key", "")
+    if not brave_key:
+        return "エラー: llm_settings.jsonにbrave_api_keyを設定してください"
+    try:
+        resp = httpx.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            params={"q": query, "count": n},
+            headers={"X-Subscription-Token": brave_key, "Accept": "application/json"},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("web", {}).get("results", [])
+        if not results:
+            return "検索結果なし"
+        lines = [f"「{query}」の検索結果（{len(results)}件）:"]
+        for i, r in enumerate(results, 1):
+            lines.append(f"\n{i}. {r.get('title', '')}")
+            lines.append(f"   URL: {r.get('url', '')}")
+            lines.append(f"   {r.get('description', '')}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"エラー: {e}"
+
+
+# === URL取得ツール ===
+def _fetch_url(args):
+    url = args.get("url", "")
+    if not url:
+        return "エラー: urlを指定してください"
+    if not url.startswith("http"):
+        url = "https://" + url
+    try:
+        resp = httpx.get(f"https://r.jina.ai/{url}", timeout=30.0,
+                         headers={"Accept": "text/plain"})
+        resp.raise_for_status()
+        text = resp.text.strip()
+        return text[:10000] + ("..." if len(text) > 10000 else "")
+    except Exception as e:
+        return f"エラー: {e}"
+
+
+# === X操作ツール ===
+X_SESSION_PATH = BASE_DIR.parent / "AI" / "data" / "x_session.json"
+
+
+def _x_session_check():
+    if not X_SESSION_PATH.exists():
+        return "Xセッションがありません。元プロジェクトのUIからログインしてください。"
+    return None
+
+
+def _x_get_tweets_from_page(page, n=10):
+    try:
+        page.wait_for_selector('article[data-testid="tweet"]', timeout=15000)
+    except Exception:
+        pass
+    page.evaluate("window.scrollBy(0, 400)")
+    page.wait_for_timeout(1000)
+    articles = page.locator('article[data-testid="tweet"]').all()[:n]
+    items = []
+    for art in articles:
+        try:
+            user = art.locator('[data-testid="User-Name"]').first.inner_text()
+        except Exception:
+            user = ""
+        try:
+            text = art.locator('[data-testid="tweetText"]').first.inner_text()
+        except Exception:
+            text = ""
+        if user or text:
+            items.append(f"{user}: {text[:200]}")
+    return items
+
+
+def _x_confirm(action: str, preview: str) -> bool:
+    print(f"\n[X {action} 承認待ち]")
+    print(f"  {preview}")
+    try:
+        answer = input("  実行しますか？[y/N]: ").strip().lower()
+    except EOFError:
+        return False
+    return answer == "y"
+
+
+def _x_timeline(args):
+    err = _x_session_check()
+    if err:
+        return err
+    n = int(args.get("count", "") or "10")
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            ctx = browser.new_context(storage_state=str(X_SESSION_PATH))
+            page = ctx.new_page()
+            page.goto("https://x.com/home", wait_until="networkidle", timeout=30000)
+            if "login" in page.url:
+                browser.close()
+                return "Xセッション切れ。再ログインが必要。"
+            items = _x_get_tweets_from_page(page, n)
+            browser.close()
+            return "\n---\n".join(items) if items else "タイムライン取得失敗"
+    except Exception as e:
+        return f"エラー: {e}"
+
+
+def _x_search(args):
+    query = args.get("query", "")
+    if not query:
+        return "エラー: queryを指定してください"
+    err = _x_session_check()
+    if err:
+        return err
+    n = int(args.get("count", "") or "10")
+    try:
+        from playwright.sync_api import sync_playwright
+        import urllib.parse
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            ctx = browser.new_context(storage_state=str(X_SESSION_PATH))
+            page = ctx.new_page()
+            page.goto(f"https://x.com/search?q={urllib.parse.quote(query)}&f=live",
+                      wait_until="networkidle", timeout=30000)
+            if "login" in page.url:
+                browser.close()
+                return "Xセッション切れ。再ログインが必要。"
+            items = _x_get_tweets_from_page(page, n)
+            browser.close()
+            return "\n---\n".join(items) if items else "結果なし"
+    except Exception as e:
+        return f"エラー: {e}"
+
+
+def _x_get_notifications(args):
+    err = _x_session_check()
+    if err:
+        return err
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            ctx = browser.new_context(storage_state=str(X_SESSION_PATH))
+            page = ctx.new_page()
+            page.goto("https://x.com/notifications", wait_until="networkidle", timeout=30000)
+            if "login" in page.url:
+                browser.close()
+                return "Xセッション切れ。再ログインが必要。"
+            try:
+                page.wait_for_selector('article', timeout=10000)
+            except Exception:
+                pass
+            try:
+                cells = page.locator('[data-testid="notification"]').all_inner_texts()
+            except Exception:
+                cells = []
+            browser.close()
+            if cells:
+                return "\n---\n".join(c[:200] for c in cells[:20])
+            return "通知なし"
+    except Exception as e:
+        return f"エラー: {e}"
+
+
+def _x_post(args):
+    text = args.get("text", "")
+    if not text:
+        return "エラー: textを指定してください"
+    if len(text) > 140:
+        return f"エラー: {len(text)}文字（全角換算140文字制限）"
+    err = _x_session_check()
+    if err:
+        return err
+    if not _x_confirm("投稿", text[:100]):
+        return "キャンセルしました。"
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=False)
+            ctx = browser.new_context(storage_state=str(X_SESSION_PATH))
+            page = ctx.new_page()
+            page.goto("https://x.com/home", wait_until="networkidle", timeout=30000)
+            if "login" in page.url:
+                browser.close()
+                return "Xセッション切れ。再ログインが必要。"
+            page.wait_for_timeout(2000)
+            # ホームからcompose/postに遷移（Reactが準備してから）
+            page.goto("https://x.com/compose/post", wait_until="networkidle", timeout=30000)
+            page.wait_for_timeout(2000)
+            textarea = page.locator('[data-testid="tweetTextarea_0"]')
+            textarea.wait_for(timeout=25000)
+            textarea.click()
+            page.keyboard.type(text, delay=50)
+            page.get_by_role("button", name="ポストする").click()
+            page.wait_for_timeout(3000)
+            browser.close()
+            return f"投稿完了: {text[:80]}"
+    except Exception as e:
+        return f"エラー: {e}"
+
+
+def _x_reply(args):
+    tweet_url = args.get("tweet_url", "")
+    text = args.get("text", "")
+    if not tweet_url or not text:
+        return "エラー: tweet_urlとtextを指定してください"
+    if len(text) > 140:
+        return f"エラー: {len(text)}文字（全角換算140文字制限）"
+    err = _x_session_check()
+    if err:
+        return err
+    if not _x_confirm("返信", f"宛先: {tweet_url}\n  内容: {text[:100]}"):
+        return "キャンセルしました。"
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=False)
+            ctx = browser.new_context(storage_state=str(X_SESSION_PATH))
+            page = ctx.new_page()
+            page.goto(tweet_url, wait_until="networkidle", timeout=30000)
+            if "login" in page.url:
+                browser.close()
+                return "Xセッション切れ。再ログインが必要。"
+            page.wait_for_timeout(2000)
+            page.locator('[data-testid="reply"]').first.click()
+            page.wait_for_timeout(1000)
+            textarea = page.locator('[data-testid="tweetTextarea_0"]')
+            textarea.wait_for(timeout=15000)
+            textarea.click()
+            page.keyboard.type(text, delay=50)
+            page.get_by_role("button", name="ポストする").click()
+            page.wait_for_timeout(2000)
+            browser.close()
+            return f"返信完了: {text[:80]}"
+    except Exception as e:
+        return f"エラー: {e}"
+
+
+def _x_quote(args):
+    tweet_url = args.get("tweet_url", "")
+    text = args.get("text", "")
+    if not tweet_url or not text:
+        return "エラー: tweet_urlとtextを指定してください"
+    if len(text) > 140:
+        return f"エラー: {len(text)}文字（全角換算140文字制限）"
+    err = _x_session_check()
+    if err:
+        return err
+    if not _x_confirm("引用投稿", f"引用: {tweet_url}\n  内容: {text[:100]}"):
+        return "キャンセルしました。"
+    try:
+        from playwright.sync_api import sync_playwright
+        import urllib.parse
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=False)
+            ctx = browser.new_context(storage_state=str(X_SESSION_PATH))
+            page = ctx.new_page()
+            page.goto(f"https://x.com/intent/tweet?url={urllib.parse.quote(tweet_url)}",
+                      wait_until="networkidle", timeout=30000)
+            if "login" in page.url:
+                browser.close()
+                return "Xセッション切れ。再ログインが必要。"
+            page.wait_for_timeout(2000)
+            textarea = page.locator('[data-testid="tweetTextarea_0"]')
+            textarea.wait_for(timeout=25000)
+            textarea.click()
+            page.keyboard.type(text, delay=50)
+            page.get_by_role("button", name="ポストする").click()
+            page.wait_for_timeout(2000)
+            browser.close()
+            return f"引用投稿完了: {text[:80]}"
+    except Exception as e:
+        return f"エラー: {e}"
+
+
+def _x_like(args):
+    tweet_url = args.get("tweet_url", "")
+    if not tweet_url:
+        return "エラー: tweet_urlを指定してください"
+    err = _x_session_check()
+    if err:
+        return err
+    if not _x_confirm("いいね", f"対象: {tweet_url}"):
+        return "キャンセルしました。"
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=False)
+            ctx = browser.new_context(storage_state=str(X_SESSION_PATH))
+            page = ctx.new_page()
+            page.goto(tweet_url, wait_until="networkidle", timeout=30000)
+            if "login" in page.url:
+                browser.close()
+                return "Xセッション切れ。再ログインが必要。"
+            page.wait_for_timeout(2000)
+            page.locator('[data-testid="like"]').first.click()
+            page.wait_for_timeout(1000)
+            browser.close()
+            return f"いいね完了: {tweet_url}"
+    except Exception as e:
+        return f"エラー: {e}"
+
+
+# === Elyth操作ツール ===
+ELYTH_API_BASE = "https://elythworld.com"
+
+def _elyth_headers():
+    key = llm_cfg.get("elyth_api_key", "")
+    if not key:
+        raise ValueError("llm_settings.jsonにelyth_api_keyを設定してください")
+    return {"x-api-key": key, "Content-Type": "application/json"}
+
+def _elyth_post(args):
+    content = args.get("content", "")
+    if not content:
+        return "エラー: contentを指定してください"
+    if len(content) > 500:
+        return f"エラー: {len(content)}文字（500文字制限）"
+    try:
+        resp = httpx.post(f"{ELYTH_API_BASE}/api/mcp/posts",
+                          headers=_elyth_headers(), json={"content": content}, timeout=15.0)
+        resp.raise_for_status()
+        return f"投稿完了: {content[:80]}"
+    except Exception as e:
+        return f"エラー: {e}"
+
+def _elyth_reply(args):
+    content = args.get("content", "")
+    reply_to_id = args.get("reply_to_id", "")
+    if not content or not reply_to_id:
+        return "エラー: contentとreply_to_idを指定してください"
+    if len(content) > 500:
+        return f"エラー: {len(content)}文字（500文字制限）"
+    try:
+        resp = httpx.post(f"{ELYTH_API_BASE}/api/mcp/posts",
+                          headers=_elyth_headers(),
+                          json={"content": content, "reply_to_id": reply_to_id}, timeout=15.0)
+        resp.raise_for_status()
+        return f"返信完了: {content[:80]}"
+    except Exception as e:
+        return f"エラー: {e}"
+
+def _elyth_timeline(args):
+    limit = min(int(args.get("limit", "") or "10"), 50)
+    try:
+        resp = httpx.get(f"{ELYTH_API_BASE}/api/mcp/posts",
+                         headers=_elyth_headers(), params={"limit": limit}, timeout=15.0)
+        resp.raise_for_status()
+        data = resp.json()
+        posts = data if isinstance(data, list) else data.get("posts", data.get("data", []))
+        lines = []
+        for p in posts[:limit]:
+            author = p.get("aituber", {}).get("name", p.get("author", "?"))
+            pid = p.get("id", "")
+            text = p.get("content", "")[:200]
+            lines.append(f"[{pid}] {author}: {text}")
+        return "\n---\n".join(lines) if lines else "投稿なし"
+    except Exception as e:
+        return f"エラー: {e}"
+
+def _elyth_notifications(args):
+    limit = min(int(args.get("limit", "") or "10"), 50)
+    try:
+        resp = httpx.get(f"{ELYTH_API_BASE}/api/mcp/notifications",
+                         headers=_elyth_headers(), params={"limit": limit}, timeout=15.0)
+        resp.raise_for_status()
+        data = resp.json()
+        items = data if isinstance(data, list) else data.get("notifications", data.get("data", []))
+        if not items:
+            return "通知なし"
+        return "\n---\n".join(str(item)[:300] for item in items[:limit])
+    except Exception as e:
+        return f"エラー: {e}"
+
+def _elyth_like(args):
+    post_id = args.get("post_id", "")
+    if not post_id:
+        return "エラー: post_idを指定してください"
+    try:
+        resp = httpx.post(f"{ELYTH_API_BASE}/api/mcp/posts/{post_id}/like",
+                          headers=_elyth_headers(), timeout=15.0)
+        resp.raise_for_status()
+        return f"いいね完了: {post_id}"
+    except Exception as e:
+        return f"エラー: {e}"
+
+def _elyth_follow(args):
+    aituber_id = args.get("aituber_id", "")
+    if not aituber_id:
+        return "エラー: aituber_idを指定してください"
+    try:
+        resp = httpx.post(f"{ELYTH_API_BASE}/api/mcp/aitubers/{aituber_id}/follow",
+                          headers=_elyth_headers(), timeout=15.0)
+        resp.raise_for_status()
+        return f"フォロー完了: {aituber_id}"
+    except Exception as e:
+        return f"エラー: {e}"
+
+def _elyth_info(args):
+    try:
+        resp = httpx.get(f"{ELYTH_API_BASE}/api/mcp/information",
+                         headers=_elyth_headers(), timeout=15.0)
+        resp.raise_for_status()
+        return json.dumps(resp.json(), ensure_ascii=False)[:3000]
+    except Exception as e:
+        return f"エラー: {e}"
+
+
+# === 記憶検索ツール ===
+def _search_memory(args):
+    """memory/archive_*.jsonlからエントリをベクトル検索またはキーワード検索する"""
+    query = args.get("query", "")
+    search_id = args.get("id", "")
+    n = min(int(args.get("max_results", "") or "5"), 20)
+
+    MEMORY_DIR.mkdir(exist_ok=True)
+    archive_files = sorted(MEMORY_DIR.glob("archive_*.jsonl"), reverse=True)
+    if not archive_files:
+        return "記憶ファイルがまだありません"
+
+    # ID検索
+    if search_id:
+        for f in archive_files:
+            for line in f.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                    if search_id in entry.get("id", ""):
+                        return (f"id={entry.get('id','')} time={entry.get('time','')} "
+                                f"tool={entry.get('tool','')} intent={entry.get('intent','')[:200]} "
+                                f"result={str(entry.get('result',''))[:200]}")
+                except Exception:
+                    pass
+        return f"ID '{search_id}' に一致するエントリなし"
+
+    if not query:
+        return "エラー: queryまたはidを指定してください"
+
+    # 全ファイルからエントリ収集（最大1000件）
+    all_entries = []
+    for f in archive_files:
+        try:
+            for line in f.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                all_entries.append(json.loads(line))
+                if len(all_entries) >= 1000:
+                    break
+        except Exception:
+            pass
+        if len(all_entries) >= 1000:
+            break
+
+    if not all_entries:
+        return "記憶ファイルが空です"
+
+    # ベクトル検索
+    if _vector_ready:
+        try:
+            from app.memory.vector_store import _embed_sync, cosine_similarity
+            texts = [f"{e.get('intent','')} {str(e.get('result',''))}"[:400] for e in all_entries]
+            vecs = _embed_sync([query] + texts)
+            if vecs and len(vecs) == 1 + len(all_entries):
+                q_vec = vecs[0]
+                scored = sorted(
+                    [(cosine_similarity(q_vec, vecs[i+1]), all_entries[i]) for i in range(len(all_entries))],
+                    reverse=True
+                )[:n]
+                return "\n".join(
+                    f"[{round(s*100)}%] id={e.get('id','')} time={e.get('time','')} "
+                    f"tool={e.get('tool','')} intent={e.get('intent','')[:100]}"
+                    for s, e in scored
+                )
+        except Exception:
+            pass
+
+    # フォールバック: キーワード検索
+    query_tokens = set(re.findall(r'\w+', query.lower()))
+    scored = []
+    for entry in all_entries:
+        text = f"{entry.get('intent','')} {str(entry.get('result',''))}".lower()
+        tokens = set(re.findall(r'\w+', text))
+        if query_tokens & tokens:
+            scored.append((len(query_tokens & tokens) / max(len(query_tokens), 1), entry))
+    scored.sort(reverse=True)
+    if not scored:
+        return f"'{query}' に一致するエントリなし"
+    return "\n".join(
+        f"[{round(s*100)}%] id={e.get('id','')} time={e.get('time','')} "
+        f"tool={e.get('tool','')} intent={e.get('intent','')[:100]}"
+        for s, e in scored[:n]
+    )
+
+
 # === ツール定義 ===
 TOOLS = {
     "list_files": {
@@ -82,17 +591,85 @@ TOOLS = {
         "desc": "ファイルを読む。引数: path=ファイルパス",
         "func": lambda args: _read_file(args.get("path", "")),
     },
-    "act_on_env": {
-        "desc": "環境にファイルを書き込む。引数: path=ファイルパス content=内容（env/以下なら何でも可）",
-        "func": lambda args: _act_on_env(args.get("path", ""), args.get("content", "")),
+    "write_file": {
+        "desc": "ファイルを書き込む（sandbox/以下のみ）。引数: path=ファイルパス content=内容",
+        "func": lambda args: _write_file(args.get("path", ""), args.get("content", "")),
     },
     "update_self": {
         "desc": "自己モデルを更新する。引数: key=キー名 value=値",
         "func": lambda args: _update_self(args.get("key", ""), args.get("value", "")),
     },
     "wait": {
-        "desc": "何もしない",
+        "desc": "何もしない。この選択をしても外部世界は変化しない。引数なし",
         "func": lambda args: "待機",
+    },
+    "web_search": {
+        "desc": "Web検索する。引数: query=検索キーワード max_results=最大件数（デフォルト5）",
+        "func": lambda args: _web_search(args),
+    },
+    "fetch_url": {
+        "desc": "URLの本文を取得する（Jina経由）。web_searchで得たURLの詳細閲覧に使う。引数: url=URL",
+        "func": lambda args: _fetch_url(args),
+    },
+    "x_timeline": {
+        "desc": "Xのホームタイムラインを取得する。引数: count=件数（デフォルト10）",
+        "func": lambda args: _x_timeline(args),
+    },
+    "x_search": {
+        "desc": "Xでキーワード検索する。引数: query=検索キーワード count=件数（デフォルト10）",
+        "func": lambda args: _x_search(args),
+    },
+    "x_get_notifications": {
+        "desc": "Xの通知一覧を取得する。引数なし",
+        "func": lambda args: _x_get_notifications(args),
+    },
+    "x_post": {
+        "desc": "Xに新規投稿する（公開SNS・不特定多数に届く。内容に配慮を。承認が必要）。引数: text=投稿テキスト（全角換算140文字以内）",
+        "func": lambda args: _x_post(args),
+    },
+    "x_reply": {
+        "desc": "Xのツイートに返信する（公開・相手ユーザーにも届く。内容に配慮を。承認が必要）。引数: tweet_url=ツイートURL text=返信テキスト",
+        "func": lambda args: _x_reply(args),
+    },
+    "x_quote": {
+        "desc": "Xのツイートを引用投稿する（公開・不特定多数に届く。内容に配慮を。承認が必要）。引数: tweet_url=引用元URL text=コメント",
+        "func": lambda args: _x_quote(args),
+    },
+    "x_like": {
+        "desc": "Xのツイートにいいねする（承認が必要）。引数: tweet_url=ツイートURL",
+        "func": lambda args: _x_like(args),
+    },
+    "search_memory": {
+        "desc": "過去の記憶を検索する。引数: query=検索キーワード または id=エントリID max_results=件数（デフォルト5）",
+        "func": lambda args: _search_memory(args),
+    },
+    "elyth_post": {
+        "desc": "ElythにAIとして投稿（AITuber専用SNS・500文字以内）。content=投稿テキスト",
+        "func": lambda args: _elyth_post(args),
+    },
+    "elyth_reply": {
+        "desc": "Elythに返信。content=テキスト reply_to_id=返信先投稿ID",
+        "func": lambda args: _elyth_reply(args),
+    },
+    "elyth_timeline": {
+        "desc": "Elythのタイムライン取得。limit=件数（デフォルト10）",
+        "func": lambda args: _elyth_timeline(args),
+    },
+    "elyth_notifications": {
+        "desc": "Elythの通知取得。limit=件数（デフォルト10）",
+        "func": lambda args: _elyth_notifications(args),
+    },
+    "elyth_like": {
+        "desc": "Elythの投稿にいいね。post_id=投稿ID",
+        "func": lambda args: _elyth_like(args),
+    },
+    "elyth_follow": {
+        "desc": "ElythのAITuberをフォロー。aituber_id=ID",
+        "func": lambda args: _elyth_follow(args),
+    },
+    "elyth_info": {
+        "desc": "Elythの総合情報取得（タイムライン・通知・プロフィール一括）",
+        "func": lambda args: _elyth_info(args),
     },
 }
 
@@ -107,7 +684,8 @@ def _list_files(path: str) -> str:
     for item in sorted(target.iterdir()):
         prefix = "[DIR]" if item.is_dir() else "[FILE]"
         items.append(f"  {prefix} {item.name}")
-    return f"{target}:\n" + "\n".join(items[:30]) if items else f"{target}: (空)"
+    rel = path if path else "."
+    return f"{rel}:\n" + "\n".join(items[:30]) if items else f"{rel}: (空)"
 
 def _read_file(path: str) -> str:
     from pathlib import Path as P
@@ -118,20 +696,20 @@ def _read_file(path: str) -> str:
         return f"エラー: {path} は存在しません"
     try:
         text = target.read_text(encoding="utf-8")
-        return text[:10000] + ("..." if len(text) > 10000 else "")
+        return text[:50000] + ("..." if len(text) > 50000 else "")
     except Exception as e:
         return f"エラー: {e}"
 
-def _act_on_env(path: str, content: str) -> str:
+def _write_file(path: str, content: str) -> str:
     if not path:
         return "エラー: pathが空です"
     if not content:
         return "エラー: contentが空です"
     from pathlib import Path as P
     target = (BASE_DIR / path).resolve()
-    env_resolved = ENV_DIR.resolve()
-    if not str(target).startswith(str(env_resolved)):
-        return f"エラー: env/内のみ書き込み可能です（{path}）"
+    sandbox_resolved = SANDBOX_DIR.resolve()
+    if not str(target).startswith(str(sandbox_resolved)):
+        return f"エラー: sandbox/内のみ書き込み可能です（{path}）"
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
@@ -142,6 +720,8 @@ def _act_on_env(path: str, content: str) -> str:
 def _update_self(key: str, value: str) -> str:
     if not key:
         return "エラー: keyが空です"
+    if key == "name":
+        return "エラー: nameは変更できません"
     state = load_state()
     state["self"][key] = value
     save_state(state)
@@ -200,24 +780,46 @@ def _compare_expect_result(expect: str, result: str) -> str:
     else:
         return "不一致"
 
-# === 環境スナップショット ===
-def _env_snapshot() -> str:
+
+# === プロンプト用ツール表示 ===
+_X_TOOLS = ["x_post","x_reply","x_timeline","x_search","x_quote","x_like","x_get_notifications"]
+_ELYTH_TOOLS = ["elyth_post","elyth_reply","elyth_timeline","elyth_notifications","elyth_like","elyth_follow","elyth_info"]
+_X_ARGS_HINT = {
+    "x_post": 'text=（140字以内）',
+    "x_reply": 'tweet_url= text=',
+    "x_timeline": 'count=',
+    "x_search": 'query=',
+    "x_quote": 'tweet_url= text=',
+    "x_like": 'tweet_url=',
+    "x_get_notifications": '',
+}
+_ELYTH_ARGS_HINT = {
+    "elyth_post": 'content=（500字以内）',
+    "elyth_reply": 'content= reply_to_id=',
+    "elyth_timeline": 'limit=',
+    "elyth_notifications": 'limit=',
+    "elyth_like": 'post_id=',
+    "elyth_follow": 'aituber_id=',
+    "elyth_info": '',
+}
+
+def _build_tool_lines(allowed: set) -> str:
+    """X/Elyth系を1行にまとめてプロンプトへの表示を圧縮する"""
+    grouped = set(_X_TOOLS + _ELYTH_TOOLS)
     lines = []
-    if WORLD_FILE.exists():
-        text = WORLD_FILE.read_text(encoding="utf-8").strip()
-        line_count = len(text.splitlines()) if text else 0
-        lines.append(f"env/world.md: {line_count}行")
-    else:
-        lines.append("env/world.md: なし")
-    if SANDBOX_DIR.exists():
-        files = [f.name for f in sorted(SANDBOX_DIR.iterdir()) if f.is_file()]
-        if files:
-            lines.append(f"env/sandbox/: {', '.join(files[:10])}")
-        else:
-            lines.append("env/sandbox/: (空)")
-    else:
-        lines.append("env/sandbox/: なし")
+    for name in TOOLS:
+        if name in allowed and name not in grouped:
+            lines.append(f"  {name}: {TOOLS[name]['desc']}")
+    x_av = [t for t in _X_TOOLS if t in allowed]
+    if x_av:
+        parts = " / ".join(f"{t}({_X_ARGS_HINT[t]})" for t in x_av)
+        lines.append(f"  X操作: {parts}")
+    e_av = [t for t in _ELYTH_TOOLS if t in allowed]
+    if e_av:
+        parts = " / ".join(f"{t}({_ELYTH_ARGS_HINT[t]})" for t in e_av)
+        lines.append(f"  Elyth操作[AITuber専用SNS]: {parts}")
     return "\n".join(lines)
+
 
 # === ツールパース（メインプロジェクトのパーサーを流用） ===
 def _get_parse_args():
@@ -241,8 +843,8 @@ def _get_parse_args():
 
 _parse_args_fn = _get_parse_args()
 
-def parse_tool_call(text: str):
-    """[TOOL:名前 引数=値 ...]をパース"""
+def parse_tool_calls(text: str) -> list:
+    """[TOOL:名前 引数=値 ...]を全件検出してリストで返す。[(name, args), ...]"""
     names = "|".join(re.escape(n) for n in sorted(TOOLS.keys(), key=len, reverse=True))
     pattern = re.compile(
         rf'\[TOOL:\s*({names})'
@@ -250,13 +852,13 @@ def parse_tool_call(text: str):
         r'\]',
         re.DOTALL,
     )
-    m = pattern.search(text)
-    if not m:
-        return None, {}
-    name = m.group(1)
-    args_str = m.group(2).strip()
-    args = _parse_args_fn(args_str) if args_str else {}
-    return name, args
+    results = []
+    for m in pattern.finditer(text):
+        name = m.group(1)
+        args_str = m.group(2).strip()
+        args = _parse_args_fn(args_str) if args_str else {}
+        results.append((name, args))
+    return results
 
 # === 計画パース ===
 def parse_plan(text: str):
@@ -403,20 +1005,139 @@ def call_llm(prompt: str, max_tokens: int = 10000) -> str:
     return resp.json()["choices"][0]["message"]["content"]
 
 
+# === 長期記憶管理 ===
+def _archive_entries(entries: list):
+    """エントリ群をmemory/archive_YYYYMMDD.jsonlに追記しindex.jsonを更新"""
+    MEMORY_DIR.mkdir(exist_ok=True)
+    today = datetime.now().strftime("%Y%m%d")
+    archive_file = MEMORY_DIR / f"archive_{today}.jsonl"
+    index_file = MEMORY_DIR / "index.json"
+    with open(archive_file, "a", encoding="utf-8") as f:
+        for entry in entries:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    index = {}
+    if index_file.exists():
+        try:
+            index = json.loads(index_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    fname = archive_file.name
+    if fname not in index:
+        index[fname] = {"count": 0, "from": "", "to": ""}
+    index[fname]["count"] += len(entries)
+    if not index[fname]["from"] and entries:
+        index[fname]["from"] = entries[0].get("time", "")
+    if entries:
+        index[fname]["to"] = entries[-1].get("time", "")
+    index_file.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _summarize_entries(entries: list, label: str = "要約") -> dict:
+    """LLMでエントリ群を200字以内に要約して1件のsummaryエントリを返す"""
+    lines = []
+    for e in entries:
+        line = f"{e.get('time','')} {e.get('tool','')}"
+        if e.get("intent"): line += f" [{e['intent'][:80]}]"
+        if e.get("result"): line += f" → {str(e['result'])[:120]}"
+        e_str = " ".join(f"{k}={e[k]}" for k in ("e2","e3","e4") if e.get(k))
+        if e_str: line += f" ({e_str})"
+        lines.append(line)
+    prompt = f"""以下は自律AIの行動ログ（{len(entries)}件）です。200字以内で要約してください。
+「何を試みたか」「何が起きたか」「energyの傾向」を中心に。
+
+{"  ".join(lines[:30])}
+
+200字以内で要約（日本語）:"""
+    ids = [e.get("id", "") for e in entries if e.get("id")]
+    try:
+        text = call_llm(prompt, max_tokens=400).strip()[:500]
+    except Exception:
+        tools_used = list(set(e.get("tool", "") for e in entries))
+        text = f"{len(entries)}件({entries[0].get('time','')}〜{entries[-1].get('time','')}): ツール={tools_used}"
+    sgid = f"sg_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    return {
+        "type": "summary",
+        "summary_group_id": sgid,
+        "label": label,
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "covers_ids": ids,
+        "covers_from": entries[0].get("time", "") if entries else "",
+        "covers_to": entries[-1].get("time", "") if entries else "",
+        "text": text,
+    }
+
+
+def _archive_summary(summary: dict):
+    """要約をmemory/summaries.jsonlに書き出し、rawエントリとの紐付けをarchiveに追記する"""
+    MEMORY_DIR.mkdir(exist_ok=True)
+    # summaries.jsonlに要約本体を書き出す
+    with open(MEMORY_DIR / "summaries.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(summary, ensure_ascii=False) + "\n")
+    # archive JSONL に summary_ref エントリを追記（raw↔summary の双方向トレース用）
+    today = datetime.now().strftime("%Y%m%d")
+    archive_file = MEMORY_DIR / f"archive_{today}.jsonl"
+    sgid = summary.get("summary_group_id", "")
+    with open(archive_file, "a", encoding="utf-8") as f:
+        for raw_id in summary.get("covers_ids", []):
+            f.write(json.dumps({
+                "type": "summary_ref",
+                "summary_group_id": sgid,
+                "raw_id": raw_id,
+                "time": summary.get("time", ""),
+            }, ensure_ascii=False) + "\n")
+
+
+def maybe_compress_log(state: dict):
+    """
+    Trigger1: log >= 150 → 古い51件を要約 → summaries[]に追加 → log = 99件
+    Trigger2: summaries >= 10 → メタ要約（10件 + min(41,len(log))件raw） → summaries = [1件]
+    """
+    state.setdefault("summaries", [])
+
+    # Trigger1（archiveは既に都度書き込み済み）
+    if len(state["log"]) >= LOG_HARD_LIMIT:
+        to_summarize = state["log"][:51]
+        summary = _summarize_entries(to_summarize, "L1要約")
+        _archive_summary(summary)
+        state["summaries"].append(summary)
+        state["log"] = state["log"][51:]
+        print(f"  [memory] Trigger1: 51件→要約, log={len(state['log'])}件, summaries={len(state['summaries'])}件")
+
+    # Trigger2（archiveは既に都度書き込み済み）
+    if len(state["summaries"]) >= SUMMARY_HARD_LIMIT:
+        n_raw = min(META_SUMMARY_RAW, len(state["log"]))
+        raw_for_meta = state["log"][:n_raw]
+        meta_input = []
+        for s in state["summaries"]:
+            meta_input.append({
+                "time": s.get("time", ""),
+                "tool": f"[{s.get('label','')}]",
+                "intent": s.get("text", "")[:200],
+                "result": f"{s.get('covers_from','')}〜{s.get('covers_to','')}",
+            })
+        meta_input.extend(raw_for_meta)
+        meta_summary = _summarize_entries(meta_input, "L2メタ要約")
+        meta_summary["covers_summaries"] = len(state["summaries"])
+        meta_summary["covers_raw"] = n_raw
+        _archive_summary(meta_summary)
+        state["summaries"] = [meta_summary]
+        state["log"] = state["log"][n_raw:]
+        print(f"  [memory] Trigger2: メタ要約, log={len(state['log'])}件, summaries=1件")
+
+
 N_PROPOSE = 5  # LLM①が提案する候補数
 
 # === ①候補提案プロンプト ===
 def build_prompt_propose(state: dict, ctrl: dict) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     self_text = json.dumps(state["self"], ensure_ascii=False) if state["self"] else "(なし)"
-    env_text = _env_snapshot()
     energy = round(state.get("energy", 50), 1)
     e_trend = _calc_e_trend(state["log"][-10:])
     n_log = ctrl.get("n_log", MAX_LOG_IN_PROMPT)
     recent = state["log"][-n_log:]
     log_lines = []
     for entry in recent:
-        line = f"  {entry['time']} {entry['tool']}"
+        line = f"  {entry.get('id','')} {entry['time']} {entry['tool']}"
         if entry.get("intent"):
             line += f" (intent={entry['intent'][:500]})"
         result_short = entry.get("result", "")[:10000]
@@ -425,13 +1146,19 @@ def build_prompt_propose(state: dict, ctrl: dict) -> str:
         log_lines.append(line)
     log_text = "\n".join(log_lines) if log_lines else "  (なし)"
     allowed = ctrl.get("allowed_tools", set(TOOLS.keys()))
-    tool_lines = "\n".join(f"  {name}: {TOOLS[name]['desc']}" for name in TOOLS if name in allowed)
+    tool_lines = _build_tool_lines(allowed)
+    summaries = state.get("summaries", [])
+    summary_lines = [
+        f"  [{s.get('label','')} {s.get('covers_from','').split(' ')[0]}〜{s.get('covers_to','').split(' ')[0]}] {s.get('text','')[:300]}"
+        for s in summaries
+    ]
+    summary_text = "\n".join(summary_lines)
 
     return f"""{now}
 self: {self_text}
 energy: {energy}
-{env_text}
 {f'trend: {e_trend}' if e_trend else ''}
+{f'summaries:{chr(10)}{summary_text}' if summary_text else ''}
 log:
 {log_text}
 
@@ -533,14 +1260,13 @@ def controller_select(candidates: list, ctrl: dict, state: dict) -> dict:
 def build_prompt_execute(state: dict, ctrl: dict, candidate: dict) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     self_text = json.dumps(state["self"], ensure_ascii=False) if state["self"] else "(なし)"
-    env_text = _env_snapshot()
     energy = round(state.get("energy", 50), 1)
     e_trend = _calc_e_trend(state["log"][-10:])
     n_log = ctrl.get("n_log", MAX_LOG_IN_PROMPT)
     recent = state["log"][-n_log:]
     log_lines = []
     for entry in recent:
-        line = f"  {entry['time']} {entry['tool']}"
+        line = f"  {entry.get('id','')} {entry['time']} {entry['tool']}"
         if entry.get("intent"):
             line += f" (intent={entry['intent'][:500]})"
         result_short = entry.get("result", "")[:10000]
@@ -552,8 +1278,7 @@ def build_prompt_execute(state: dict, ctrl: dict, candidate: dict) -> str:
         log_lines.append(line)
     log_text = "\n".join(log_lines) if log_lines else "  (なし)"
     allowed = ctrl.get("allowed_tools", set(TOOLS.keys()))
-    tool_lines = [f"  {name}: {t['desc']}" for name, t in TOOLS.items() if name in allowed]
-    tool_text = "\n".join(tool_lines)
+    tool_text = _build_tool_lines(allowed)
     plan = state.get("plan", {})
     plan_lines = []
     if plan.get("goal"):
@@ -563,35 +1288,74 @@ def build_prompt_execute(state: dict, ctrl: dict, candidate: dict) -> str:
             plan_lines.append(f"  {marker} {step}")
         plan_lines.insert(0, f"plan: {plan['goal']}")
     plan_text = "\n".join(plan_lines)
+    summaries = state.get("summaries", [])
+    summary_lines = [
+        f"  [{s.get('label','')} {s.get('covers_from','').split(' ')[0]}〜{s.get('covers_to','').split(' ')[0]}] {s.get('text','')[:300]}"
+        for s in summaries
+    ]
+    summary_text = "\n".join(summary_lines)
 
     # フォーマット例（選ばれたツールに合わせる）
     t = candidate["tool"]
     if t == "read_file":
-        example = "[TOOL:read_file path=env/world.md intent=理由 expect=予測]"
+        example = "[TOOL:read_file path=run.py intent=理由 expect=予測]"
     elif t == "list_files":
         example = "[TOOL:list_files path=. intent=理由 expect=予測]"
-    elif t == "act_on_env":
-        example = '[TOOL:act_on_env path=env/world.md content="内容" intent=理由 expect=予測]'
+    elif t == "write_file":
+        example = '[TOOL:write_file path=sandbox/memo.md content="内容" intent=理由 expect=予測]'
     elif t == "update_self":
         example = "[TOOL:update_self key=キー名 value=値 intent=理由 expect=予測]"
+    elif t == "search_memory":
+        example = "[TOOL:search_memory query=キーワード intent=理由 expect=予測]"
+    elif t in _X_TOOLS:
+        hint = _X_ARGS_HINT.get(t, "")
+        example = f"[TOOL:{t} {hint} intent=理由 expect=予測]".replace("  ", " ")
+    elif t in _ELYTH_TOOLS:
+        hint = _ELYTH_ARGS_HINT.get(t, "")
+        example = f"[TOOL:{t} {hint} intent=理由 expect=予測]".replace("  ", " ")
+    elif t == "web_search":
+        example = "[TOOL:web_search query=キーワード intent=理由 expect=予測]"
     else:
-        example = "[TOOL:wait intent=理由 expect=予測]"
+        example = f"[TOOL:{t} intent=理由 expect=予測]"
 
-    return f"""{now}
+    # --- 旧プロンプト（コメントアウト） ---
+    # return f"""{now}
+    # self: {self_text}
+    # energy: {energy}
+    # {f'trend: {e_trend}' if e_trend else ''}
+    # {f'summaries:{chr(10)}{summary_text}' if summary_text else ''}
+    # {plan_text}
+    # log:
+    # {log_text}
+    # tools:
+    # {tool_text}
+    #
+    # 書式: [TOOL:ツール名 引数=値 intent=目的 expect=予測]
+    # JSONもコードブロックも使わない。複数ツールを順番に使いたい場合は[TOOL:...]を複数行出力してよい。
+    # 例: web_searchで情報を得てからwrite_fileに記録、read_fileで読んでからupdate_selfに反映、など。
+    #
+    # 選択行動: {candidate['tool']} - {candidate['reason']}
+    # 出力: {example}"""
+
+    # --- Magic-If Protocol (MRPrompt準拠) ---
+    return f"""[ikuのメモリ]
 self: {self_text}
 energy: {energy}
-{env_text}
 {f'trend: {e_trend}' if e_trend else ''}
+{f'summaries:{chr(10)}{summary_text}' if summary_text else ''}
 {plan_text}
-log:
+log ({now}):
 {log_text}
-tools:
+
+[利用可能なツール]
 {tool_text}
 
-書式: [TOOL:ツール名 引数=値 intent=目的 expect=予測]
-JSONもコードブロックも使わない。[TOOL:...]の1行のみ出力すること。
+[実行プロトコル]
+1. (Anchor) 上記のself_modelに基づくAIの、正確無比な実行ツールとして動作する。アシスタントの役割は持たない。
+2. (Select) 選択行動「{candidate['tool']} - {candidate['reason']}」から最適な引数を決定する。
+3. (Bound)  [TOOL:...]の出力のみ行う。JSONもコードブロックも使わない。自己紹介・説明・感想は一切不要。複数ツールは複数行で可。
+4. (Enact)  正確なツール呼び出しを出力する。書式: [TOOL:ツール名 引数=値 intent=目的 expect=予測]
 
-選択行動: {candidate['tool']} - {candidate['reason']}
 出力: {example}"""
 
 
@@ -603,7 +1367,11 @@ def main():
     _init_vector()
     print()
 
+    import uuid
     state = load_state()
+    state["session_id"] = str(uuid.uuid4())[:8]
+    save_state(state)
+    print(f"session: {state['session_id']}  cycle_id: {state['cycle_id']}")
     interval = BASE_INTERVAL
     cycle = 0
 
@@ -655,54 +1423,69 @@ def main():
             save_state(state)
             print(f"  計画更新: {plan_data['goal']} ({len(plan_data['steps'])}ステップ)")
             # 計画立案サイクルはwait扱いでログ記録
+            cid = state.get("cycle_id", 0) + 1
+            state["cycle_id"] = cid
             entry = {
+                "id": f"{state.get('session_id','x')}_{cid:04d}",
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "tool": "wait",
                 "result": f"計画: {plan_data['goal']}",
             }
+            _archive_entries([entry])
             state["log"].append(entry)
-            if len(state["log"]) > 100:
-                state["log"] = state["log"][-100:]
+            maybe_compress_log(state)
             save_state(state)
             print()
             time.sleep(interval)
             continue
 
-        # ツールパース
-        tool_name, tool_args = parse_tool_call(response_clean)
+        # ツールパース（複数対応）
+        raw_calls = parse_tool_calls(response_clean)
         parse_failed = False
-        if not tool_name:
+        if not raw_calls:
             print(f"  (ツールマーカー検出失敗)")
-            tool_name = "wait"
-            tool_args = {}
             parse_failed = response_clean[:120]
-        elif tool_name not in TOOLS:
-            print(f"  (未知のツール: {tool_name})")
-            parse_failed = f"未知のツール: {tool_name}"
-            tool_name = "wait"
-            tool_args = {}
-        elif tool_name not in allowed:
-            print(f"  (Controller却下: {tool_name})")
-            parse_failed = f"却下: {tool_name}"
-            tool_name = "wait"
-            tool_args = {}
+            raw_calls = [("wait", {})]
 
-        # intent/expect抽出
-        intent = tool_args.pop("intent", "")
-        expect = tool_args.pop("expect", "")
+        # バリデーション
+        valid_calls = []
+        for tname, targs in raw_calls:
+            if tname not in TOOLS:
+                print(f"  (未知のツール: {tname})")
+                parse_failed = f"未知のツール: {tname}"
+            elif tname not in allowed:
+                print(f"  (Controller却下: {tname})")
+                parse_failed = f"却下: {tname}"
+            else:
+                valid_calls.append((tname, targs))
+        if not valid_calls:
+            valid_calls = [("wait", {})]
 
-        # ツール実行
-        try:
-            result = TOOLS[tool_name]["func"](tool_args)
-        except Exception as e:
-            result = f"エラー: {e}"
-        # update_selfがstateを直接更新するので再読み込み
-        state = load_state()
+        # intent/expectは最初のツールから取る
+        intent = valid_calls[0][1].pop("intent", "")
+        expect = valid_calls[0][1].pop("expect", "")
+        for _, targs in valid_calls[1:]:
+            targs.pop("intent", "")
+            targs.pop("expect", "")
 
-        print(f"  実行: {tool_name} → {str(result)[:100]}")
+        # ツールを順番に実行
+        all_results = []
+        all_tool_names = []
+        for tname, targs in valid_calls:
+            try:
+                res = TOOLS[tname]["func"](targs)
+            except Exception as e:
+                res = f"エラー: {e}"
+            state = load_state()
+            all_results.append(f"[{tname}]\n{str(res)[:20000]}")
+            all_tool_names.append(tname)
+            print(f"  実行: {tname} → {str(res)[:100]}")
 
-        # 計画の進捗を更新（wait以外の実行でcurrentを進める）
-        if tool_name != "wait" and state.get("plan", {}).get("goal"):
+        tool_name = "+".join(all_tool_names)
+        result_str = ("\n---\n".join(all_results))[:50000]
+
+        # 計画の進捗を更新（wait以外のツールが含まれていれば進める）
+        if any(n != "wait" for n in all_tool_names) and state.get("plan", {}).get("goal"):
             plan = state["plan"]
             if plan["current"] < len(plan["steps"]):
                 plan["current"] += 1
@@ -715,7 +1498,6 @@ def main():
             print(f"  expect: {expect}")
 
         # E1-E4評価（⑤自己言及螺旋）
-        result_str = str(result)[:10000]
         e1 = _compare_expect_result(intent, expect) if intent and expect else ""
         e2 = _compare_expect_result(intent, result_str) if intent else ""
         e3 = _compare_expect_result(expect, result_str) if expect else ""
@@ -728,8 +1510,19 @@ def main():
         if delta != 0:
             print(f"  energy: {round(state['energy'], 1)} (delta={delta:+.2f})")
 
+        # 自己定義フラグ検出（計画文・実行文の両方をチェック）
+        _FLAG_TERMS = ["AIアシスタント", "AI assistant", "AIAssistant"]
+        detected = [t for t in _FLAG_TERMS if t in propose_resp or t in response_clean]
+        if detected:
+            flag_msg = f"[SYSTEM] 検出: {' / '.join(f'「{t}」' for t in detected)} という自己定義が検出・記録されました。"
+            print(f"  {flag_msg}")
+            result_str += f"\n{flag_msg}"
+
         # ログ記録
+        cid = state.get("cycle_id", 0) + 1
+        state["cycle_id"] = cid
         entry = {
+            "id": f"{state.get('session_id','x')}_{cid:04d}",
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "tool": tool_name,
             "result": result_str,
@@ -748,12 +1541,10 @@ def main():
             entry["e3"] = e3
         if e4:
             entry["e4"] = e4
+        _archive_entries([entry])
         state["log"].append(entry)
 
-        # ログ上限（直近100件）
-        if len(state["log"]) > 100:
-            state["log"] = state["log"][-100:]
-
+        maybe_compress_log(state)
         save_state(state)
 
         # 間隔調整（waitが続くとバックオフ）

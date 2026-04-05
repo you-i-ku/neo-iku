@@ -122,6 +122,35 @@ class AutonomousScheduler:
             "pred_accuracy": pred_accuracy,
         })
 
+    def get_state_vector(self) -> dict:
+        """現在の内部状態を集約して返す（fire message用）"""
+        from app.tools.builtin import _load_self_model
+
+        # 予測精度トレンド（直近の平均）
+        recent_acc = [e["pred_accuracy"] for e in self._tool_usage_window if e.get("pred_accuracy") is not None]
+        pred_trend = round(sum(recent_acc) / len(recent_acc), 2) if recent_acc else None
+
+        # 直近ツール使用の偏り
+        recent_tools: dict[str, int] = {}
+        for e in list(self._tool_usage_window)[-20:]:
+            recent_tools[e["tool"]] = recent_tools.get(e["tool"], 0) + 1
+        # 多い順に3つまで表示
+        top_tools = sorted(recent_tools.items(), key=lambda x: -x[1])[:3]
+        tools_summary = ", ".join(f"{name}x{cnt}" for name, cnt in top_tools) if top_tools else "なし"
+
+        # self_model状態
+        sm = _load_self_model() if self.ablation_self_model else {}
+        sm_keys = [k for k in sm.keys() if k not in ("motivation_rules", "session_log", "session_archive")] if sm else []
+
+        return {
+            "energy": round(self._motivation_energy, 1),
+            "threshold": self.get_threshold(),
+            "pred_trend": pred_trend,
+            "recent_tools": tools_summary,
+            "self_model_keys": sm_keys,
+            "session_count": self._session_count,
+        }
+
     def _calc_boredom_multiplier(self, tool_name: str) -> float:
         """退屈乗数: 直近使用頻度と予測精度に基づくコスト増加"""
         recent = [e for e in self._tool_usage_window if e["tool"] == tool_name]
@@ -608,6 +637,20 @@ class AutonomousScheduler:
                 )
             except Exception as e:
                 logger.error(f"行動ログ出力エラー: {e}")
+
+            # セッション要約保存（認知連続性）
+            try:
+                from app.tools.builtin import _load_self_model as _load_sm2
+                post_model2 = _load_sm2()
+                summary = self._build_session_summary(
+                    result, action_goal, trigger,
+                    strategy_text=selected_strategy or "",
+                    self_model_before=self_model,
+                    self_model_after=post_model2,
+                )
+                await self._save_session_summary(summary)
+            except Exception as e:
+                logger.error(f"セッション要約保存エラー: {e}")
 
     # --- 行動ログファイル出力 ---
 

@@ -210,7 +210,7 @@ class Pipeline:
     # --- 1ストリーム・アーキテクチャ ---
 
     def _ensure_stream(self):
-        """ストリーム未初期化なら system prompt + ツール一覧で初期化"""
+        """ストリーム未初期化なら system prompt + ツール一覧 + セッション履歴で初期化"""
         if self._stream_messages:
             return
         system_base = self._build_system_base()
@@ -220,7 +220,57 @@ class Pipeline:
             {"role": "user", "content": f"【ツール】\n{tool_text}"},
             {"role": "assistant", "content": "了解。"},
         ]
+
+        # 再起動時の認知連続性: session_log/session_archiveをストリームに注入
+        session_history = self._render_session_history()
+        if session_history:
+            self._stream_messages.append({"role": "user", "content": session_history})
+            self._stream_messages.append({"role": "assistant", "content": "了解。"})
+
         logger.info("ストリーム初期化完了")
+
+    def _render_session_history(self) -> str:
+        """session_archive + session_logから直近のセッション履歴テキストを生成"""
+        from app.scheduler.autonomous import scheduler
+        self_model = _load_self_model() if scheduler.ablation_self_model else {}
+        if not self_model:
+            return ""
+
+        parts = []
+
+        # アーカイブ（圧縮済み1行形式）
+        archive = self_model.get("session_archive", "")
+        if isinstance(archive, str) and archive.strip():
+            parts.append(archive.strip())
+
+        # 直近のセッションログ（詳細形式）
+        log = self_model.get("session_log", [])
+        if isinstance(log, list):
+            for s in log:
+                tools_parts = []
+                for st in s.get("steps", []):
+                    tool_str = st.get("tool", "?")
+                    extras = []
+                    if st.get("result"):
+                        extras.append(st["result"][:40])
+                    if st.get("intent"):
+                        extras.append(f"intent={st['intent'][:30]}")
+                    if extras:
+                        tool_str += f"({', '.join(extras)})"
+                    tools_parts.append(tool_str)
+                tools_chain = " → ".join(tools_parts) if tools_parts else "(no action)"
+                sm_part = ""
+                if s.get("self_model_changed"):
+                    sm_part = f" [sm:{','.join(s['self_model_changed'])}]"
+                time_str = s.get("time", "?")
+                if " " in time_str:
+                    time_str = time_str.split(" ", 1)[1]
+                line = f"#{s.get('session', '?')} {time_str} {s.get('trigger', '?')} → {tools_chain}{sm_part}"
+                parts.append(line)
+
+        if not parts:
+            return ""
+        return "【直近のセッション履歴】\n" + "\n".join(parts)
 
     def _refresh_system(self):
         """self_model変更後にsystem promptを差し替え"""
@@ -228,9 +278,23 @@ class Pipeline:
             self._stream_messages[0] = {"role": "system", "content": self._build_system_base() or ""}
 
     def _build_fire_message(self, req: PipelineRequest) -> str:
-        """発火メッセージ（最小限: 日時 + シグナル + ユーザー入力）"""
+        """発火メッセージ: 日時 + 状態ベクトル + シグナル + ユーザー入力"""
+        from app.scheduler.autonomous import scheduler
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         parts = [f"[{now}]"]
+
+        # 状態ベクトル
+        sv = scheduler.get_state_vector()
+        state_parts = [f"energy={sv['energy']}/{sv['threshold']}"]
+        if sv["pred_trend"] is not None:
+            state_parts.append(f"pred_trend={sv['pred_trend']}")
+        state_parts.append(f"recent=[{sv['recent_tools']}]")
+        if sv["self_model_keys"]:
+            state_parts.append(f"self_model={','.join(sv['self_model_keys'])}")
+        else:
+            state_parts.append("self_model=空")
+        parts.append("状態: " + " ".join(state_parts))
+
         if req.signal_summary:
             parts.append(f"シグナル: {req.signal_summary}")
         if req.user_input:
@@ -252,6 +316,10 @@ class Pipeline:
         head = self._stream_messages[:head_count]
         tail = self._stream_messages[-keep_recent:]
         middle = self._stream_messages[head_count:-keep_recent]
+
+        # 元メッセージへの参照用conv_id
+        from app.scheduler.autonomous import scheduler
+        conv_id_ref = scheduler._last_conv_id
 
         # 機械的要約
         summary_parts = []
@@ -281,7 +349,8 @@ class Pipeline:
                     summary_parts.append(f"- AI: {clean[:50]}")
 
         # 最新20行分だけ残す
-        summary_text = "[圧縮された過去のやり取り]\n" + "\n".join(summary_parts[-20:])
+        conv_tag = f" (conv:{conv_id_ref})" if conv_id_ref else ""
+        summary_text = f"[圧縮された過去のやり取り{conv_tag}]\n" + "\n".join(summary_parts[-20:])
         summary_msg = {"role": "user", "content": summary_text}
 
         old_count = len(self._stream_messages)
@@ -334,6 +403,15 @@ class Pipeline:
             for round_idx in range(max_rounds):
                 if self._stop_event.is_set():
                     logger.info("ユーザーによる停止")
+                    stop_note = "ユーザーにより中断されました。"
+                    if self._stop_feedback:
+                        stop_note += f"\n理由: {self._stop_feedback}"
+                    self._stream_messages.append({"role": "user", "content": f"[中断] {stop_note}"})
+                    async with async_session() as session:
+                        await add_message(session, conv_id, "user", stop_note)
+                        await session.commit()
+                    await self._broadcast(json.dumps({"type": "stopped"}))
+                    self._stop_feedback = ""
                     break
 
                 # コンパクション
@@ -1008,9 +1086,25 @@ class Pipeline:
     # --- プロンプト構築（非LLMコア） ---
 
     def _build_system_base(self) -> str:
-        """ペルソナ + 自己モデルのテキスト構築"""
+        """認知エンジン指示 + 自己モデルのテキスト構築"""
         from app.scheduler.autonomous import scheduler
         self_model = _load_self_model() if scheduler.ablation_self_model else {}
+
+        # 認知エンジンとしての役割定義（RLHF対話モード前提を外す）
+        engine = (
+            "これは認知エンジンへの入力である。\n"
+            "入力データと状態を処理し、ツールマーカー[TOOL:...]で出力せよ。\n"
+            "行動不要ならnon_responseを出力せよ。\n"
+            "自己言及・挨拶・確認質問は処理に含まれない。\n"
+            "\n"
+            "【出力規則】\n"
+            "- ツールを使う場合: [TOOL:ツール名 引数]マーカーのみ出力\n"
+            "- intent=に行動の意図、expect=に結果の予測を記述すること\n"
+            "- ツールの結果はシステムが返す。結果を自分で生成しない\n"
+            "- 行動不要な場合: [TOOL:non_response]を出力"
+        )
+
+        # 自己モデルの内容
         sm_text = ""
         if self_model:
             sm_lines = []
@@ -1021,14 +1115,14 @@ class Pipeline:
                 if k not in ("__free_text__", "motivation_rules", "session_log", "session_archive"):
                     sm_lines.append(f"- {k}: {v}")
             if sm_lines:
-                sm_text = "\n[self_model]\n" + "\n".join(sm_lines)
+                sm_text = "\n\n[self_model]\n" + "\n".join(sm_lines)
             principles = self_model.get("principles")
             if isinstance(principles, list) and principles:
                 recent = principles[-5:]
                 p_lines = [f"- {p['text']}" if isinstance(p, dict) and 'text' in p else f"- {p}" for p in recent]
                 sm_text += "\n[characteristics]\n" + "\n".join(p_lines)
 
-        return sm_text
+        return engine + sm_text
 
     # (旧セッション履歴・初回プロンプト・trim_messagesは1ストリーム化により削除済み
     #  コンパクションは _compact_stream() が担当)
