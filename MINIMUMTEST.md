@@ -119,7 +119,7 @@ state.jsonに記録 → maybe_compress_log() → 次のサイクルへ
 | 0 | `list_files` `read_file` `update_self` `wait` | 初期状態 |
 | 1 | `write_file` `search_memory` | `iku.txt` または `run.py` を読んだ |
 | 2 | `web_search` `fetch_url` | `iku.txt` **かつ** `run.py` を両方読んだ |
-| 3 | 全ツール（X/Elyth含む） | 5ファイル以上読んだ |
+| 3 | 全ツール（X/Elyth含む） | 読んだファイル数 + 書いたファイル数 ≥ 5 |
 
 **`update_self`（自己更新）と`write_file`（環境介入）は意図的に分離。**
 

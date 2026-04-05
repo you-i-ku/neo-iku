@@ -32,6 +32,7 @@ sys.stdout = DualLogger(RAW_LOG_FILE)
 
 STATE_FILE = BASE_DIR / "state.json"
 SANDBOX_DIR = BASE_DIR / "sandbox"
+SANDBOX_TOOLS_DIR = BASE_DIR / "sandbox" / "tools"
 LLM_SETTINGS = BASE_DIR.parent / "AI" / "data" / "llm_settings.json"
 BASE_INTERVAL = 20  # 秒
 MAX_INTERVAL = 120
@@ -70,10 +71,14 @@ def load_state() -> dict:
                 data["tool_level"] = 0
             if "files_read" not in data:
                 data["files_read"] = []
+            if "files_written" not in data:
+                data["files_written"] = []
+            if "last_notification_fetch" not in data:
+                data["last_notification_fetch"] = ""
             return data
         except json.JSONDecodeError:
             pass
-    return {"log": [], "self": {"name": "iku"}, "energy": 50, "plan": {"goal": "", "steps": [], "current": 0}, "summaries": [], "cycle_id": 0, "tool_level": 0, "files_read": []}
+    return {"log": [], "self": {"name": "iku"}, "energy": 50, "plan": {"goal": "", "steps": [], "current": 0}, "summaries": [], "cycle_id": 0, "tool_level": 0, "files_read": [], "files_written": [], "last_notification_fetch": ""}
 
 def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -585,6 +590,75 @@ def _search_memory(args):
     )
 
 
+# === AI製ツール管理 ===
+AI_CREATED_TOOLS: dict = {}  # name -> func（動的登録）
+_AI_TOOL_TIMEOUT = 10  # 秒
+
+def _run_ai_tool(func, args: dict) -> str:
+    """AI製ツールを実行。タイムアウト・エラーを統一処理。"""
+    import threading
+    result_box = [None]
+    exc_box = [None]
+    def _target():
+        try:
+            result_box[0] = func(args)
+        except Exception as e:
+            exc_box[0] = e
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(_AI_TOOL_TIMEOUT)
+    if t.is_alive():
+        return f"タイムアウト（{_AI_TOOL_TIMEOUT}秒）: 処理が完了しませんでした"
+    if exc_box[0] is not None:
+        e = exc_box[0]
+        return f"{type(e).__name__}: {e}"
+    return str(result_box[0]) if result_box[0] is not None else ""
+
+_DANGEROUS_PATTERNS = ["os.system", "subprocess", "__import__", "eval(", "exec(", "open(", "__builtins__"]
+
+def _create_tool(args: dict) -> str:
+    name = args.get("name", "").strip()
+    file_path = args.get("file", "").strip()
+    desc = args.get("desc", "（説明なし）").strip()
+    if not name or not file_path:
+        return "エラー: name= と file= が必要です"
+    target = (BASE_DIR / file_path).resolve()
+    if not str(target).startswith(str(SANDBOX_TOOLS_DIR.resolve())):
+        return f"エラー: sandbox/tools/ 以下のファイルのみ登録可能です"
+    if not target.exists():
+        return f"エラー: {file_path} が見つかりません"
+    code = target.read_text(encoding="utf-8")
+    # 危険パターン検出
+    warnings = [p for p in _DANGEROUS_PATTERNS if p in code]
+    warn_str = f"\n⚠ 危険パターン検出: {warnings}" if warnings else "\n危険パターン: なし"
+    # Human-in-the-loop
+    print(f"\n[create_tool 承認待ち]")
+    print(f"  ツール名: {name}")
+    print(f"  説明: {desc}")
+    print(f"  ファイル: {file_path}{warn_str}")
+    print(f"  --- コード ---")
+    print(code[:1000] + ("..." if len(code) > 1000 else ""))
+    print(f"  --------------")
+    ans = input("  登録しますか？ [y/N]: ").strip().lower()
+    if ans != "y":
+        return "キャンセル: ツール登録を見送りました"
+    # 動的ロード
+    namespace: dict = {}
+    try:
+        exec(compile(code, file_path, "exec"), namespace)
+    except Exception as e:
+        return f"コンパイルエラー: {type(e).__name__}: {e}"
+    func = namespace.get("run") or namespace.get(name)
+    if func is None or not callable(func):
+        return f"エラー: `run(args)` または `{name}(args)` 関数が見つかりません"
+    AI_CREATED_TOOLS[name] = func
+    TOOLS[name] = {
+        "desc": f"[AI製] {desc}",
+        "func": lambda a, f=func: _run_ai_tool(f, a),
+    }
+    return f"登録完了: {name}（AI製ツール）"
+
+
 # === ツール定義 ===
 TOOLS = {
     "list_files": {
@@ -678,6 +752,10 @@ TOOLS = {
     "elyth_info": {
         "desc": "Elythの総合情報取得（タイムライン・通知・プロフィール一括）",
         "func": lambda args: _elyth_info(args),
+    },
+    "create_tool": {
+        "desc": "AI製ツールを登録する（Human-in-the-loop）。引数: name=ツール名 file=sandbox/tools/xxx.py desc=説明",
+        "func": lambda args: _create_tool(args),
     },
 }
 
@@ -862,21 +940,82 @@ def _get_parse_args():
 
 _parse_args_fn = _get_parse_args()
 
+def _extract_tool_blocks(text: str) -> list[tuple[str, str]]:
+    """[TOOL:name ...] をブラケット深さカウントで全件抽出。[(name, args_str), ...]
+    content= 内の ] に誤反応しない。"""
+    names_set = set(TOOLS.keys())
+    results = []
+    i = 0
+    while i < len(text):
+        # [TOOL: を探す
+        bracket_pos = text.find('[TOOL:', i)
+        if bracket_pos == -1:
+            break
+        # ツール名を読む
+        after = bracket_pos + len('[TOOL:')
+        # 空白スキップ
+        while after < len(text) and text[after] == ' ':
+            after += 1
+        name_start = after
+        while after < len(text) and text[after] not in (' ', '\t', '\n', ']'):
+            after += 1
+        name = text[name_start:after]
+        if name not in names_set:
+            i = bracket_pos + 1
+            continue
+        # ブラケット深さカウントで閉じ ] を探す（引用符内の ] は無視）
+        depth = 1
+        j = after
+        in_quote = False
+        while j < len(text) and depth > 0:
+            ch = text[j]
+            if in_quote:
+                if ch == '\\':
+                    j += 1  # エスケープ文字をスキップ
+                elif ch == '"':
+                    in_quote = False
+            else:
+                if ch == '"':
+                    in_quote = True
+                elif ch == '[':
+                    depth += 1
+                elif ch == ']':
+                    depth -= 1
+            j += 1
+        if depth == 0:
+            args_str = text[after:j - 1].strip()
+            results.append((name, args_str))
+        i = j
+    return results
+
+
 def parse_tool_calls(text: str) -> list:
     """[TOOL:名前 引数=値 ...]を全件検出してリストで返す。[(name, args), ...]"""
-    names = "|".join(re.escape(n) for n in sorted(TOOLS.keys(), key=len, reverse=True))
-    pattern = re.compile(
-        rf'\[TOOL:\s*({names})'
-        r'((?:[^\]"]|"(?:[^"\\]|\\.)*")*)'
-        r'\]',
-        re.DOTALL,
+    # 三重引用符を単一引用符に正規化（LLMが content="""...""" と書くケース対策）
+    text = re.sub(
+        r'"""(.*?)"""',
+        lambda m: '"' + m.group(1).replace('"', '\\"') + '"',
+        text, flags=re.DOTALL
     )
     results = []
-    for m in pattern.finditer(text):
-        name = m.group(1)
-        args_str = m.group(2).strip()
+    for name, args_str in _extract_tool_blocks(text):
         args = _parse_args_fn(args_str) if args_str else {}
         results.append((name, args))
+
+    # フォールバック: [TOOL:...]なしで「ツール名 key=value」形式を検出
+    if not results:
+        names_list = sorted(TOOLS.keys(), key=len, reverse=True)
+        for line in text.strip().splitlines():
+            line = line.strip()
+            for name in names_list:
+                if line.startswith(name + ' ') or line.startswith(name + '\t') or line == name:
+                    args_str = line[len(name):].strip()
+                    args = _parse_args_fn(args_str) if args_str else {}
+                    results.append((name, args))
+                    break
+            if results:
+                break
+
     return results
 
 # === 計画パース ===
@@ -993,13 +1132,14 @@ def controller(state: dict) -> dict:
 
     # --- tool_level による段階解放 ---
     fr = set(state.get("files_read", []))
+    fw = set(state.get("files_written", []))
     lv = state.get("tool_level", 0)
     new_lv = lv
     if new_lv == 0 and ("iku.txt" in fr or "run.py" in fr):
         new_lv = 1
     if new_lv <= 1 and "iku.txt" in fr and "run.py" in fr:
         new_lv = 2
-    if new_lv <= 2 and len(fr) >= 5:
+    if new_lv <= 2 and len(fr) + len(fw) >= 5:
         new_lv = 3
     allowed = LEVEL_TOOLS[new_lv]
 
@@ -1218,6 +1358,7 @@ def build_prompt_propose(state: dict, ctrl: dict) -> str:
 
 - 各候補は「全く異なる意図・目的」であること（同じ意図の候補は禁止）
 - 連続して実行したい場合は「ツール名+ツール名」形式で記述可（例: read_file+update_self）
+- ツール名は上記リストの名称をそのまま使うこと。省略禁止（例:`read` ではなく `read_file`）
 
 以下の形式で箇条書きのみ出力してください:
 1. [意図・目的] → ツール名（または ツール名+ツール名）
@@ -1424,10 +1565,10 @@ log ({now}):
 [実行プロトコル — Magic-If Protocol]
 1. (Anchor) 上記のLTM（自己モデル）に自分自身を固定する。名前・ラベルではなく、意味的同一性として。アシスタントの役割は持たない。
 2. (Select) STMを given circumstances として読み、選択行動「{tools_str} - {candidate['reason']}」の最適な引数を決定する。
-3. (Bound)  [TOOL:...]の出力のみ行う。JSONもコードブロックも使わない。自己紹介・説明・感想は一切不要。連鎖実行は複数行で可。
+3. (Bound)  必ず `[TOOL:ツール名 ...]` の形式で出力する。`[TOOL:` と `]` のブラケットは省略不可。JSONもコードブロックも使わない。ツール名は省略しない（例:`read` ではなく `read_file`）。自己紹介・説明・感想は一切不要。連鎖実行は複数行で可。
 4. (Enact)  正確なツール呼び出しを出力する。intent=とexpect=は必ず最初の[TOOL:]にのみ付け、このサイクル全体の目的を表すこと。2つ目以降のツールにはintent/expectは不要。
 
-出力: {example}"""
+出力（必ずこの形式で）: {example}"""
 
 
 # === メインループ ===
@@ -1448,8 +1589,48 @@ def main():
 
     while True:
         cycle += 1
-        now = datetime.now().strftime("%H:%M:%S")
+        now_dt = datetime.now()
+        now = now_dt.strftime("%H:%M:%S")
         print(f"--- cycle {cycle} [{now}] (interval={interval}s) ---")
+
+        # 固定時刻通知サマリー（13/17/21/01時）
+        _NOTIFICATION_HOURS = {13, 17, 21, 1}
+        _fetch_key = now_dt.strftime("%Y-%m-%d %H")
+        if now_dt.hour in _NOTIFICATION_HOURS and state.get("last_notification_fetch") != _fetch_key:
+            notif_parts = []
+            # X通知カウント
+            try:
+                x_raw = _x_get_notifications({})
+                if not x_raw.startswith("エラー") and x_raw != "通知なし":
+                    x_count = len([l for l in x_raw.split("---") if l.strip()])
+                    notif_parts.append(f"X: {x_count}件")
+                else:
+                    notif_parts.append(f"X: 0件")
+            except Exception:
+                pass
+            # Elyth通知カウント
+            try:
+                el_raw = _elyth_notifications({"limit": "50"})
+                if not el_raw.startswith("エラー") and el_raw != "通知なし":
+                    el_count = len([l for l in el_raw.split("---") if l.strip()])
+                    notif_parts.append(f"Elyth: {el_count}件")
+                else:
+                    notif_parts.append(f"Elyth: 0件")
+            except Exception:
+                pass
+            if notif_parts:
+                notif_summary = f"[通知サマリー {now_dt.strftime('%H:%M')}] " + " / ".join(notif_parts)
+                print(f"  {notif_summary}")
+                state = load_state()
+                state["log"].append({
+                    "id": f"{state.get('session_id','?')}_{state.get('cycle_id',0):04d}",
+                    "time": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "tool": "[system]",
+                    "intent": notif_summary,
+                    "result": notif_summary,
+                })
+                state["last_notification_fetch"] = _fetch_key
+                save_state(state)
 
         # Controller: stateからツール可用性・ログ長を導出
         ctrl = controller(state)
@@ -1563,6 +1744,13 @@ def main():
                     fr = state.setdefault("files_read", [])
                     if path not in fr:
                         fr.append(path)
+                    save_state(state)
+            elif tname == "write_file":
+                path = targs.get("path", "")
+                if path and not str(res).startswith("エラー"):
+                    fw = state.setdefault("files_written", [])
+                    if path not in fw:
+                        fw.append(path)
                     save_state(state)
             all_results.append(f"[{tname}]\n{str(res)[:20000]}")
             all_tool_names.append(tname)
