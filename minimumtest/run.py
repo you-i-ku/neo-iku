@@ -2,7 +2,14 @@
 import json
 import time
 import re
+import os
+import math
+import socket
+import statistics
+import threading
 import httpx
+import psutil
+from collections import deque
 from pathlib import Path
 from datetime import datetime
 import sys
@@ -34,9 +41,30 @@ STATE_FILE = BASE_DIR / "state.json"
 SANDBOX_DIR = BASE_DIR / "sandbox"
 SANDBOX_TOOLS_DIR = BASE_DIR / "sandbox" / "tools"
 LLM_SETTINGS = BASE_DIR.parent / "AI" / "data" / "llm_settings.json"
-BASE_INTERVAL = 20  # 秒
-MAX_INTERVAL = 120
+BASE_INTERVAL = 20  # 秒（エラー回復用に残す）
 MAX_LOG_IN_PROMPT = 10
+ENV_INJECT_INTERVAL = 10  # 秒: 環境ログ注入間隔
+_NOTIFICATION_HOURS = {13, 17, 21, 1}
+
+# 電脳気候パラメータのデフォルト（pref.jsonで上書き可）
+DEFAULT_PRESSURE_PARAMS = {
+    "decay": 0.97,
+    "clock_base": 0.1,
+    "threshold": 12.0,
+    "post_fire_reset": 0.3,
+    "e2_pressure_scale": 3.0,
+    "e3_pressure_scale": 0.6,
+    "weights": {
+        "info_velocity": 0.3,
+        "info_entropy": 0.3,
+        "channel_state": 0.3,
+        "noise": 0.1,
+    },
+}
+
+# ネットワーク計測キャッシュ（バックグラウンドスレッドが更新）
+_net_cache: dict = {"avg": 50.0, "jitter": 0.0}
+_net_lock = threading.Lock()
 DEBUG_LOG = BASE_DIR / "llm_debug.log"
 MEMORY_DIR = BASE_DIR / "memory"
 LOG_HARD_LIMIT = 150    # logがこの件数に達したらTrigger1
@@ -75,6 +103,10 @@ def load_state() -> dict:
                 data["files_written"] = []
             if "last_notification_fetch" not in data:
                 data["last_notification_fetch"] = ""
+            if "pressure" not in data:
+                data["pressure"] = 0.0
+            if "last_e3" not in data:
+                data["last_e3"] = 0.5
             if "tools_created" not in data:
                 data["tools_created"] = []
             return data
@@ -1438,6 +1470,8 @@ def _summarize_entries(entries: list, label: str = "要約") -> dict:
     """LLMでエントリ群を200字以内に要約して1件のsummaryエントリを返す"""
     lines = []
     for e in entries:
+        if e.get("type") in ("system", "environment"):
+            continue
         line = f"{e.get('time','')} {e.get('tool','')}"
         if e.get("intent"): line += f" [{e['intent'][:80]}]"
         if e.get("result"): line += f" → {str(e['result'])[:120]}"
@@ -1499,14 +1533,18 @@ def maybe_compress_log(state: dict):
     # Trigger1（archiveは既に都度書き込み済み）
     if len(state["log"]) >= LOG_HARD_LIMIT:
         to_summarize = state["log"][:51]
-        # pref.json にE2をEMAで蓄積（圧縮で消える前に記録）
+        # pref.json の _ema にE2をEMAで蓄積（観察用・prefの実値には触れない）
         pref = load_pref()
+        ema = pref.get("_ema", {})
         for entry in to_summarize:
+            if entry.get("type") in ("system", "environment"):
+                continue
             t = entry.get("tool", "")
             m = re.search(r'(\d+)%', str(entry.get("e2", "")))
             if m and t in TOOLS:
-                old = pref.get(t, 50.0)
-                pref[t] = round(old * 0.8 + int(m.group(1)) * 0.2, 1)
+                old = ema.get(t, 50.0)
+                ema[t] = round(old * 0.8 + int(m.group(1)) * 0.2, 1)
+        pref["_ema"] = ema
         save_pref(pref)
         summary = _summarize_entries(to_summarize, "L1要約")
         _archive_summary(summary)
@@ -1816,6 +1854,40 @@ log ({now}):
 出力（必ずこの形式で）: {example}"""
 
 
+# === 電脳気候: ヘルパー ===
+
+def _znorm(buf: deque) -> float:
+    """ローリングZスコア正規化 → [0.0, 1.0]、中央0.5"""
+    if len(buf) < 3:
+        return 0.5
+    m = statistics.mean(buf)
+    s = statistics.stdev(buf)
+    if s < 1e-9:
+        return 0.5
+    z = (buf[-1] - m) / s
+    return max(0.0, min(1.0, z / 6.0 + 0.5))
+
+
+def _net_measure_worker():
+    """バックグラウンドで10秒ごとにTCPレイテンシを計測してキャッシュ更新"""
+    hosts = [("8.8.8.8", 53), ("1.1.1.1", 53), ("8.8.4.4", 53)]
+    while True:
+        lats = []
+        for host, port in hosts:
+            t = time.time()
+            try:
+                s = socket.create_connection((host, port), timeout=1.5)
+                s.close()
+                lats.append((time.time() - t) * 1000)
+            except Exception:
+                pass
+        with _net_lock:
+            if lats:
+                _net_cache["avg"] = sum(lats) / len(lats)
+                _net_cache["jitter"] = statistics.stdev(lats) if len(lats) > 1 else 0.0
+        time.sleep(10)
+
+
 # === メインループ ===
 def main():
     print("=== 最小自律AIテスト ===")
@@ -1829,53 +1901,129 @@ def main():
     state["session_id"] = str(uuid.uuid4())[:8]
     save_state(state)
     print(f"session: {state['session_id']}  cycle_id: {state['cycle_id']}")
-    interval = BASE_INTERVAL
-    cycle = 0
+
+    # pref.json 初期化（pressure_paramsだけ保証、ツール好みは空から始める）
+    pref = load_pref()
+    if "pressure_params" not in pref:
+        pref["pressure_params"] = DEFAULT_PRESSURE_PARAMS
+        save_pref(pref)
+        print("  pref.json 初期化完了")
+
+    # 感覚層・蓄積層の初期化
+    pressure = state.get("pressure", 0.0)
+    _env_bufs = {
+        "info_velocity": deque(maxlen=60),
+        "info_entropy":  deque(maxlen=12),
+        "channel_state": deque(maxlen=12),
+    }
+    _nic_prev = psutil.net_io_counters()
+    threading.Thread(target=_net_measure_worker, daemon=True).start()
+    print("  感覚層: ネットワーク計測スレッド起動")
 
     while True:
-        cycle += 1
-        now_dt = datetime.now()
-        now = now_dt.strftime("%H:%M:%S")
-        print(f"--- cycle {cycle} [{now}] (interval={interval}s) ---")
+        pp = load_pref().get("pressure_params", DEFAULT_PRESSURE_PARAMS)
+        _last_env_inject = 0.0
+        tick_dt = datetime.now()
 
-        # 固定時刻通知サマリー（13/17/21/01時）
-        _NOTIFICATION_HOURS = {13, 17, 21, 1}
-        _fetch_key = now_dt.strftime("%Y-%m-%d %H")
-        if now_dt.hour in _NOTIFICATION_HOURS and state.get("last_notification_fetch") != _fetch_key:
-            notif_parts = []
-            # X通知カウント
-            try:
-                x_raw = _x_get_notifications({})
-                if not x_raw.startswith("エラー") and x_raw != "通知なし":
-                    x_count = len([l for l in x_raw.split("---") if l.strip()])
-                    notif_parts.append(f"X: {x_count}件")
-                else:
-                    notif_parts.append(f"X: 0件")
-            except Exception:
-                pass
-            # Elyth通知カウント
-            try:
-                el_raw = _elyth_notifications({"limit": "50"})
-                if not el_raw.startswith("エラー") and el_raw != "通知なし":
-                    el_count = len([l for l in el_raw.split("---") if l.strip()])
-                    notif_parts.append(f"Elyth: {el_count}件")
-                else:
-                    notif_parts.append(f"Elyth: 0件")
-            except Exception:
-                pass
-            if notif_parts:
-                notif_summary = f"[通知サマリー {now_dt.strftime('%H:%M')}] " + " / ".join(notif_parts)
-                print(f"  {notif_summary}")
+        # 蓄積層: pressureが閾値に達するまで1Hzでティック
+        while pressure < pp.get("threshold", DEFAULT_PRESSURE_PARAMS["threshold"]):
+            tick_start = time.time()
+            tick_dt = datetime.now()
+
+            # --- 感覚層: 環境計測 ---
+            nic_now = psutil.net_io_counters()
+            nic_bytes = (nic_now.bytes_sent + nic_now.bytes_recv
+                         - _nic_prev.bytes_sent - _nic_prev.bytes_recv)
+            _nic_prev = nic_now
+            _env_bufs["info_velocity"].append(math.log1p(max(0.0, float(nic_bytes))))
+
+            with _net_lock:
+                jitter = _net_cache["jitter"]
+                lat_avg = _net_cache["avg"]
+            _env_bufs["info_entropy"].append(jitter)
+            _env_bufs["channel_state"].append(math.log1p(lat_avg))
+            noise_val = int.from_bytes(os.urandom(2), "big") / 65535.0
+
+            # --- 蓄積層: 漏洩積分器 ---
+            w = pp.get("weights", DEFAULT_PRESSURE_PARAMS["weights"])
+            env_delta = (
+                w.get("info_velocity", 0.3) * _znorm(_env_bufs["info_velocity"]) +
+                w.get("info_entropy",  0.3) * _znorm(_env_bufs["info_entropy"]) +
+                w.get("channel_state", 0.3) * _znorm(_env_bufs["channel_state"]) +
+                w.get("noise",         0.1) * noise_val
+            )
+            # E3低い（予測外れ）= 不確実性が残っている = 微加圧（Active Inference的）
+            last_e3 = state.get("last_e3", 0.5)
+            e3_delta = max(0.0, 0.5 - last_e3) * pp.get("e3_pressure_scale", 0.2)
+            pressure = pressure * pp.get("decay", 0.97) + env_delta + pp.get("clock_base", 0.1) + e3_delta
+
+            # 固定時刻通知チェック
+            _fetch_key = tick_dt.strftime("%Y-%m-%d %H")
+            if tick_dt.hour in _NOTIFICATION_HOURS and state.get("last_notification_fetch") != _fetch_key:
+                notif_parts = []
+                try:
+                    x_raw = _x_get_notifications({})
+                    if not x_raw.startswith("エラー") and x_raw != "通知なし":
+                        x_count = len([l for l in x_raw.split("---") if l.strip()])
+                        notif_parts.append(f"X: {x_count}件")
+                    else:
+                        notif_parts.append(f"X: 0件")
+                except Exception:
+                    pass
+                try:
+                    el_raw = _elyth_notifications({"limit": "50"})
+                    if not el_raw.startswith("エラー") and el_raw != "通知なし":
+                        el_count = len([l for l in el_raw.split("---") if l.strip()])
+                        notif_parts.append(f"Elyth: {el_count}件")
+                    else:
+                        notif_parts.append(f"Elyth: 0件")
+                except Exception:
+                    pass
+                if notif_parts:
+                    notif_summary = f"[通知サマリー {tick_dt.strftime('%H:%M')}] " + " / ".join(notif_parts)
+                    print(f"  {notif_summary}")
+                    state = load_state()
+                    state["log"].append({
+                        "id": f"{state.get('session_id','?')}_{state.get('cycle_id',0):04d}",
+                        "time": tick_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                        "tool": "[system]",
+                        "type": "system",
+                        "result": notif_summary,
+                    })
+                    state["last_notification_fetch"] = _fetch_key
+                    save_state(state)
+
+            # 環境ログ注入（ENV_INJECT_INTERVAL秒ごと）
+            now_ts = time.time()
+            if now_ts - _last_env_inject >= ENV_INJECT_INTERVAL:
+                _last_env_inject = now_ts
+                iv = _znorm(_env_bufs["info_velocity"])
+                ie = _znorm(_env_bufs["info_entropy"])
+                cs = _znorm(_env_bufs["channel_state"])
                 state = load_state()
                 state["log"].append({
-                    "id": f"{state.get('session_id','?')}_{state.get('cycle_id',0):04d}",
-                    "time": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                    "tool": "[system]",
-                    "intent": notif_summary,
-                    "result": notif_summary,
+                    "id": f"{state.get('session_id','?')}_env_{int(now_ts)}",
+                    "time": tick_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "tool": "[environment]",
+                    "type": "environment",
+                    "result": (
+                        f"info_velocity={iv:.3f} info_entropy={ie:.3f} "
+                        f"channel_state={cs:.3f} noise={noise_val:.3f} "
+                        f"pressure={pressure:.2f}"
+                    ),
                 })
-                state["last_notification_fetch"] = _fetch_key
                 save_state(state)
+                print(f"  [env] p={pressure:.2f} iv={iv:.2f} ie={ie:.2f} cs={cs:.2f} n={noise_val:.2f}")
+
+            # 1Hzで回す
+            elapsed = time.time() - tick_start
+            time.sleep(max(0.0, 1.0 - elapsed))
+
+        # --- 閾値超過: 認知層起動 ---
+        state = load_state()
+        now_dt = tick_dt
+        now = now_dt.strftime("%H:%M:%S")
+        print(f"--- cycle {state.get('cycle_id', 0) + 1} [{now}] pressure={pressure:.2f} ---")
 
         # Controller: stateからツール可用性・ログ長を導出
         ctrl = controller(state)
@@ -1898,7 +2046,8 @@ def main():
             append_debug_log("LLM1 (Propose)", propose_resp)
         except Exception as e:
             print(f"  LLM①エラー: {e}")
-            time.sleep(interval)
+            pressure = max(0.0, pressure * pp.get("post_fire_reset", 0.3))
+            time.sleep(10)
             continue
         candidates = parse_candidates(propose_resp, ctrl["allowed_tools"])
         print(f"  LLM①raw: {propose_resp.strip()[:300]}")
@@ -1915,7 +2064,8 @@ def main():
             append_debug_log("LLM2 (Execute)", response)
         except Exception as e:
             print(f"  LLM②エラー: {e}")
-            time.sleep(interval)
+            pressure = max(0.0, pressure * pp.get("post_fire_reset", 0.3))
+            time.sleep(10)
             continue
 
         # レスポンス表示
@@ -1941,8 +2091,8 @@ def main():
             state["log"].append(entry)
             maybe_compress_log(state)
             save_state(state)
+            pressure = max(0.0, pressure * pp.get("post_fire_reset", 0.3))
             print()
-            time.sleep(interval)
             continue
 
         # ツールパース（複数対応）
@@ -2069,16 +2219,19 @@ def main():
         maybe_compress_log(state)
         save_state(state)
 
-        # 間隔調整（waitが続くとバックオフ）
-        recent_tools = [e["tool"] for e in state["log"][-5:]]
-        if all(t == "wait" for t in recent_tools) and len(recent_tools) >= 5:
-            interval = min(interval * 2, MAX_INTERVAL)
-            print(f"  (wait連続 → interval={interval}s)")
-        else:
-            interval = BASE_INTERVAL
-
+        # pressure reset: E2フィードバックで初期値をセット（認知層→蓄積層）
+        last_e2_str = str(entry.get("e2", ""))
+        m_e2 = re.search(r'(\d+)', last_e2_str)
+        e2_val = int(m_e2.group(1)) / 100.0 if m_e2 else 0.5
+        pressure = max(0.0, pressure * pp.get("post_fire_reset", 0.3) + (e2_val - 0.5) * pp.get("e2_pressure_scale", 3.0))
+        state["pressure"] = round(pressure, 2)
+        # last_e3更新（次の蓄積層でのe3_delta計算に使う）
+        last_e3_str = str(entry.get("e3", ""))
+        m_e3 = re.search(r'(\d+)', last_e3_str)
+        state["last_e3"] = int(m_e3.group(1)) / 100.0 if m_e3 else 0.5
+        save_state(state)
+        print(f"  pressure reset: {pressure:.2f} (e2={e2_val:.2f} e3={state['last_e3']:.2f})")
         print()
-        time.sleep(interval)
 
 if __name__ == "__main__":
     main()
