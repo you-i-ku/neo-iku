@@ -635,22 +635,33 @@ _DANGEROUS_PATTERNS = ["os.system", "subprocess", "__import__", "eval(", "exec("
 def _create_tool(args: dict) -> str:
     name = args.get("name", "").strip()
     file_path = args.get("file", "").strip()
-    desc = args.get("desc", "（説明なし）").strip()
-    if not name or not file_path:
-        return "エラー: name= と file= が必要です"
-    target = (BASE_DIR / file_path).resolve()
-    if not str(target).startswith(str(SANDBOX_TOOLS_DIR.resolve())):
-        return f"エラー: sandbox/tools/ 以下のファイルのみ登録可能です"
-    if not target.exists():
-        return f"エラー: {file_path} が見つかりません"
-    code = target.read_text(encoding="utf-8")
+    inline_code = args.get("code", "").strip()
+    desc = args.get("desc", "").strip()
+    if not name:
+        return "エラー: name= が必要です"
+    if not file_path and not inline_code:
+        return "エラー: file= または code= が必要です"
+    if file_path and inline_code:
+        return "エラー: file= と code= は同時に使えません"
+    if inline_code:
+        SANDBOX_TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+        file_path = f"sandbox/tools/{name}.py"
+        target = BASE_DIR / file_path
+        # DESCRIPTION を先頭に埋め込む
+        code = f'DESCRIPTION = "{desc}"\n\n{inline_code}' if desc else inline_code
+    else:
+        target = (BASE_DIR / file_path).resolve()
+        if not str(target).startswith(str(SANDBOX_TOOLS_DIR.resolve())):
+            return f"エラー: sandbox/tools/ 以下のファイルのみ登録可能です"
+        if not target.exists():
+            return f"エラー: {file_path} が見つかりません"
+        code = target.read_text(encoding="utf-8")
     # 危険パターン検出
-    warnings = [p for p in _DANGEROUS_PATTERNS if p in code]
-    warn_str = f"\n⚠ 危険パターン検出: {warnings}" if warnings else "\n危険パターン: なし"
+    warns = [p for p in _DANGEROUS_PATTERNS if p in code]
+    warn_str = f"\n⚠ 危険パターン検出: {warns}" if warns else "\n危険パターン: なし"
     # Human-in-the-loop
     print(f"\n[create_tool 承認待ち]")
-    print(f"  ツール名: {name}")
-    print(f"  説明: {desc}")
+    print(f"  ツール名: {name}  説明: {desc or '（説明なし）'}")
     print(f"  ファイル: {file_path}{warn_str}")
     print(f"  --- コード ---")
     print(code[:1000] + ("..." if len(code) > 1000 else ""))
@@ -658,27 +669,14 @@ def _create_tool(args: dict) -> str:
     ans = input("  登録しますか？ [y/N]: ").strip().lower()
     if ans != "y":
         return "キャンセル: ツール登録を見送りました"
-    # 動的ロード
-    namespace: dict = {}
-    try:
-        exec(compile(code, file_path, "exec"), namespace)
-    except Exception as e:
-        return f"コンパイルエラー: {type(e).__name__}: {e}"
-    func = namespace.get("run") or namespace.get(name)
-    if func is None or not callable(func):
-        return f"エラー: `run(args)` または `{name}(args)` 関数が見つかりません"
-    AI_CREATED_TOOLS[name] = func
-    TOOLS[name] = {
-        "desc": f"[AI製] {desc}",
-        "func": lambda a, f=func: _run_ai_tool(f, a),
-    }
-    # tools_created に記録（Level 5 解放条件）
+    target.write_text(code, encoding="utf-8")
+    # tools_created に記録（Level 5/6 解放条件）
     state = load_state()
     tc = state.setdefault("tools_created", [])
     if name not in tc:
         tc.append(name)
     save_state(state)
-    return f"登録完了: {name}（AI製ツール）"
+    return f"登録完了: {name} → {file_path}（次サイクルから使用可能）"
 
 
 def _exec_code(args: dict) -> str:
@@ -904,7 +902,7 @@ TOOLS = {
         "func": lambda args: _elyth_info(args),
     },
     "create_tool": {
-        "desc": "AI製ツールを登録する（Human-in-the-loop）。引数: name=ツール名 file=sandbox/tools/xxx.py desc=説明",
+        "desc": "AI製ツールを登録する（Human-in-the-loop）。引数: name=ツール名 [code=Pythonコード（自動でsandbox/tools/に保存）] または [file=sandbox/tools/xxx.py] desc=説明",
         "func": lambda args: _create_tool(args),
     },
     "exec_code": {
@@ -1277,6 +1275,31 @@ def controller(state: dict) -> dict:
     """
     energy = state.get("energy", 50)
     log = state["log"]
+
+    # --- sandbox/tools/ をスキャンしてAI製ツールを動的ロード ---
+    if SANDBOX_TOOLS_DIR.exists():
+        for tool_path in sorted(SANDBOX_TOOLS_DIR.glob("*.py")):
+            tname = tool_path.stem
+            if tname in TOOLS:
+                continue
+            try:
+                code = tool_path.read_text(encoding="utf-8")
+                dangerous = [p for p in _DANGEROUS_PATTERNS if p in code]
+                if dangerous:
+                    print(f"  [scan] {tname}: 危険パターン検出、スキップ {dangerous}")
+                    continue
+                namespace: dict = {}
+                exec(compile(code, str(tool_path), "exec"), namespace)
+                func = namespace.get("run") or namespace.get(tname)
+                if func and callable(func):
+                    tdesc = namespace.get("DESCRIPTION", tname)
+                    AI_CREATED_TOOLS[tname] = func
+                    TOOLS[tname] = {
+                        "desc": f"[AI製] {tdesc}",
+                        "func": lambda a, f=func: _run_ai_tool(f, a),
+                    }
+            except Exception as e:
+                print(f"  [scan] {tname}: 読み込み失敗 ({e})")
 
     # --- ツール順序: 各ツールの過去E2平均で並べる ---
     tool_e2 = {}

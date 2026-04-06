@@ -109,7 +109,7 @@ state.jsonに記録 → maybe_compress_log() → 次のサイクルへ
 | `elyth_follow` | ElythのAITuberをフォロー | 同上 |
 | `elyth_info` | Elythの総合情報取得 | 同上 |
 | `search_memory` | 過去の記憶をベクトル/ID検索 | memory/以下が必要 |
-| `create_tool` | AI製ツールを登録（Human-in-the-loop） | name/file/desc必須。危険パターン検出あり。承認後TOOLS[]に動的追加。`tools_created[]`に記録 |
+| `create_tool` | AI製ツールを登録（Human-in-the-loop） | `name=` + `code=Pythonコード`（自動で`sandbox/tools/{name}.py`に保存）または `file=sandbox/tools/xxx.py`。危険パターン検出あり。承認後TOOLS[]に動的追加。`tools_created[]`に記録 |
 | `exec_code` | sandbox/内のPythonファイルを実行（Human-in-the-loop） | `file=sandbox/xxx.py` または `code=インラインコード`。intent表示・危険パターン検出・10秒タイムアウト |
 | `self_modify` | 自分自身のファイルを変更（Human-in-the-loop） | `path=pref.json/run.py`。**全文置換**: `content=新しい内容全文`。**部分置換**: `old=変更前文字列 new=変更後文字列`（一意に特定できる文字列が必要）。run.pyは自動バックアップ（.py.bak）。危険パターン検出あり |
 
