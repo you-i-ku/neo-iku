@@ -111,6 +111,7 @@ state.jsonに記録 → maybe_compress_log() → 次のサイクルへ
 | `search_memory` | 過去の記憶をベクトル/ID検索 | memory/以下が必要 |
 | `create_tool` | AI製ツールを登録（Human-in-the-loop） | name/file/desc必須。危険パターン検出あり。承認後TOOLS[]に動的追加。`tools_created[]`に記録 |
 | `exec_code` | sandbox/内のPythonファイルを実行（Human-in-the-loop） | `file=sandbox/xxx.py` または `code=インラインコード`。intent表示・危険パターン検出・10秒タイムアウト |
+| `self_modify` | 自分自身のファイルを変更（Human-in-the-loop） | `path=pref.json/run.py`。**全文置換**: `content=新しい内容全文`。**部分置換**: `old=変更前文字列 new=変更後文字列`（一意に特定できる文字列が必要）。run.pyは自動バックアップ（.py.bak）。危険パターン検出あり |
 
 ### ツール段階解放
 
@@ -124,6 +125,7 @@ state.jsonに記録 → maybe_compress_log() → 次のサイクルへ
 | 3 | X/Elyth系全ツール | 読んだファイル数 + 書いたファイル数 ≥ 5 |
 | 4 | `create_tool` | sandbox/ 以下に `.py` ファイルを書いた |
 | 5 | `exec_code` | `create_tool` で1つ以上ツールを登録した |
+| 6 | `self_modify` | exec_code + create_tool 合計 ≥ 7（各 ≥ 2）、両方のE2平均 ≥ 65%、直近3件のstd < 20、エラー率 ≤ 30%（キャンセル除外） |
 
 **`update_self`（自己更新）と`write_file`（環境介入）は意図的に分離。**
 
@@ -284,6 +286,13 @@ AIの自由な作業領域。`write_file` で書き込み可能（sandbox/以下
 - `search_memory`ツール追加 → AIが過去を能動的に参照できる
 - **観察**: ツール数が増えるとE4（多様性）が大幅改善
 
+### Phase 9: 好み関数 + self_modify（Level 6）
+
+- **好み関数 (`pref.json`)**: Trigger1（log圧縮）タイミングで捨てられる51件のE2をEMA（α=0.2）で蓄積。`controller()` でtool_avgに乗算（50が基準、50超=好み、50未満=苦手）。LLMには渡さない。初回Trigger1時に動的生成。
+- **`self_modify`（Level 6）**: AIが `pref.json` や `run.py` を直接書き換えられるツール。Human-in-the-loop + 危険パターン検出 + run.py は自動バックアップ。
+- **Level 6 ゲート**: exec_code + create_tool の実績ゲート（量・E2平均・安定性・エラー率の4条件）。
+- **設計上の判断**: prefをLLMプロンプトに含めないのは、energyを外した理由と同じ（数字に引っ張られるのを避けるため）。AIがpref.jsonを自力で読んで反応するか、という設計。
+
 ### Phase 8: 自己プログラミング基盤 + ツール段階拡張
 
 - `create_tool`（Level 4）: AIが自分でツールを定義・登録できる。Human-in-the-loop + 危険パターン検出 + 10秒タイムアウト。`sandbox/tools/` に保存。登録後は通常ツールと同様に使用可能。
@@ -318,29 +327,44 @@ AIの自由な作業領域。`write_file` で書き込み可能（sandbox/以下
 2. **X/Elyth投稿の安定性** — タイムアウト・APIエラーの頻度確認
 3. **search_memoryの使われ方** — AIが自律的に過去を参照するか
 
-### 将来実装: 好み関数
+### 将来検討: LLM自動切り替え
 
-経験から好みが生まれ、好みが行動選択に補正をかける仕組み。
+操作の種類に応じてLLMを自動選択する仕組み。現状は全サイクルで同一モデルを使用。
 
-**設計方針**:
-- **①記入方式: AI自記入**（`update_self key=preferences value={"elyth_post": 1.3, "wait": 0.5}`）
-  - 「システムが決めた好み」ではなく「AIが自分で気づいて書く」
-  - 信頼性は低いが哲学的に正しい
-  - 実装不要（update_selfとstate["self"]は既存）
-- **②格納: そのままself_modelに**（`self["preferences"] = {...}`）
-- **③適用: 候補A — controllerのtool_avg補正**
-  ```python
-  prefs = state.get("self", {}).get("preferences", {})
-  for t in TOOLS:
-      tool_avg[t] = tool_avg.get(t, 50) * float(prefs.get(t, 1.0))
-  ```
-  - E値は「正直な計測値」のまま温存
-  - 好みはtool_avg経由で選択確率のみ変える
-- **対策: 減衰** — Trigger1要約タイミングで `preferences` の各値を0.95倍
-  - 古い好みが強くなりすぎるのを防ぐ
-  - E4（多様性）との拮抗が自然に生まれる
+**設計方針**: Controllerが操作タイプを判定し、`call_llm()` に渡すモデルを動的に切り替える。`llm_settings.json` に複数モデルを定義しておき、タスク種別でルーティング。
 
-**リスク**: E4（多様性）と対立する可能性。好みが強くなると同じツールを選びやすくなりE4が下がり、energyが落ちる。この緊張構造は意図的に残す。
+**切り替え候補の例**:
+
+| 操作タイプ | 使用モデル例 | 理由 |
+|-----------|------------|------|
+| 通常の候補提案（LLM①） | 軽量モデル（Qwen2.5-7Bなど） | 速度優先、候補5個出すだけ |
+| 要約（Trigger1/2） | 軽量モデル | 単純なテキスト圧縮 |
+| コード生成・self_modify | コーディングモデル（Qwen2.5-Coder, DeepSeek-Coderなど） | コード品質優先 |
+| web_search後の統合・分析 | 高性能モデル | 複雑な推論が必要 |
+| exec_code のインラインコード | コーディングモデル | 同上 |
+| create_tool のコード定義 | コーディングモデル | 同上 |
+
+**実装イメージ**:
+```python
+# llm_settings.json
+{
+  "base_url": "...",
+  "models": {
+    "default": "qwen2.5-7b-instruct",
+    "coder":   "qwen2.5-coder-14b-instruct",
+    "summary": "qwen2.5-3b-instruct"
+  }
+}
+
+# call_llm に model= を追加
+def call_llm(prompt, max_tokens=10000, model=None):
+    m = model or llm_cfg["models"]["default"]
+    ...
+
+# self_modify / exec_code / create_tool 時はコーダーモデルで呼ぶ
+```
+
+**備考**: self_modify（run.py書き換え）は特に精度が求められるため、これが実装の主な動機。上位LLMへのAPI切り替え（Claude/GPT）も同じ仕組みで対応可能。
 
 ### 将来検討: write_diary
 内省強化ツール。現状は `write_file path=sandbox/memo.md` で代替できているため急ぎではない。

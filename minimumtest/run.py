@@ -85,6 +85,20 @@ def load_state() -> dict:
 def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
+# === 好み関数（pref.json）===
+PREF_FILE = BASE_DIR / "pref.json"
+
+def load_pref() -> dict:
+    if PREF_FILE.exists():
+        try:
+            return json.loads(PREF_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+def save_pref(pref: dict):
+    PREF_FILE.write_text(json.dumps(pref, ensure_ascii=False, indent=2), encoding="utf-8")
+
 def append_debug_log(phase: str, text: str):
     try:
         with open(DEBUG_LOG, "a", encoding="utf-8") as f:
@@ -734,6 +748,67 @@ def _exec_code(args: dict) -> str:
                 pass
 
 
+# === self_modify ===
+_MODIFY_ALLOWED = {"pref.json", "run.py"}
+
+def _self_modify(args: dict) -> str:
+    path = args.get("path", "").strip()
+    content = args.get("content", "")
+    old = args.get("old", "")
+    new = args.get("new", "")
+    intent = args.get("intent", "（意図なし）")
+    if not path:
+        return "エラー: path= が必要です"
+    if path not in _MODIFY_ALLOWED:
+        return f"エラー: 変更可能なファイルは {sorted(_MODIFY_ALLOWED)} のみです"
+    # モード判定
+    if old and content:
+        return "エラー: content= と old=/new= は同時に使えません"
+    if not old and not content:
+        return "エラー: content=（全文置換）または old=+new=（部分置換）が必要です"
+    mode = "partial" if old else "full"
+    target = BASE_DIR / path
+    current = target.read_text(encoding="utf-8") if target.exists() else ""
+    # 部分置換: old文字列の存在確認
+    if mode == "partial":
+        if old not in current:
+            return f"エラー: 指定した old= の文字列がファイル内に見つかりません"
+        if current.count(old) > 1:
+            return f"エラー: old= の文字列がファイル内に{current.count(old)}箇所あります。より長い文字列で一意に指定してください"
+        new_content = current.replace(old, new, 1)
+    else:
+        new_content = content
+    # 危険パターン検出（.pyのみ）
+    check_target = new if mode == "partial" else content
+    if path.endswith(".py"):
+        warnings = [p for p in _DANGEROUS_PATTERNS if p in check_target]
+        warn_str = f"\n⚠ 危険パターン検出: {warnings}" if warnings else "\n危険パターン: なし"
+    else:
+        warn_str = ""
+    # Human-in-the-loop
+    print(f"\n[self_modify 承認待ち]")
+    print(f"  対象: {path}  モード: {'部分置換' if mode == 'partial' else '全文置換'}")
+    print(f"  AIの意図: {intent}{warn_str}")
+    if mode == "partial":
+        print(f"  --- 変更前 ---")
+        print(old[:400] + ("..." if len(old) > 400 else ""))
+        print(f"  --- 変更後 ---")
+        print(new[:400] + ("..." if len(new) > 400 else ""))
+    else:
+        print(f"  --- 変更後の内容（先頭400字）---")
+        print(new_content[:400] + ("..." if len(new_content) > 400 else ""))
+    print(f"  --------------------------------")
+    ans = input("  変更を適用しますか？ [y/N]: ").strip().lower()
+    if ans != "y":
+        return "キャンセル: 変更を見送りました"
+    if path == "run.py":
+        backup = target.with_suffix(".py.bak")
+        backup.write_text(current, encoding="utf-8")
+        print(f"  バックアップ: {backup.name}")
+    target.write_text(new_content, encoding="utf-8")
+    return f"変更完了: {path}（{'部分置換' if mode == 'partial' else '全文置換'}, {len(new_content)}文字）"
+
+
 # === ツール定義 ===
 TOOLS = {
     "list_files": {
@@ -836,17 +911,22 @@ TOOLS = {
         "desc": "sandbox/内のPythonファイルを実行する（Human-in-the-loop）。引数: file=sandbox/xxx.py または code=インラインコード intent=実行目的",
         "func": lambda args: _exec_code(args),
     },
+    "self_modify": {
+        "desc": "自分自身のファイルを変更する（Human-in-the-loop）。引数: path=対象ファイル(pref.json/run.py) [全文置換: content=新しい内容全文] [部分置換: old=変更前の文字列 new=変更後の文字列] intent=変更目的",
+        "func": lambda args: _self_modify(args),
+    },
 }
 
 # === ツール段階解放テーブル ===
-_LV3_TOOLS = set(TOOLS.keys()) - {"create_tool", "exec_code"}
+_LV3_TOOLS = set(TOOLS.keys()) - {"create_tool", "exec_code", "self_modify"}
 LEVEL_TOOLS = {
     0: {"list_files", "read_file", "wait", "update_self"},
     1: {"list_files", "read_file", "wait", "update_self", "write_file", "search_memory"},
     2: {"list_files", "read_file", "wait", "update_self", "write_file", "search_memory", "web_search", "fetch_url"},
     3: _LV3_TOOLS,
     4: _LV3_TOOLS | {"create_tool"},
-    5: set(TOOLS.keys()),
+    5: set(TOOLS.keys()) - {"self_modify"},
+    6: set(TOOLS.keys()),
 }
 
 def _list_files(path: str) -> str:
@@ -1210,6 +1290,12 @@ def controller(state: dict) -> dict:
         if t not in tool_avg:
             tool_avg[t] = 50
 
+    # pref.json を読んで tool_avg に乗算（50が基準。50超=好み、50未満=苦手）
+    pref = load_pref()
+    for t in TOOLS:
+        if t in pref:
+            tool_avg[t] = round(min(100, max(0, tool_avg[t] * (pref[t] / 50.0))), 1)
+
     ranked = sorted(TOOLS.keys(), key=lambda t: tool_avg[t], reverse=True)
 
     # --- tool_level による段階解放 ---
@@ -1228,6 +1314,46 @@ def controller(state: dict) -> dict:
         new_lv = 4
     if new_lv <= 4 and len(tc) >= 1:
         new_lv = 5
+
+    # Level 6: self_modify（exec_code + create_tool の実績ゲート）
+    if new_lv <= 5:
+        ec_entries = [e for e in log if e.get("tool") == "exec_code"]
+        ct_entries = [e for e in log if e.get("tool") == "create_tool"]
+        if len(ec_entries) + len(ct_entries) >= 7 and len(ec_entries) >= 2 and len(ct_entries) >= 2:
+            # E2平均（どちらも65%以上必要）
+            if tool_avg.get("exec_code", 0) >= 65 and tool_avg.get("create_tool", 0) >= 65:
+                # 安定性（直近3件のstd < 20）
+                def _e2_list(entries):
+                    result = []
+                    for e in entries:
+                        m = re.search(r'(\d+)%', str(e.get("e2", "")))
+                        if m:
+                            result.append(int(m.group(1)))
+                    return result
+                def _std(vals):
+                    if len(vals) < 2:
+                        return 0.0
+                    mean = sum(vals) / len(vals)
+                    return (sum((x - mean) ** 2 for x in vals) / len(vals)) ** 0.5
+                ec_std = _std(_e2_list(ec_entries[-3:]))
+                ct_std = _std(_e2_list(ct_entries[-3:]))
+                if ec_std < 20 and ct_std < 20:
+                    # エラー率（キャンセル除外、30%以下）
+                    def _err_rate(entries, tool):
+                        valid = [e for e in entries if not str(e.get("result", "")).startswith("キャンセル")]
+                        if not valid:
+                            return 1.0
+                        if tool == "exec_code":
+                            errs = [e for e in valid if
+                                    str(e.get("result", "")).startswith("タイムアウト") or
+                                    "[stderr]" in str(e.get("result", ""))]
+                        else:
+                            errs = [e for e in valid if
+                                    str(e.get("result", "")).startswith(("コンパイルエラー", "エラー:"))]
+                        return len(errs) / len(valid)
+                    if _err_rate(ec_entries, "exec_code") <= 0.3 and _err_rate(ct_entries, "create_tool") <= 0.3:
+                        new_lv = 6
+
     allowed = LEVEL_TOOLS[new_lv]
 
     return {
@@ -1350,6 +1476,15 @@ def maybe_compress_log(state: dict):
     # Trigger1（archiveは既に都度書き込み済み）
     if len(state["log"]) >= LOG_HARD_LIMIT:
         to_summarize = state["log"][:51]
+        # pref.json にE2をEMAで蓄積（圧縮で消える前に記録）
+        pref = load_pref()
+        for entry in to_summarize:
+            t = entry.get("tool", "")
+            m = re.search(r'(\d+)%', str(entry.get("e2", "")))
+            if m and t in TOOLS:
+                old = pref.get(t, 50.0)
+                pref[t] = round(old * 0.8 + int(m.group(1)) * 0.2, 1)
+        save_pref(pref)
         summary = _summarize_entries(to_summarize, "L1要約")
         _archive_summary(summary)
         state["summaries"].append(summary)
